@@ -3,17 +3,31 @@ import csv
 from datetime import datetime
 from transformers import pipeline
 
-# 1) Set up the sentiment analysis pipeline
-pipe = pipeline("text-classification", model="mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+# setup model and tokenizer
+model_name = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(model_name)
 
 # 2) Create a Ticker object for the desired stock symbol (e.g., "AAPL")
 ticker = yf.Ticker("TSLA")
 
 # 3) Retrieve up to 50 news articles (Yahoo may provide fewer if not available)
-news = ticker.get_news(count=100)
+news = ticker.get_news(count=20)
 
 # 4) Define output file path
 csv_file_path = 'news_articles.csv'
+
+
+# Function to perform sentiment analysis
+def predict_sentiment(text):
+    inputs = tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
+    outputs = model(**inputs)
+    sentiment_class = outputs.logits.argmax(dim=1).item()
+    sentiment_mapping = {0: 'Negative', 1: 'Neutral', 2: 'Positive'}
+    predicted_sentiment = sentiment_mapping.get(sentiment_class, 'Unknown')
+    return predicted_sentiment, outputs.logits.softmax(dim=1)[0].tolist()
 
 if not news:
     print("No news articles available.")
@@ -41,9 +55,19 @@ else:
 
             # Combine Title + Summary for sentiment analysis
             combined_text = f"{title} {summary}"
-            sentiment_result = pipe(combined_text)[0]["label"]
 
-            # Write the row to CSV (title, summary, pub_date, link, sentiment)
-            writer.writerow([title, summary, pub_date, link, sentiment_result])
+            sentiment, confidence_scores = predict_sentiment(combined_text)
+
+            print(f"prediction: {sentiment}")
+            print(f"confidence_scores: {confidence_scores}")
+
+            # Format the confidence scores to 3 decimal places (and transform to string)
+            confidence_scores[0] = "{:.3f}".format(confidence_scores[0])
+            confidence_scores[1] = "{:.3f}".format(confidence_scores[1])
+            confidence_scores[2] = "{:.3f}".format(confidence_scores[2])
+
+
+            # Write the row to CSV (title, summary, pub_date, link, negative, neutral, positive
+            writer.writerow([title, summary, pub_date, link, confidence_scores[0], confidence_scores[1], confidence_scores[2]])
 
     print(f"CSV file '{csv_file_path}' created successfully with up to {len(news)} articles.")

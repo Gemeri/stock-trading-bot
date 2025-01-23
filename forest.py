@@ -915,7 +915,12 @@ def console_listener():
             logging.info("  force-run [-r]")
             logging.info("  backtest <N> [timeframe optional] [-r]")
             logging.info("  feature-importance [timeframe optional] [-r]")
+            logging.info("  set-tickers (tickers)")
+            logging.info("  set-timeframe (timeframe)")
+            logging.info("  set-nbars (Number of candles)")
+            logging.info("  set-news (on/off)")
             logging.info("  commands")
+
 
         # -------------------------------
         # New Commands to Update .env
@@ -995,8 +1000,7 @@ def main():
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [timeframe] [-r], feature-importance [timeframe] [-r], commands")
-    logging.info("New environment commands: set-tickers, set-timeframe, set-nbars, set-news (on/off)")
+    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [timeframe] [-r], feature-importance [timeframe] [-r], commands, set-tickers, set-timeframe, set-nbars, set-news (on/off)")
     while not SHUTDOWN:
         try:
             schedule.run_pending()

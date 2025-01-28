@@ -41,14 +41,22 @@ NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()  # "on" or "off"
 
 # A new environment variable controlling which features are disabled
 DISABLED_FEATURES = os.getenv("DISABLED_FEATURES", "").strip()
+
 if DISABLED_FEATURES:
     DISABLED_FEATURES_SET = set([f.strip() for f in DISABLED_FEATURES.split(",") if f.strip()])
 else:
     DISABLED_FEATURES_SET = set()
 
-# Make sure sentiment is NEVER disabled
-if "sentiment" in DISABLED_FEATURES_SET:
-    DISABLED_FEATURES_SET.remove("sentiment")
+# We define special sets for "main" and "base". 
+# If DISABLED_FEATURES == "main" or "base", we'll do a special keep-only logic.
+MAIN_FEATURES = {
+    "timestamp","open","high","low","close","vwap",
+    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10",
+    "bollinger_upper","bollinger_lower","momentum","obv"
+}
+BASE_FEATURES = {
+    "timestamp","open","high","low","close","volume","vwap","transactions"
+}
 
 SHUTDOWN = False
 
@@ -294,154 +302,134 @@ def run_sentiment_job(skip_data=False):
 # -------------------------------
 # 7. Additional Feature Engineering
 # -------------------------------
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds some basic features, but checks for column existence to avoid KeyErrors.
+    """
+    logging.info("Adding features (price_change, high_low_range, log_volume)...")
+    # Only compute if columns exist:
+    if 'close' in df.columns and 'open' in df.columns:
+        df['price_change'] = df['close'] - df['open']
+    if 'high' in df.columns and 'low' in df.columns:
+        df['high_low_range'] = df['high'] - df['low']
+    if 'volume' in df.columns:
+        df['log_volume'] = np.log1p(df['volume'])
+    return df
+
 def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
-
-    # Example: price_return needs 'close' to compute percentage change
-    if 'price_return' not in DISABLED_FEATURES_SET and 'close' in df.columns:
+    """
+    Computes a variety of technical indicators and features.
+    Checks for needed columns before computing each, to avoid KeyErrors.
+    """
+    # price_return
+    if 'close' in df.columns:
         df['price_return'] = df['close'].pct_change().fillna(0)
-
-    # candle_rise = high - low
-    if 'candle_rise' not in DISABLED_FEATURES_SET and 'high' in df.columns and 'low' in df.columns:
+    # candle_rise
+    if all(x in df.columns for x in ['high','low']):
         df['candle_rise'] = df['high'] - df['low']
-
-    # body_size = close - open
-    if 'body_size' not in DISABLED_FEATURES_SET and 'close' in df.columns and 'open' in df.columns:
+    # body_size
+    if all(x in df.columns for x in ['close','open']):
         df['body_size'] = df['close'] - df['open']
-
-    # wick_to_body = (high - low)/(close - open)
-    if 'wick_to_body' not in DISABLED_FEATURES_SET and all(col in df.columns for col in ['high','low','close','open']):
-        body = (df['close'] - df['open']).replace(0, np.nan)  # avoid div-zero
-        df['wick_to_body'] = ((df['high'] - df['low']) / body).replace(np.nan, 0)
-
+        body = (df['close'] - df['open']).replace(0, np.nan)
+        if all(x in df.columns for x in ['high','low']):
+            df['wick_to_body'] = ((df['high'] - df['low']) / body).replace(np.nan, 0)
     # macd_line
-    if 'macd_line' not in DISABLED_FEATURES_SET and 'close' in df.columns:
+    if 'close' in df.columns:
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
         ema26 = df['close'].ewm(span=26, adjust=False).mean()
         macd = ema12 - ema26
         signal = macd.ewm(span=9, adjust=False).mean()
-        df['macd_line'] = macd - signal
-
+        df['macd_line'] = (macd - signal)
     # rsi
-    if 'rsi' not in DISABLED_FEATURES_SET and 'close' in df.columns:
+    if 'close' in df.columns:
         window = 14
         delta = df['close'].diff()
         up = delta.clip(lower=0)
         down = -1 * delta.clip(upper=0)
-        ema_up = up.ewm(com=window - 1, adjust=False).mean()
-        ema_down = down.ewm(com=window - 1, adjust=False).mean()
+        ema_up = up.ewm(com=window-1, adjust=False).mean()
+        ema_down = down.ewm(com=window-1, adjust=False).mean()
         rs = ema_up / ema_down.replace(0, np.nan)
         df['rsi'] = 100 - (100 / (1 + rs))
         df['rsi'] = df['rsi'].fillna(50)
-
-    # momentum = close - close.shift(14)
-    if 'momentum' not in DISABLED_FEATURES_SET and 'close' in df.columns:
+    # momentum
+    if 'close' in df.columns:
         df['momentum'] = df['close'] - df['close'].shift(14)
         df['momentum'] = df['momentum'].fillna(0)
-
-    # rate of change (roc)
-    if 'roc' not in DISABLED_FEATURES_SET and 'close' in df.columns:
+    # roc
+    if 'close' in df.columns:
         shifted = df['close'].shift(14)
         df['roc'] = ((df['close'] - shifted) / shifted.replace(0, np.nan)) * 100
         df['roc'] = df['roc'].fillna(0)
-
     # atr
-    if 'atr' not in DISABLED_FEATURES_SET and all(col in df.columns for col in ['high','low','close']):
+    if all(x in df.columns for x in ['high','low','close']):
         high_low = df['high'] - df['low']
         high_close = (df['high'] - df['close'].shift(1)).abs()
         low_close = (df['low'] - df['close'].shift(1)).abs()
         tr = high_low.combine(high_close, max).combine(low_close, max)
         df['atr'] = tr.ewm(span=14, adjust=False).mean().fillna(0)
-
     # hist_vol
-    if 'hist_vol' not in DISABLED_FEATURES_SET and 'close' in df.columns:
+    if 'close' in df.columns:
         ret = df['close'].pct_change()
         rolling_std = ret.rolling(window=14).std()
         df['hist_vol'] = rolling_std * np.sqrt(14)
         df['hist_vol'] = df['hist_vol'].fillna(0)
-
-    # obv and volume_change both need 'volume'
+    # obv
+    if 'close' in df.columns and 'volume' in df.columns:
+        df['obv'] = 0
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > df['close'].iloc[i-1]:
+                df.loc[i, 'obv'] = df.loc[i-1, 'obv'] + df.loc[i, 'volume']
+            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
+                df.loc[i, 'obv'] = df.loc[i-1, 'obv'] - df.loc[i, 'volume']
+            else:
+                df.loc[i, 'obv'] = df.loc[i-1, 'obv']
+    # volume_change
     if 'volume' in df.columns:
-        # obv
-        if 'obv' not in DISABLED_FEATURES_SET:
-            df['obv'] = 0
-            for i in range(1, len(df)):
-                if df['close'].iloc[i] > df['close'].iloc[i - 1]:
-                    df.loc[i, 'obv'] = df.loc[i - 1, 'obv'] + df.loc[i, 'volume']
-                elif df['close'].iloc[i] < df['close'].iloc[i - 1]:
-                    df.loc[i, 'obv'] = df.loc[i - 1, 'obv'] - df.loc[i, 'volume']
-                else:
-                    df.loc[i, 'obv'] = df.loc[i - 1, 'obv']
-
-        # volume_change
-        if 'volume_change' not in DISABLED_FEATURES_SET:
-            df['volume_change'] = df['volume'].pct_change().fillna(0)
-
-    else:
-        # If 'volume' is missing or disabled, skip them
-        if 'obv' not in DISABLED_FEATURES_SET:
-            logging.info("Cannot compute OBV: 'volume' missing or disabled.")
-        if 'volume_change' not in DISABLED_FEATURES_SET:
-            logging.info("Cannot compute volume_change: 'volume' missing or disabled.")
-
+        df['volume_change'] = df['volume'].pct_change().fillna(0)
     # stoch_k
-    if 'stoch_k' not in DISABLED_FEATURES_SET and all(col in df.columns for col in ['high','low','close']):
+    if all(x in df.columns for x in ['close','high','low']):
         low14 = df['low'].rolling(window=14).min()
         high14 = df['high'].rolling(window=14).max()
         stoch_k = (df['close'] - low14) / (high14 - low14.replace(0, np.nan)) * 100
         df['stoch_k'] = stoch_k.fillna(50)
-
     # bollinger
-    if 'bollinger_upper' not in DISABLED_FEATURES_SET or 'bollinger_lower' not in DISABLED_FEATURES_SET:
-        if 'close' in df.columns:
-            ma20 = df['close'].rolling(window=20).mean()
-            std20 = df['close'].rolling(window=20).std()
-            if 'bollinger_upper' not in DISABLED_FEATURES_SET:
-                df['bollinger_upper'] = ma20 + 2 * std20
-            if 'bollinger_lower' not in DISABLED_FEATURES_SET:
-                df['bollinger_lower'] = ma20 - 2 * std20
-
-    # lagged_close
-    if any(f'lagged_close_{lag}' not in DISABLED_FEATURES_SET for lag in [1,2,3,5,10]):
-        if 'close' in df.columns:
-            for lag in [1, 2, 3, 5, 10]:
-                if f'lagged_close_{lag}' not in DISABLED_FEATURES_SET:
-                    df[f'lagged_close_{lag}'] = df['close'].shift(lag).fillna(df['close'].iloc[0])
-
+    if 'close' in df.columns:
+        ma20 = df['close'].rolling(window=20).mean()
+        std20 = df['close'].rolling(window=20).std()
+        df['bollinger_upper'] = ma20 + 2*std20
+        df['bollinger_lower'] = ma20 - 2*std20
+    # lagged_close_*
+    if 'close' in df.columns:
+        for lag in [1,2,3,5,10]:
+            df[f'lagged_close_{lag}'] = df['close'].shift(lag).fillna(df['close'].iloc[0])
     return df
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Safely add features that depend on columns which may be disabled or missing.
-    """
-    logging.info("Adding features (price_change, high_low_range, log_volume)...")
-
-    # 'price_change' depends on 'open' and 'close'
-    if 'price_change' not in DISABLED_FEATURES_SET:
-        if 'open' in df.columns and 'close' in df.columns:
-            df['price_change'] = df['close'] - df['open']
-
-    # 'high_low_range' depends on 'high' and 'low'
-    if 'high_low_range' not in DISABLED_FEATURES_SET:
-        if 'high' in df.columns and 'low' in df.columns:
-            df['high_low_range'] = df['high'] - df['low']
-
-    # 'log_volume' depends on 'volume'
-    if 'volume' not in DISABLED_FEATURES_SET:
-        if 'volume' in df.columns:
-            df['log_volume'] = np.log1p(df['volume'])
-        else:
-            logging.info("Volume column missing, skipping log_volume feature.")
-    
-    return df
+# A helper to apply the "DISABLED_FEATURES" logic,
+# including the special "main" or "base" modes,
+# and ensuring 'sentiment' is never disabled.
+def drop_disabled_features(df: pd.DataFrame) -> pd.DataFrame:
+    global DISABLED_FEATURES, DISABLED_FEATURES_SET
+    # If the mode is "main" or "base", we keep only certain columns + "sentiment".
+    if DISABLED_FEATURES == "main":
+        keep_set = MAIN_FEATURES.union({"sentiment"})
+        # Only keep columns in keep_set (if they exist in df)
+        keep_cols = [c for c in df.columns if c in keep_set]
+        return df[keep_cols]
+    elif DISABLED_FEATURES == "base":
+        keep_set = BASE_FEATURES.union({"sentiment"})
+        keep_cols = [c for c in df.columns if c in keep_set]
+        return df[keep_cols]
+    else:
+        # Normal custom approach: remove columns if they are in DISABLED_FEATURES_SET, except 'sentiment'
+        temp = {c for c in DISABLED_FEATURES_SET if c.lower() != 'sentiment'}
+        final_cols = [c for c in df.columns if c not in temp]
+        return df[final_cols]
 
 # -------------------------------
 # 8. Enhanced Train & Predict Pipeline
 # -------------------------------
 def train_and_predict(df: pd.DataFrame) -> float:
-    # Make sure we forcibly remove 'sentiment' from disabled if present
-    if "sentiment" in DISABLED_FEATURES_SET:
-        DISABLED_FEATURES_SET.remove("sentiment")
-
+    # Ensure sentiment is float if it exists
     if 'sentiment' in df.columns and df["sentiment"].dtype == object:
         try:
             df["sentiment"] = df["sentiment"].astype(float)
@@ -449,8 +437,12 @@ def train_and_predict(df: pd.DataFrame) -> float:
             logging.error(f"Cannot convert sentiment column to float: {e}")
             return None
 
+    # The script previously calls add_features and compute_custom_features, 
+    # so we typically do it outside. But let's keep the calls here to maintain consistency
     df = add_features(df)
     df = compute_custom_features(df)
+    # Drop disabled features
+    df = drop_disabled_features(df)
 
     possible_cols = [
         'open','high','low','close','volume','vwap',
@@ -460,26 +452,27 @@ def train_and_predict(df: pd.DataFrame) -> float:
         'stoch_k','bollinger_upper','bollinger_lower',
         'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10'
     ]
-    enabled_cols = []
-    for c in possible_cols:
-        if c in df.columns:
-            if c not in DISABLED_FEATURES_SET:
-                enabled_cols.append(c)
+    # Only use columns that actually exist
+    available_cols = [c for c in possible_cols if c in df.columns]
 
+    # We want to predict the next close => create target
+    if 'close' not in df.columns:
+        logging.error("No 'close' in DataFrame, cannot create target.")
+        return None
     df['target'] = df['close'].shift(-1)
     df.dropna(inplace=True)
     if len(df) < 10:
         logging.error("Not enough rows after shift to train. Need more candles.")
         return None
 
-    X = df[enabled_cols]
+    X = df[available_cols]
     y = df['target']
-    logging.info(f"Training RandomForestRegressor with {len(X)} rows and {len(enabled_cols)} features.")
+    logging.info(f"Training RandomForestRegressor with {len(X)} rows and {len(available_cols)} features (others are disabled).")
     model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
     model_rf.fit(X, y)
 
-    last_row_features = df.iloc[-1][enabled_cols]
-    last_row_df = pd.DataFrame([last_row_features], columns=enabled_cols)
+    last_row_features = df.iloc[-1][available_cols]
+    last_row_df = pd.DataFrame([last_row_features], columns=available_cols)
     predicted_close = model_rf.predict(last_row_df)[0]
     return predicted_close
 
@@ -636,7 +629,7 @@ def log_trade(action, ticker, qty, current_price, predicted_price, profit_loss):
         df.to_csv(TRADE_LOG_FILENAME, index=False, mode='a', header=False)
 
 # -------------------------------
-# 10. Trading Job
+# 10. Trading Job (with integrated sentiment update)
 # -------------------------------
 def _perform_trading_job(skip_data=False):
     for ticker in TICKERS:
@@ -649,18 +642,15 @@ def _perform_trading_job(skip_data=False):
                 logging.error(f"[{ticker}] Data fetch returned empty DataFrame. Skipping.")
                 continue
 
+            # Generate features
             df = add_features(df)
             df = compute_custom_features(df)
-
-            # drop disabled columns from the final CSV
-            for col in list(df.columns):
-                # never drop sentiment forcibly
-                if col in DISABLED_FEATURES_SET and col != "sentiment":
-                    df.drop(columns=[col], inplace=True)
+            # Now drop disabled
+            df = drop_disabled_features(df)
 
             try:
                 df.to_csv(csv_filename, index=False)
-                logging.info(f"[{ticker}] Saved candle data (with advanced features minus disabled) to {csv_filename}")
+                logging.info(f"[{ticker}] Saved candle data (w/out disabled) to {csv_filename}")
             except Exception as e:
                 logging.error(f"[{ticker}] Error saving CSV: {e}")
                 continue
@@ -671,13 +661,16 @@ def _perform_trading_job(skip_data=False):
                 news_list = fetch_news_sentiments(ticker, news_num_days, articles_per_day)
                 save_news_to_csv(ticker, news_list)
                 sentiments = assign_sentiment_to_candles(df, news_list)
+                # Add sentiment
                 df["sentiment"] = sentiments
                 df["sentiment"] = df["sentiment"].apply(lambda x: f"{x:.15f}")
-                if "sentiment" in DISABLED_FEATURES_SET:
-                    # never actually drop sentiment
-                    pass
+                # If sentiment is not allowed to be disabled, we keep it anyway
+                # but if "sentiment" was in the user-limited set, do not drop it.
+                # We'll just re-drop disabled (which won't remove sentiment).
+                df = drop_disabled_features(df)
+
                 df.to_csv(csv_filename, index=False)
-                logging.info(f"[{ticker}] Updated candle CSV with sentiment & features.")
+                logging.info(f"[{ticker}] Updated candle CSV with sentiment & features, minus disabled.")
             else:
                 logging.info(f"[{ticker}] NEWS_MODE=off, skipping sentiment assignment.")
         else:
@@ -690,6 +683,7 @@ def _perform_trading_job(skip_data=False):
                 logging.error(f"[{ticker}] Existing CSV is empty. Skipping.")
                 continue
 
+        # Model train & predict
         pred_close = train_and_predict(df)
         if pred_close is None:
             logging.error(f"[{ticker}] Model training or prediction failed. Skipping trade logic.")
@@ -699,7 +693,7 @@ def _perform_trading_job(skip_data=False):
         trade_logic(current_price, pred_close, ticker)
 
 # -------------------------------
-# 11. Scheduling
+# 11. Scheduling & Console Listener
 # -------------------------------
 TIMEFRAME_SCHEDULE = {
     "15Min": ["09:30", "09:45", "10:00", "10:15", "10:30", "10:45",
@@ -787,244 +781,10 @@ def update_env_variable(key: str, value: str):
     logging.info(f"Updated .env: {key}={value}")
 
 # -------------------------------
-# 13. Backtest with Trading Simulation
-# -------------------------------
-def simulate_backtest_trades(ticker, df, initial_balance=100000.0):
-    """
-    We do a candle-by-candle backtest:
-     1) For each i in [0..len(df)-1], we train a model on [0..i-1], predict row i,
-        decide to go long/short/none, place or hold position, etc.
-     2) We track trades in backtest_trades_{ticker}.csv
-     3) We track a daily equity curve in backtest_equity_{ticker}.csv
-    We'll do a simple approach with 1 share trades for demonstration.
-    """
-    if 'sentiment' in df.columns and df["sentiment"].dtype == object:
-        try:
-            df["sentiment"] = df["sentiment"].astype(float)
-        except:
-            pass
-
-    # We'll store a list of dicts for trades, plus portfolio snapshots
-    trades = []
-    portfolio_curve = []
-
-    # position can be: 'long', 'short', or 'none'
-    position = 'none'
-    shares_held = 0
-    balance = initial_balance
-    entry_price = 0.0
-
-    # We'll define a function to compute total equity
-    def current_equity(price):
-        if position == 'none':
-            return balance
-        elif position == 'long':
-            return balance + (price - entry_price) * shares_held
-        elif position == 'short':
-            return balance + (entry_price - price) * shares_held
-
-    # We'll walk candle by candle
-    for i in range(len(df) - 1):
-        # Train on data [0..i-1]
-        train_df = df.iloc[:i].copy()
-        if len(train_df) < 10:
-            # Not enough data to train
-            continue
-
-        # Meanwhile, we want to do next candle's open or close as the "current price"
-        current_price = df.iloc[i]['close']  # or open, your choice
-
-        # Create a subset that doesn't include row i
-        train_df['target'] = train_df['close'].shift(-1)
-        train_df.dropna(inplace=True)
-        if len(train_df) < 10:
-            continue
-
-        # gather columns that remain (skip disabled)
-        possible_cols = [
-            'open','high','low','close','volume','vwap',
-            'price_change','high_low_range','log_volume','sentiment',
-            'price_return','candle_rise','body_size','wick_to_body','macd_line',
-            'rsi','momentum','roc','atr','hist_vol','obv','volume_change',
-            'stoch_k','bollinger_upper','bollinger_lower',
-            'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10'
-        ]
-        enabled_cols = [c for c in possible_cols if c in train_df.columns and c not in DISABLED_FEATURES_SET]
-
-        X = train_df[enabled_cols]
-        y = train_df['target']
-
-        if len(X) < 10:
-            continue
-
-        # Train model
-        model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-        model_rf.fit(X, y)
-
-        # Now predict row i's next close
-        row_i = df.iloc[i][enabled_cols]
-        row_i_df = pd.DataFrame([row_i], columns=enabled_cols)
-        pred_close = model_rf.predict(row_i_df)[0]
-
-        # Our trade logic:
-        # if pred_close > current_price => we want to go long
-        # if pred_close < current_price => we want to go short
-        if pred_close > current_price:
-            # want to be long
-            if position == 'long':
-                # do nothing
-                pass
-            elif position == 'short':
-                # close short
-                pl = (entry_price - current_price) * shares_held
-                balance += pl
-                trades.append({
-                    'timestamp': str(df.iloc[i]['timestamp']),
-                    'action': 'COVER',
-                    'price': current_price,
-                    'pl': pl,
-                    'balance': balance
-                })
-                # open new long
-                shares_held = 1
-                position = 'long'
-                entry_price = current_price
-                trades.append({
-                    'timestamp': str(df.iloc[i]['timestamp']),
-                    'action': 'BUY',
-                    'price': current_price,
-                    'pl': None,
-                    'balance': balance
-                })
-            elif position == 'none':
-                # open new long
-                shares_held = 1
-                position = 'long'
-                entry_price = current_price
-                trades.append({
-                    'timestamp': str(df.iloc[i]['timestamp']),
-                    'action': 'BUY',
-                    'price': current_price,
-                    'pl': None,
-                    'balance': balance
-                })
-
-        else:
-            # want to be short
-            if position == 'short':
-                # do nothing
-                pass
-            elif position == 'long':
-                # close long
-                pl = (current_price - entry_price) * shares_held
-                balance += pl
-                trades.append({
-                    'timestamp': str(df.iloc[i]['timestamp']),
-                    'action': 'SELL',
-                    'price': current_price,
-                    'pl': pl,
-                    'balance': balance
-                })
-                # open new short
-                shares_held = 1
-                position = 'short'
-                entry_price = current_price
-                trades.append({
-                    'timestamp': str(df.iloc[i]['timestamp']),
-                    'action': 'SHORT',
-                    'price': current_price,
-                    'pl': None,
-                    'balance': balance
-                })
-            elif position == 'none':
-                # open short
-                shares_held = 1
-                position = 'short'
-                entry_price = current_price
-                trades.append({
-                    'timestamp': str(df.iloc[i]['timestamp']),
-                    'action': 'SHORT',
-                    'price': current_price,
-                    'pl': None,
-                    'balance': balance
-                })
-
-        # record portfolio equity
-        eq = current_equity(current_price)
-        portfolio_curve.append({
-            'timestamp': df.iloc[i]['timestamp'],
-            'equity': eq
-        })
-
-    # at the end, we close any open position
-    final_price = df.iloc[-1]['close']
-    eq = 0
-    if position == 'long':
-        pl = (final_price - entry_price) * shares_held
-        balance += pl
-        eq = balance
-        trades.append({
-            'timestamp': str(df.iloc[-1]['timestamp']),
-            'action': 'SELL (final)',
-            'price': final_price,
-            'pl': pl,
-            'balance': balance
-        })
-    elif position == 'short':
-        pl = (entry_price - final_price) * shares_held
-        balance += pl
-        eq = balance
-        trades.append({
-            'timestamp': str(df.iloc[-1]['timestamp']),
-            'action': 'COVER (final)',
-            'price': final_price,
-            'pl': pl,
-            'balance': balance
-        })
-    else:
-        eq = balance
-
-    # Save trades
-    trades_df = pd.DataFrame(trades)
-    trades_csv = f"backtest_trades_{ticker}.csv"
-    trades_df.to_csv(trades_csv, index=False)
-    logging.info(f"[{ticker}] Saved backtest trades to {trades_csv}")
-
-    # Save portfolio
-    portfolio_df = pd.DataFrame(portfolio_curve)
-    # append a final row for the last candle
-    portfolio_df = portfolio_df.append({
-        'timestamp': df.iloc[-1]['timestamp'],
-        'equity': eq
-    }, ignore_index=True)
-
-    portfolio_csv = f"backtest_equity_{ticker}.csv"
-    portfolio_df.to_csv(portfolio_csv, index=False)
-    logging.info(f"[{ticker}] Saved backtest equity curve to {portfolio_csv}")
-
-    # Plot equity
-    plt.figure(figsize=(10,6))
-    plt.plot(portfolio_df['timestamp'], portfolio_df['equity'], label='Equity')
-    plt.title(f"{ticker} Backtest Equity")
-    plt.xticks(rotation=45)
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    equity_png = f"backtest_equity_{ticker}.png"
-    plt.savefig(equity_png)
-    plt.close()
-    logging.info(f"[{ticker}] Saved backtest equity chart to {equity_png}")
-
-    total_pl = eq - initial_balance
-    logging.info(f"[{ticker}] Backtest final P/L = {total_pl:.2f} (Start={initial_balance:.2f}, End={eq:.2f})")
-
-    return trades_df, portfolio_df
-
-# -------------------------------
-# 14. Console Commands
+# 13. Additional Commands
 # -------------------------------
 def console_listener():
-    global SHUTDOWN, TICKERS, BAR_TIMEFRAME, N_BARS, NEWS_MODE, DISABLED_FEATURES_SET
+    global SHUTDOWN, TICKERS, BAR_TIMEFRAME, N_BARS, NEWS_MODE, DISABLED_FEATURES, DISABLED_FEATURES_SET
     while not SHUTDOWN:
         cmd_line = sys.stdin.readline().strip()
         if not cmd_line:
@@ -1059,10 +819,8 @@ def console_listener():
                     continue
                 df = add_features(df)
                 df = compute_custom_features(df)
-                # drop disabled columns except sentiment
-                for col in list(df.columns):
-                    if col in DISABLED_FEATURES_SET and col != "sentiment":
-                        df.drop(columns=[col], inplace=True)
+                df = drop_disabled_features(df)
+
                 tf_code = timeframe_to_code(timeframe)
                 csv_filename = f"{ticker}_{tf_code}.csv"
                 df.to_csv(csv_filename, index=False)
@@ -1088,9 +846,8 @@ def console_listener():
                         continue
                     df = add_features(df)
                     df = compute_custom_features(df)
-                    for col in list(df.columns):
-                        if col in DISABLED_FEATURES_SET and col != "sentiment":
-                            df.drop(columns=[col], inplace=True)
+                    df = drop_disabled_features(df)
+
                     df.to_csv(csv_filename, index=False)
                     logging.info(f"[{ticker}] Fetched new data + advanced features (minus disabled), saved to {csv_filename}")
 
@@ -1117,22 +874,35 @@ def console_listener():
             logging.info("Force-run job finished.")
 
         elif cmd == "backtest":
-            """
-            backtest <N> [timeframe optional] [-r optional]
-             -> now uses a step-by-step approach that simulates actual trades
-            """
+            # Usage:
+            #   backtest <N> [simple|complex] [timeframe optional] [-r optional]
+            # Example:
+            #   backtest 500 simple -r
+            #   backtest 500 complex 1Hour
             if len(parts) < 2:
-                logging.warning("Usage: backtest <N> [timeframe optional] [-r optional]")
+                logging.warning("Usage: backtest <N> [simple|complex] [timeframe?] [-r?]")
                 continue
+
             test_size_str = parts[1]
+            approach = "simple"  # default
+            timeframe = BAR_TIMEFRAME
+            # next parts might be 'simple' or 'complex' or a timeframe
+            # parse them in order
+            possible_approaches = ["simple", "complex"]
+            idx = 2
+            while idx < len(parts):
+                val = parts[idx]
+                if val in possible_approaches:
+                    approach = val
+                elif val != "-r":  # might be timeframe
+                    timeframe = val
+                idx += 1
+
             try:
                 test_size = int(test_size_str)
             except ValueError:
                 logging.error("Invalid test_size for 'backtest' command.")
                 continue
-            timeframe = BAR_TIMEFRAME
-            if len(parts) > 2 and parts[2] != '-r':
-                timeframe = parts[2]
 
             for ticker in TICKERS:
                 tf_code = timeframe_to_code(timeframe)
@@ -1152,23 +922,24 @@ def console_listener():
                     if df.empty:
                         logging.error(f"[{ticker}] No data to backtest.")
                         continue
-                    # If NEWS_MODE=on, get sentiment
+                    logging.info(f"[{ticker}] Fetching news for backtest sentiment (timeframe={timeframe})...")
                     if NEWS_MODE == "on":
                         news_num_days = NUM_DAYS_MAPPING.get(timeframe, 1650)
                         articles_per_day = ARTICLES_PER_DAY_MAPPING.get(timeframe, 1)
                         news_list = fetch_news_sentiments(ticker, news_num_days, articles_per_day)
-                        df["sentiment"] = assign_sentiment_to_candles(df, news_list)
+                        save_news_to_csv(ticker, news_list)
+                        sentiments = assign_sentiment_to_candles(df, news_list)
+                        df["sentiment"] = sentiments
                         df["sentiment"] = df["sentiment"].apply(lambda x: f"{x:.15f}")
 
                     df = add_features(df)
                     df = compute_custom_features(df)
-                    # drop disabled except sentiment
-                    for col in list(df.columns):
-                        if col in DISABLED_FEATURES_SET and col != "sentiment":
-                            df.drop(columns=[col], inplace=True)
+                    df = drop_disabled_features(df)
+
                     df.to_csv(csv_filename, index=False)
                     logging.info(f"[{ticker}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
 
+                # Convert sentiment if needed
                 if 'sentiment' in df.columns and df["sentiment"].dtype == object:
                     try:
                         df["sentiment"] = df["sentiment"].astype(float)
@@ -1176,17 +947,295 @@ def console_listener():
                         logging.error(f"[{ticker}] Could not convert sentiment to float: {e}")
                         continue
 
-                # If user wants partial data or test_size, we do it differently. 
-                # We'll do a step-by-step approach with "simulate_backtest_trades"
+                # We do another pass of add_features + compute_custom_features 
+                # to mirror the typical pipeline. Then drop disabled again:
+                df = add_features(df)
+                df = compute_custom_features(df)
+                df = drop_disabled_features(df)
 
-                # Optionally, if we want the last N rows only. But let's do a full approach.
-                # We'll just pass the entire df. The step by step function will not skip the last test_size. 
-                if len(df) < 15:
-                    logging.error(f"[{ticker}] Not enough data to do step-by-step backtest.")
+                # Make sure we can do the target shift
+                if 'close' not in df.columns:
+                    logging.error(f"[{ticker}] No 'close' column after feature processing. Cannot backtest.")
+                    continue
+                df['target'] = df['close'].shift(-1)
+                df.dropna(inplace=True)
+                if len(df) <= test_size + 1:
+                    logging.error(f"[{ticker}] Not enough rows for backtest split. Need more data than test_size.")
                     continue
 
-                logging.info(f"[{ticker}] Starting step-by-step backtest with test_size={test_size}.")
-                simulate_backtest_trades(ticker, df, initial_balance=100000.0)
+                # We define the train_end as len(df) - test_size
+                # so the last test_size rows are our "test set" in either approach.
+                total_len = len(df)
+                train_end = total_len - test_size
+                if train_end < 1:
+                    logging.error(f"[{ticker}] train_end < 1. Not enough data for that test_size.")
+                    continue
+
+                possible_cols = [
+                    'open','high','low','close','volume','vwap',
+                    'price_change','high_low_range','log_volume','sentiment',
+                    'price_return','candle_rise','body_size','wick_to_body','macd_line',
+                    'rsi','momentum','roc','atr','hist_vol','obv','volume_change',
+                    'stoch_k','bollinger_upper','bollinger_lower',
+                    'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10'
+                ]
+                available_cols = [c for c in possible_cols if c in df.columns]
+
+                # Prepare arrays for storing predictions
+                predictions = []
+                actuals = []
+                timestamps = []
+
+                # We'll also do a local "backtest trading simulation"
+                # Start with $10,000, no position
+                start_balance = 10000.0
+                cash = start_balance
+                position_qty = 0.0
+                position_type = "none"  # "none", "long", or "short"
+                avg_entry_price = 0.0
+
+                # We'll keep logs of trades
+                trade_records = []
+                # We'll keep a record of portfolio value after each candle
+                portfolio_records = []
+
+                def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
+                    trade_records.append({
+                        "timestamp": tstamp,
+                        "action": action,
+                        "shares": shares,
+                        "current_price": curr_price,
+                        "predicted_price": pred_price,
+                        "profit_loss": pl
+                    })
+
+                def get_portfolio_value(p_type, p_qty, csh, curr_price):
+                    """
+                    If long: total = cash + (current_price - avg_entry_price) * p_qty
+                    If short: total = cash + (avg_entry_price - current_price) * p_qty
+                    """
+                    if p_type == "none":
+                        return csh
+                    elif p_type == "long":
+                        return csh + (curr_price - avg_entry_price) * p_qty
+                    elif p_type == "short":
+                        return csh + (avg_entry_price - curr_price) * p_qty
+                    return csh
+
+                def backtest_trade_logic(c_price, p_price, row_time):
+                    nonlocal cash, position_qty, position_type, avg_entry_price
+
+                    # if predicted_price > current_price => go long
+                    # if predicted_price < current_price => go short
+                    # close old position if it differs from new direction
+                    shares_traded = 0
+                    pl = None
+
+                    if p_price > c_price:
+                        # should be long
+                        if position_type == "long":
+                            # do nothing
+                            pass
+                        elif position_type == "short":
+                            # close short
+                            pl = (avg_entry_price - c_price) * position_qty
+                            cash += pl
+                            record_trade("COVER", row_time, position_qty, c_price, p_price, pl)
+                            position_qty = 0.0
+                            position_type = "none"
+                            avg_entry_price = 0.0
+
+                            # open long
+                            shares_to_buy = int(cash // c_price)
+                            if shares_to_buy > 0:
+                                position_qty = shares_to_buy
+                                position_type = "long"
+                                avg_entry_price = c_price
+                                record_trade("LONG", row_time, shares_to_buy, c_price, p_price, None)
+                                cash = cash
+                        else:
+                            # none -> open long
+                            shares_to_buy = int(cash // c_price)
+                            if shares_to_buy > 0:
+                                position_qty = shares_to_buy
+                                position_type = "long"
+                                avg_entry_price = c_price
+                                record_trade("LONG", row_time, position_qty, c_price, p_price, None)
+                                cash = cash
+
+                    elif p_price < c_price:
+                        # should be short
+                        if position_type == "short":
+                            # do nothing
+                            pass
+                        elif position_type == "long":
+                            pl = (c_price - avg_entry_price) * position_qty
+                            cash += pl
+                            record_trade("SELL", row_time, position_qty, c_price, p_price, pl)
+                            position_qty = 0.0
+                            position_type = "none"
+                            avg_entry_price = 0.0
+
+                            # open short
+                            shares_to_short = int(cash // c_price)
+                            if shares_to_short > 0:
+                                position_qty = shares_to_short
+                                position_type = "short"
+                                avg_entry_price = c_price
+                                record_trade("SHORT", row_time, position_qty, c_price, p_price, None)
+                                cash = cash
+                        else:
+                            # none -> open short
+                            shares_to_short = int(cash // c_price)
+                            if shares_to_short > 0:
+                                position_qty = shares_to_short
+                                position_type = "short"
+                                avg_entry_price = c_price
+                                record_trade("SHORT", row_time, position_qty, c_price, p_price, None)
+                                cash = cash
+
+                    # at the end of this candle, record portfolio
+                    port_value = get_portfolio_value(position_type, position_qty, cash, c_price)
+                    portfolio_records.append({
+                        "timestamp": row_time,
+                        "portfolio_value": port_value
+                    })
+
+                # ---------------------------
+                #  "simple" approach: train once, predict for each candle in the test set
+                # ---------------------------
+                if approach == "simple":
+                    # Train once on [0..train_end-1]
+                    train_df = df.iloc[:train_end]
+                    test_df  = df.iloc[train_end:]
+                    if len(train_df) < 2:
+                        logging.error(f"[{ticker}] Not enough training rows for simple approach.")
+                        continue
+
+                    X_train = train_df[available_cols]
+                    y_train = train_df['target']
+                    model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                    model_rf.fit(X_train, y_train)
+
+                    for i in range(len(test_df)):
+                        row_idx = test_df.index[i]
+                        row_data = df.loc[row_idx]
+                        row_features = row_data[available_cols].values.reshape(1, -1)
+                        pred_price = model_rf.predict(row_features)[0]
+                        real_close = row_data['close']
+                        timestamps.append(row_data['timestamp'])
+                        predictions.append(pred_price)
+                        actuals.append(real_close)
+
+                        backtest_trade_logic(real_close, pred_price, row_data['timestamp'])
+
+                # ---------------------------
+                #  "complex" approach: 
+                #   For each candle i in the last test_size, re-train on [0..i-1], then predict i
+                #   Add a progress bar printing in console
+                # ---------------------------
+                elif approach == "complex":
+                    count = total_len - train_end
+                    logging.info(f"[{ticker}] Starting COMPLEX backtest. Steps to process = {count}")
+                    bar_length = 20
+
+                    for step_index, i in enumerate(range(train_end, total_len), start=1):
+                        # Print a rudimentary progress bar
+                        progress = int(bar_length * step_index / count)
+                        bar = "#"*progress + "-"*(bar_length - progress)
+                        logging.info(f"[{ticker}] complex backtest progress: Step {step_index}/{count} [{bar}]")
+
+                        row_data = df.iloc[i]
+                        # train on [0..i-1]
+                        sub_train = df.iloc[:i]
+                        if len(sub_train) < 2:
+                            logging.warning(f"[{ticker}] Not enough data to train at iteration i={i}. Skipping.")
+                            continue
+                        X_sub = sub_train[available_cols]
+                        y_sub = sub_train['target']
+                        model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                        model_rf.fit(X_sub, y_sub)
+
+                        # Now predict row i
+                        x_test = row_data[available_cols].values.reshape(1, -1)
+                        pred_price = model_rf.predict(x_test)[0]
+                        real_close = row_data['close']
+                        timestamps.append(row_data['timestamp'])
+                        predictions.append(pred_price)
+                        actuals.append(real_close)
+
+                        backtest_trade_logic(real_close, pred_price, row_data['timestamp'])
+                else:
+                    logging.warning(f"[{ticker}] Unknown approach={approach}. Skipping backtest.")
+                    continue
+
+                # Evaluate and produce RMSE, MAE, Accuracy
+                y_pred = np.array(predictions)
+                y_test = np.array(actuals)
+                rmse = math.sqrt(mean_squared_error(y_test, y_pred))
+                mae = mean_absolute_error(y_test, y_pred)
+                avg_close = y_test.mean() if len(y_test) > 0 else 1e-6
+                accuracy = 100 - (mae / avg_close * 100)
+
+                logging.info(f"[{ticker}] Backtest ({approach}): test_size={test_size}, RMSE={rmse:.4f}, MAE={mae:.4f}, Accuracy={accuracy:.2f}%")
+
+                # Save predictions vs actual
+                out_df = pd.DataFrame({
+                    'timestamp': timestamps,
+                    'actual_close': actuals,
+                    'predicted_close': predictions
+                })
+                out_csv = f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.csv"
+                out_df.to_csv(out_csv, index=False)
+                logging.info(f"[{ticker}] Saved backtest predictions to {out_csv}.")
+
+                # Plot
+                plt.figure(figsize=(10, 6))
+                plt.plot(out_df['timestamp'], out_df['actual_close'], label='Actual')
+                plt.plot(out_df['timestamp'], out_df['predicted_close'], label='Predicted')
+                plt.title(f"{ticker} Backtest ({approach} - Last {test_size} rows) - {timeframe}")
+                plt.xlabel("Timestamp")
+                plt.ylabel("Close Price")
+                plt.legend()
+                plt.grid(True)
+                if test_size > 30:
+                    plt.xticks(rotation=45)
+                plt.tight_layout()
+                out_img = f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.png"
+                plt.savefig(out_img)
+                plt.close()
+                logging.info(f"[{ticker}] Saved backtest predictions plot to {out_img}.")
+
+                # Save the trade log
+                trade_log_df = pd.DataFrame(trade_records)
+                trade_log_csv = f"backtest_trades_{ticker}_{test_size}_{tf_code}_{approach}.csv"
+                if not trade_log_df.empty:
+                    trade_log_df.to_csv(trade_log_csv, index=False)
+                logging.info(f"[{ticker}] Saved backtest trade log to {trade_log_csv}.")
+
+                # Save the portfolio values
+                port_df = pd.DataFrame(portfolio_records)
+                port_csv = f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.csv"
+                if not port_df.empty:
+                    port_df.to_csv(port_csv, index=False)
+                logging.info(f"[{ticker}] Saved backtest portfolio records to {port_csv}.")
+
+                # Plot the portfolio growth
+                if not port_df.empty:
+                    plt.figure(figsize=(10, 6))
+                    plt.plot(port_df['timestamp'], port_df['portfolio_value'], label='Portfolio Value')
+                    plt.title(f"{ticker} Portfolio Value Backtest ({approach})")
+                    plt.xlabel("Timestamp")
+                    plt.ylabel("Portfolio Value (USD)")
+                    plt.legend()
+                    plt.grid(True)
+                    if test_size > 30:
+                        plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    out_port_img = f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.png"
+                    plt.savefig(out_port_img)
+                    plt.close()
+                    logging.info(f"[{ticker}] Saved backtest portfolio plot to {out_port_img}.")
 
         elif cmd == "feature-importance":
             timeframe = BAR_TIMEFRAME
@@ -1212,18 +1261,21 @@ def console_listener():
                         logging.error(f"[{ticker}] No data for 'feature-importance'.")
                         continue
                     logging.info(f"[{ticker}] Completed candle fetch.")
+
                     if NEWS_MODE == "on":
                         logging.info(f"[{ticker}] Fetching news sentiments for {timeframe}.")
                         news_num_days = NUM_DAYS_MAPPING.get(timeframe, 1650)
                         articles_per_day = ARTICLES_PER_DAY_MAPPING.get(timeframe, 1)
                         news_list = fetch_news_sentiments(ticker, news_num_days, articles_per_day)
-                        df["sentiment"] = assign_sentiment_to_candles(df, news_list)
+                        save_news_to_csv(ticker, news_list)
+                        sentiments = assign_sentiment_to_candles(df, news_list)
+                        df["sentiment"] = sentiments
                         df["sentiment"] = df["sentiment"].apply(lambda x: f"{x:.15f}")
+
                     df = add_features(df)
                     df = compute_custom_features(df)
-                    for col in list(df.columns):
-                        if col in DISABLED_FEATURES_SET and col != "sentiment":
-                            df.drop(columns=[col], inplace=True)
+                    df = drop_disabled_features(df)
+
                     df.to_csv(csv_filename, index=False)
                     logging.info(f"[{ticker}] Saved updated CSV with data & features (minus disabled) for feature-importance.")
 
@@ -1234,13 +1286,13 @@ def console_listener():
                         logging.error(f"[{ticker}] Could not convert sentiment to float: {e}")
                         continue
 
-                # re-add in memory for training
                 df = add_features(df)
                 df = compute_custom_features(df)
-                for col in list(df.columns):
-                    if col in DISABLED_FEATURES_SET and col != "sentiment":
-                        df.drop(columns=[col], inplace=True)
+                df = drop_disabled_features(df)
 
+                if 'close' not in df.columns:
+                    logging.error(f"[{ticker}] No 'close' column. Cannot run feature-importance.")
+                    continue
                 df['target'] = df['close'].shift(-1)
                 df.dropna(inplace=True)
                 if len(df) < 10:
@@ -1279,120 +1331,92 @@ def console_listener():
             logging.info("  predict-next [-r]")
             logging.info("  run-sentiment [-r]")
             logging.info("  force-run [-r]")
-            logging.info("  backtest <N> [timeframe optional] [-r]")
+            logging.info("  backtest <N> [simple|complex] [timeframe?] [-r?]")
             logging.info("  feature-importance [timeframe optional] [-r]")
-            logging.info("  set-tickers (tickers)")
-            logging.info("  set-timeframe (timeframe)")
-            logging.info("  set-nbars (Number of candles)")
-            logging.info("  set-news (on/off)")
-            logging.info("  disable-feature <comma-separated features>")
+            logging.info("  set-tickers (tickers)  # usage: set-tickers TSLA,APPL")
+            logging.info("  set-timeframe (timeframe)  # usage: set-timeframe 4Hour")
+            logging.info("  set-nbars (Number of candles)  # usage: set-nbars 5000")
+            logging.info("  set-news (on/off)  # usage: set-news on OR set-news off")
+            logging.info("  disable-feature <comma-separated/features or main/base>")
             logging.info("  auto-feature")
             logging.info("  commands")
 
-        # -------------------------------
-        # Extended "disable-feature" logic
-        # -------------------------------
-        elif cmd == "disable-feature":
-            """
-            If user sets "disable-feature main", only the following remain enabled:
-              open, high, low, close, vwap,
-              lagged_close_1, lagged_close_2, lagged_close_3, lagged_close_5, lagged_close_10,
-              bollinger_upper, bollinger_lower,
-              momentum, obv,
-              sentiment (always forced)
-
-            If user sets "disable-feature base", only:
-              timestamp, open, high, low, close, volume, vwap, transactions,
-              sentiment
-
-            Otherwise, we do the normal approach
-            """
+        # ---- NEW COMMANDS IMPLEMENTATION ----
+        elif cmd == "set-tickers":
             if len(parts) < 2:
-                logging.warning("Usage: disable-feature <comma-separated features> OR disable-feature main/base")
+                logging.info("Usage: set-tickers TICKER1,TICKER2,...")
                 continue
+            new_tick_str = parts[1]
+            update_env_variable("TICKERS", new_tick_str)
+            # Also update in memory
+            TICKERS = [s.strip() for s in new_tick_str.split(",") if s.strip()]
+            logging.info(f"Updated TICKERS in memory to {TICKERS}")
 
-            new_disabled = parts[1].strip().lower()
-            if new_disabled == "main":
-                # enable only main set
-                # that means we disable everything except the main set + sentiment
-                main_set = {
-                    "timestamp","open","high","low","close","vwap",
-                    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10",
-                    "bollinger_upper","bollinger_lower",
-                    "momentum","obv",
-                    "sentiment"
-                }
-                # We'll gather the full possible and remove from main_set
-                all_possible = {
-                    "timestamp","open","high","low","close","volume","vwap","transactions","sentiment",
-                    "price_change","high_low_range","log_volume","price_return","candle_rise","body_size",
-                    "wick_to_body","macd_line","rsi","momentum","roc","atr","hist_vol","obv","volume_change",
-                    "stoch_k","bollinger_upper","bollinger_lower",
-                    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10"
-                }
-                # everything not in main_set is disabled
-                final_disabled = all_possible - main_set
-                # remove 'sentiment' if present
-                if "sentiment" in final_disabled:
-                    final_disabled.remove("sentiment")
-                new_disabled_str = ",".join(sorted(final_disabled))
-                update_env_variable("DISABLED_FEATURES", new_disabled_str)
-                # also update in memory
-                new_set = set(final_disabled)
-                if "sentiment" in new_set:
-                    new_set.remove("sentiment")
-                DISABLED_FEATURES_SET = new_set
-                logging.info(f"disable-feature main => DISABLED_FEATURES={new_disabled_str}")
+        elif cmd == "set-timeframe":
+            if len(parts) < 2:
+                logging.info("Usage: set-timeframe 4Hour/1Day/etc.")
                 continue
-            elif new_disabled == "base":
-                # enable only base set
-                # base set is {timestamp, open, high, low, close, volume, vwap, transactions, sentiment}
-                base_set = {
-                    "timestamp","open","high","low","close","volume","vwap","transactions","sentiment"
-                }
-                all_possible = {
-                    "timestamp","open","high","low","close","volume","vwap","transactions","sentiment",
-                    "price_change","high_low_range","log_volume","price_return","candle_rise","body_size",
-                    "wick_to_body","macd_line","rsi","momentum","roc","atr","hist_vol","obv","volume_change",
-                    "stoch_k","bollinger_upper","bollinger_lower",
-                    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10"
-                }
-                final_disabled = all_possible - base_set
-                if "sentiment" in final_disabled:
-                    final_disabled.remove("sentiment")
-                new_disabled_str = ",".join(sorted(final_disabled))
-                update_env_variable("DISABLED_FEATURES", new_disabled_str)
-                new_set = set(final_disabled)
-                if "sentiment" in new_set:
-                    new_set.remove("sentiment")
-                DISABLED_FEATURES_SET = new_set
-                logging.info(f"disable-feature base => DISABLED_FEATURES={new_disabled_str}")
+            new_tf = parts[1]
+            update_env_variable("BAR_TIMEFRAME", new_tf)
+            BAR_TIMEFRAME = new_tf
+            logging.info(f"Updated BAR_TIMEFRAME in memory to {BAR_TIMEFRAME}")
+
+        elif cmd == "set-nbars":
+            if len(parts) < 2:
+                logging.info("Usage: set-nbars 5000")
                 continue
+            new_nbars_str = parts[1]
+            try:
+                new_nbars = int(new_nbars_str)
+                update_env_variable("N_BARS", str(new_nbars))
+                N_BARS = new_nbars
+                logging.info(f"Updated N_BARS in memory to {N_BARS}")
+            except Exception as e:
+                logging.error(f"Cannot parse set-nbars: {e}")
+
+        elif cmd == "set-news":
+            if len(parts) < 2:
+                logging.info("Usage: set-news on/off")
+                continue
+            new_news = parts[1].lower()
+            if new_news not in ['on','off']:
+                logging.warning("set-news expects 'on' or 'off'.")
+                continue
+            update_env_variable("NEWS_MODE", new_news)
+            NEWS_MODE = new_news
+            logging.info(f"Updated NEWS_MODE in memory to {NEWS_MODE}")
+        # ---- END OF NEW COMMANDS ----
+
+        elif cmd == "disable-feature":
+            if len(parts) < 2:
+                logging.warning("Usage: disable-feature <comma-separated features OR 'main'/'base'>")
+                continue
+            new_disabled = parts[1]
+            update_env_variable("DISABLED_FEATURES", new_disabled)
+            DISABLED_FEATURES = new_disabled
+            # Rebuild the set
+            if new_disabled in ["main", "base"]:
+                # We'll store the actual text "main" or "base" in the env 
+                # The drop_disabled_features logic will handle it specially.
+                DISABLED_FEATURES_SET = set()
             else:
-                # normal approach
-                # parse user input
-                # forcibly remove "sentiment" if present
-                features_list = [f.strip() for f in new_disabled.split(",") if f.strip()]
-                if "sentiment" in features_list:
-                    features_list.remove("sentiment")
-                # turn into string
-                new_disabled_str = ",".join(features_list)
-                update_env_variable("DISABLED_FEATURES", new_disabled_str)
-                if new_disabled_str.strip():
-                    new_set = set(features_list)
+                if new_disabled.strip():
+                    new_set = set([f.strip() for f in new_disabled.split(",") if f.strip()])
                 else:
                     new_set = set()
-                # again remove sentiment if user tried
-                if "sentiment" in new_set:
-                    new_set.remove("sentiment")
+                # but do not allow "sentiment" to be disabled:
+                new_set.discard("sentiment")
                 DISABLED_FEATURES_SET = new_set
-                logging.info(f"Updated DISABLED_FEATURES in memory to {DISABLED_FEATURES_SET}")
+
+            logging.info(f"Updated DISABLED_FEATURES in memory to {DISABLED_FEATURES}")
+            logging.info(f"Updated DISABLED_FEATURES_SET to {DISABLED_FEATURES_SET}")
 
         elif cmd == "auto-feature":
             threshold = 0.01
             logging.info("Running auto-feature with threshold=%.2f." % threshold)
             combined_importances = {}
             combined_counts = {}
+
             for ticker in TICKERS:
                 tf_code = timeframe_to_code(BAR_TIMEFRAME)
                 csv_filename = f"{ticker}_{tf_code}.csv"
@@ -1408,29 +1432,32 @@ def console_listener():
                         df["sentiment"] = df["sentiment"].astype(float)
                     except:
                         pass
-                # re-add features in memory
+
+                # Re-add features in memory
                 df = add_features(df)
                 df = compute_custom_features(df)
-                # do not drop from memory yet if we want to see all columns
-                # we do want to skip them if they're not in the CSV though
+                # skip dropping for now, because we want to see importances for everything
+                if 'close' not in df.columns:
+                    logging.warning(f"[{ticker}] No close column for auto-feature. Skipping.")
+                    continue
                 df['target'] = df['close'].shift(-1)
                 df.dropna(inplace=True)
                 if len(df) < 10:
                     logging.warning(f"[{ticker}] Not enough rows after shift.")
                     continue
 
-                possible_cols = {
-                    "timestamp","open","high","low","close","volume","vwap","transactions","sentiment",
-                    "price_change","high_low_range","log_volume","price_return","candle_rise","body_size",
-                    "wick_to_body","macd_line","rsi","momentum","roc","atr","hist_vol","obv","volume_change",
-                    "stoch_k","bollinger_upper","bollinger_lower",
-                    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10"
-                }
-                # see which ones exist in df
+                possible_cols = [
+                    'open','high','low','close','volume','vwap',
+                    'price_change','high_low_range','log_volume','sentiment',
+                    'price_return','candle_rise','body_size','wick_to_body','macd_line',
+                    'rsi','momentum','roc','atr','hist_vol','obv','volume_change',
+                    'stoch_k','bollinger_upper','bollinger_lower',
+                    'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10'
+                ]
                 available_cols = [c for c in possible_cols if c in df.columns]
-
                 X = df[available_cols]
                 y = df['target']
+
                 if len(X) < 10:
                     logging.warning(f"[{ticker}] Not enough data to compute feature importances.")
                     continue
@@ -1452,7 +1479,6 @@ def console_listener():
                 logging.info("No features or tickers processed in auto-feature. Possibly no data.")
                 continue
 
-            # average
             averaged = {}
             for col, tot in combined_importances.items():
                 avg_imp = tot / combined_counts[col]
@@ -1464,8 +1490,6 @@ def console_listener():
 
             to_disable = []
             for col, imp in averaged.items():
-                if col == "sentiment":
-                    continue  # never disable sentiment
                 if imp < threshold:
                     to_disable.append(col)
 
@@ -1476,9 +1500,10 @@ def console_listener():
             new_disabled_str = ",".join(to_disable)
             logging.info(f"auto-feature: disabling features below threshold: {new_disabled_str}")
             update_env_variable("DISABLED_FEATURES", new_disabled_str)
+            DISABLED_FEATURES = new_disabled_str
+            # again, remove 'sentiment' from the set
             new_set = set(to_disable)
-            if "sentiment" in new_set:
-                new_set.remove("sentiment")
+            new_set.discard("sentiment")
             DISABLED_FEATURES_SET = new_set
             logging.info(f"Updated DISABLED_FEATURES in memory to {DISABLED_FEATURES_SET}")
 
@@ -1490,8 +1515,8 @@ def main():
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [timeframe] [-r], feature-importance [timeframe] [-r], commands")
-    logging.info("Also: set-tickers, set-timeframe, set-nbars, set-news (on/off), disable-feature <list>, auto-feature")
+    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], feature-importance [timeframe] [-r], commands")
+    logging.info("Also: set-tickers, set-timeframe, set-nbars, set-news, disable-feature <list or main/base>, auto-feature")
     while not SHUTDOWN:
         try:
             schedule.run_pending()

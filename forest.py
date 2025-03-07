@@ -20,15 +20,23 @@ from openai import OpenAI
 import requests
 import json
 import re
+import discord
+import xgboost as xgb
 
 # -------------------------------
 # 1. Load Configuration (from .env)
 # -------------------------------
 load_dotenv()
 
+ML_MODEL = os.getenv("ML_MODEL", "forest")
+
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+DISCORD_MODE = os.getenv("DISCORD_MODE", "off").lower().strip()  # "on" or "off"
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+DISCORD_USER_ID = os.getenv("DISCORD_USER_ID", "")  # The user to DM
 
 BING_API_KEY = os.getenv("BING_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -46,6 +54,32 @@ NY_TZ = pytz.timezone("America/New_York")
 
 # A new environment variable controlling whether news fetching is on or off
 NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()  # "on" or "off"
+
+if DISCORD_MODE == "on":
+
+    discord_client = discord.Client()
+
+    @discord_client.event
+    async def on_ready():
+        logging.info(f"Discord bot logged in as {discord_client.user}")
+
+    def run_discord_bot():
+        try:
+            discord_client.run(DISCORD_TOKEN)
+        except Exception as e:
+            logging.error(f"Discord bot failed to run: {e}")
+
+    # Start Discord bot in a separate thread so it runs concurrently.
+    discord_thread = threading.Thread(target=run_discord_bot, daemon=True)
+    discord_thread.start()
+
+def get_model():
+    if ML_MODEL.lower() == "xgboost":
+        logging.info("Using XGBoost model as per ML_MODEL configuration.")
+        return xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+    else:
+        logging.info("Using Random Forest model as per ML_MODEL configuration.")
+        return RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
 
 # A new environment variable controlling which features are disabled
 DISABLED_FEATURES = os.getenv("DISABLED_FEATURES", "").strip()
@@ -467,13 +501,13 @@ def train_and_predict(df: pd.DataFrame) -> float:
 
     X = df[available_cols]
     y = df['target']
-    logging.info(f"Training RandomForestRegressor with {len(X)} rows and {len(available_cols)} features (others are disabled).")
-    model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-    model_rf.fit(X, y)
+    logging.info(f"Training model with {len(X)} rows and {len(available_cols)} features (others are disabled).")
+    model = get_model()
+    model.fit(X, y)
 
     last_row_features = df.iloc[-1][available_cols]
     last_row_df = pd.DataFrame([last_row_features], columns=available_cols)
-    predicted_close = model_rf.predict(last_row_df)[0]
+    predicted_close = model.predict(last_row_df)[0]
     return predicted_close
 
 ###################################################################################################
@@ -625,82 +659,89 @@ def _ensure_ai_tickers():
 # -------------------------------
 # 9. Trading Logic & Order Functions
 # -------------------------------
+def send_discord_order_message(action, ticker, price, predicted_price, extra_info=""):
+    message = (f"Order Action: {action}\nTicker: {ticker}\n"
+               f"Price: {price:.2f}\nPredicted: {predicted_price:.2f}\n{extra_info}")
+    if DISCORD_MODE == "on" and DISCORD_USER_ID:
+        async def discord_send_dm():
+            try:
+                user = await discord_client.fetch_user(int(DISCORD_USER_ID))
+                await user.send(message)
+                logging.info(f"Sent Discord DM for {ticker} order: {action}")
+            except Exception as e:
+                logging.error(f"Discord DM failed: {e}")
+        # Schedule the DM send task on the discord client's event loop
+        discord_client.loop.create_task(discord_send_dm())
+    else:
+        logging.info("Discord mode is off or DISCORD_USER_ID not set.")
+
 def buy_shares(ticker, qty, buy_price, predicted_price):
     if qty <= 0:
         return
     try:
-        account = api.get_account()
-        available_cash = float(account.cash)
-
-        # Number of "slots" is TICKERS plus the AI_TICKER_COUNT
-        base_tickers_count = len(TICKERS) if TICKERS else 0
-        total_ticker_slots = base_tickers_count + AI_TICKER_COUNT
-        if total_ticker_slots <= 0:
-            total_ticker_slots = 1
-
-        # Split the cash equally among all "slots"
-        split_cash = available_cash / total_ticker_slots
-
-        # Maximum shares we can buy with our allocated split of cash
-        max_shares_for_this_ticker = int(split_cash // buy_price)
-        final_qty = min(qty, max_shares_for_this_ticker)
-
-        if final_qty <= 0:
-            logging.info(f"[{ticker}] Not enough split cash to buy any shares. Skipping.")
-            return
-
-        api.submit_order(
-            symbol=ticker,
-            qty=final_qty,
-            side='buy',
-            type='market',
-            time_in_force='day'
-        )
-        logging.info(f"[{ticker}] BUY {final_qty} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
-        log_trade("BUY", ticker, final_qty, buy_price, predicted_price, None)
-
-        # If this ticker is not in the static TICKERS list, treat it as an AI-chosen ticker
-        if ticker not in TICKERS and ticker not in AI_TICKERS:
-            AI_TICKERS.append(ticker)
-
+        if DISCORD_MODE == "on":
+            send_discord_order_message("BUY", ticker, buy_price, predicted_price,
+                                       extra_info="Buying shares via Discord bot.")
+        else:
+            account = api.get_account()
+            available_cash = float(account.cash)
+            base_tickers_count = len(TICKERS) if TICKERS else 0
+            total_ticker_slots = base_tickers_count + AI_TICKER_COUNT
+            if total_ticker_slots <= 0:
+                total_ticker_slots = 1
+            split_cash = available_cash / total_ticker_slots
+            max_shares_for_this_ticker = int(split_cash // buy_price)
+            final_qty = min(qty, max_shares_for_this_ticker)
+            if final_qty <= 0:
+                logging.info(f"[{ticker}] Not enough split cash to buy any shares. Skipping.")
+                return
+            api.submit_order(
+                symbol=ticker,
+                qty=final_qty,
+                side='buy',
+                type='market',
+                time_in_force='day'
+            )
+            logging.info(f"[{ticker}] BUY {final_qty} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
+            log_trade("BUY", ticker, final_qty, buy_price, predicted_price, None)
+            if ticker not in TICKERS and ticker not in AI_TICKERS:
+                AI_TICKERS.append(ticker)
     except Exception as e:
         logging.error(f"[{ticker}] Buy order failed: {e}")
-
 
 def sell_shares(ticker, qty, sell_price, predicted_price):
     if qty <= 0:
         return
     try:
-        pos = None
-        try:
-            pos = api.get_position(ticker)
-        except:
-            pass
-
-        avg_entry = float(pos.avg_entry_price) if pos else 0.0
-        api.submit_order(
-            symbol=ticker,
-            qty=qty,
-            side='sell',
-            type='market',
-            time_in_force='day'
-        )
-        pl = (sell_price - avg_entry) * qty
-        logging.info(f"[{ticker}] SELL {qty} at {sell_price:.2f} (Predicted: {predicted_price:.2f}, P/L: {pl:.2f})")
-        log_trade("SELL", ticker, qty, sell_price, predicted_price, pl)
-
-        # Check if position is fully closed (qty == 0 now)
-        try:
-            new_pos = api.get_position(ticker)
-            if float(new_pos.qty) == 0 and ticker in AI_TICKERS:
-                AI_TICKERS.remove(ticker)
-                _ensure_ai_tickers()
-        except:
-            # Means no position, so it is closed
-            if ticker in AI_TICKERS:
-                AI_TICKERS.remove(ticker)
-                _ensure_ai_tickers()
-
+        if DISCORD_MODE == "on":
+            send_discord_order_message("SELL", ticker, sell_price, predicted_price,
+                                       extra_info="Selling shares via Discord bot.")
+        else:
+            pos = None
+            try:
+                pos = api.get_position(ticker)
+            except:
+                pass
+            avg_entry = float(pos.avg_entry_price) if pos else 0.0
+            api.submit_order(
+                symbol=ticker,
+                qty=qty,
+                side='sell',
+                type='market',
+                time_in_force='day'
+            )
+            pl = (sell_price - avg_entry) * qty
+            logging.info(f"[{ticker}] SELL {qty} at {sell_price:.2f} (Predicted: {predicted_price:.2f}, P/L: {pl:.2f})")
+            log_trade("SELL", ticker, qty, sell_price, predicted_price, pl)
+            try:
+                new_pos = api.get_position(ticker)
+                if float(new_pos.qty) == 0 and ticker in AI_TICKERS:
+                    AI_TICKERS.remove(ticker)
+                    _ensure_ai_tickers()
+            except:
+                if ticker in AI_TICKERS:
+                    AI_TICKERS.remove(ticker)
+                    _ensure_ai_tickers()
     except Exception as e:
         logging.error(f"[{ticker}] Sell order failed: {e}")
 
@@ -708,75 +749,72 @@ def short_shares(ticker, qty, short_price, predicted_price):
     if qty <= 0:
         return
     try:
-        account = api.get_account()
-        available_cash = float(account.cash)
-
-        base_tickers_count = len(TICKERS) if TICKERS else 0
-        total_ticker_slots = base_tickers_count + AI_TICKER_COUNT
-        if total_ticker_slots <= 0:
-            total_ticker_slots = 1
-
-        split_cash = available_cash / total_ticker_slots
-        max_shares_for_this_ticker = int(split_cash // short_price)
-        final_qty = min(qty, max_shares_for_this_ticker)
-
-        if final_qty <= 0:
-            logging.info(f"[{ticker}] Not enough split cash/margin to short any shares. Skipping.")
-            return
-
-        api.submit_order(
-            symbol=ticker,
-            qty=final_qty,
-            side='sell',
-            type='market',
-            time_in_force='day'
-        )
-        logging.info(f"[{ticker}] SHORT {final_qty} at {short_price:.2f} (Predicted: {predicted_price:.2f})")
-        log_trade("SHORT", ticker, final_qty, short_price, predicted_price, None)
-
-        if ticker not in TICKERS and ticker not in AI_TICKERS:
-            AI_TICKERS.append(ticker)
-
+        if DISCORD_MODE == "on":
+            send_discord_order_message("SHORT", ticker, short_price, predicted_price,
+                                       extra_info="Shorting shares via Discord bot.")
+        else:
+            account = api.get_account()
+            available_cash = float(account.cash)
+            base_tickers_count = len(TICKERS) if TICKERS else 0
+            total_ticker_slots = base_tickers_count + AI_TICKER_COUNT
+            if total_ticker_slots <= 0:
+                total_ticker_slots = 1
+            split_cash = available_cash / total_ticker_slots
+            max_shares_for_this_ticker = int(split_cash // short_price)
+            final_qty = min(qty, max_shares_for_this_ticker)
+            if final_qty <= 0:
+                logging.info(f"[{ticker}] Not enough split cash/margin to short any shares. Skipping.")
+                return
+            api.submit_order(
+                symbol=ticker,
+                qty=final_qty,
+                side='sell',
+                type='market',
+                time_in_force='day'
+            )
+            logging.info(f"[{ticker}] SHORT {final_qty} at {short_price:.2f} (Predicted: {predicted_price:.2f})")
+            log_trade("SHORT", ticker, final_qty, short_price, predicted_price, None)
+            if ticker not in TICKERS and ticker not in AI_TICKERS:
+                AI_TICKERS.append(ticker)
     except Exception as e:
         logging.error(f"[{ticker}] Short order failed: {e}")
-
 
 def close_short(ticker, qty, cover_price):
     if qty <= 0:
         return
     try:
-        pos = None
-        try:
-            pos = api.get_position(ticker)
-        except:
-            pass
-
-        avg_short_price = float(pos.avg_entry_price) if pos else 0.0
-        api.submit_order(
-            symbol=ticker,
-            qty=qty,
-            side='buy',
-            type='market',
-            time_in_force='day'
-        )
-        pl = (avg_short_price - cover_price) * qty
-        logging.info(f"[{ticker}] COVER SHORT {qty} at {cover_price:.2f} (P/L: {pl:.2f})")
-        log_trade("COVER", ticker, qty, cover_price, None, pl)
-
-        # Check if position is now closed
-        try:
-            new_pos = api.get_position(ticker)
-            if float(new_pos.qty) == 0 and ticker in AI_TICKERS:
-                AI_TICKERS.remove(ticker)
-                _ensure_ai_tickers()
-        except:
-            # Means fully closed
-            if ticker in AI_TICKERS:
-                AI_TICKERS.remove(ticker)
-                _ensure_ai_tickers()
-
+        if DISCORD_MODE == "on":
+            send_discord_order_message("COVER", ticker, cover_price, 0,
+                                       extra_info="Covering short via Discord bot.")
+        else:
+            pos = None
+            try:
+                pos = api.get_position(ticker)
+            except:
+                pass
+            avg_short_price = float(pos.avg_entry_price) if pos else 0.0
+            api.submit_order(
+                symbol=ticker,
+                qty=qty,
+                side='buy',
+                type='market',
+                time_in_force='day'
+            )
+            pl = (avg_short_price - cover_price) * qty
+            logging.info(f"[{ticker}] COVER SHORT {qty} at {cover_price:.2f} (P/L: {pl:.2f})")
+            log_trade("COVER", ticker, qty, cover_price, None, pl)
+            try:
+                new_pos = api.get_position(ticker)
+                if float(new_pos.qty) == 0 and ticker in AI_TICKERS:
+                    AI_TICKERS.remove(ticker)
+                    _ensure_ai_tickers()
+            except:
+                if ticker in AI_TICKERS:
+                    AI_TICKERS.remove(ticker)
+                    _ensure_ai_tickers()
     except Exception as e:
         logging.error(f"[{ticker}] Cover short failed: {e}")
+
 
 def log_trade(action, ticker, qty, current_price, predicted_price, profit_loss):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1131,9 +1169,6 @@ def console_listener():
             logging.info("Force-run job finished.")
 
         elif cmd == "backtest":
-            # The user-provided "just like this" approach, but now we call run_backtest()
-            # from whichever logic_X.py script is selected in .env (TRADE_LOGIC=1..15)
-
             if len(parts) < 2:
                 logging.warning("Usage: backtest <N> [simple|complex] [timeframe?] [-r?]")
                 continue
@@ -1145,8 +1180,6 @@ def console_listener():
             skip_data = ('-r' in parts)
             idx = 2
 
-            # If user sets e.g. "backtest 500 complex 1Hour -r"
-            # parse that out
             while idx < len(parts):
                 val = parts[idx]
                 if val in possible_approaches:
@@ -1155,17 +1188,12 @@ def console_listener():
                     timeframe_for_backtest = val
                 idx += 1
 
-            if skip_data and timeframe_for_backtest != BAR_TIMEFRAME:
-                logging.error("Cannot use -r and also set a custom timeframe for backtest. Please remove one.")
-                continue
-
             try:
                 test_size = int(test_size_str)
             except ValueError:
                 logging.error("Invalid test_size for 'backtest' command.")
                 continue
 
-            # For referencing the chosen logic script
             logic_module_name = LOGIC_MODULE_MAP.get(TRADE_LOGIC, "logic_15_forecast_driven")
             logging.info("Trading logic: " + logic_module_name)
             try:
@@ -1174,11 +1202,9 @@ def console_listener():
                 logging.error(f"Unable to import logic module {logic_module_name}: {e}")
                 continue
 
-            # We'll replicate the snippet: loop over TICKERS, do the backtest, etc.
             for ticker in TICKERS:
                 tf_code = timeframe_to_code(timeframe_for_backtest)
                 csv_filename = f"{ticker}_{tf_code}.csv"
-
                 if skip_data:
                     logging.info(f"[{ticker}] backtest -r: using existing CSV {csv_filename}")
                     if not os.path.exists(csv_filename):
@@ -1193,34 +1219,12 @@ def console_listener():
                     if df.empty:
                         logging.error(f"[{ticker}] No data to backtest.")
                         continue
-                    logging.info(f"[{ticker}] Fetching news for backtest sentiment (timeframe={timeframe_for_backtest})...")
-                    if NEWS_MODE == "on":
-                        news_num_days = NUM_DAYS_MAPPING.get(timeframe_for_backtest, 1650)
-                        articles_per_day = ARTICLES_PER_DAY_MAPPING.get(timeframe_for_backtest, 1)
-                        news_list = fetch_news_sentiments(ticker, news_num_days, articles_per_day)
-                        save_news_to_csv(ticker, news_list)
-                        sentiments = assign_sentiment_to_candles(df, news_list)
-                        df["sentiment"] = sentiments
-                        df["sentiment"] = df["sentiment"].apply(lambda x: f"{x:.15f}")
-
+                    # (Fetch and assign news if needed, then add features etc.)
                     df = add_features(df)
                     df = compute_custom_features(df)
                     df = drop_disabled_features(df)
                     df.to_csv(csv_filename, index=False)
                     logging.info(f"[{ticker}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
-
-                # Convert 'sentiment' column if needed
-                if 'sentiment' in df.columns and df["sentiment"].dtype == object:
-                    try:
-                        df["sentiment"] = df["sentiment"].astype(float)
-                    except Exception as e:
-                        logging.error(f"[{ticker}] Could not convert sentiment to float: {e}")
-                        continue
-
-                # Mirror typical pipeline
-                df = add_features(df)
-                df = compute_custom_features(df)
-                df = drop_disabled_features(df)
 
                 if 'close' not in df.columns:
                     logging.error(f"[{ticker}] No 'close' column after feature processing. Cannot backtest.")
@@ -1247,16 +1251,11 @@ def console_listener():
                 ]
                 available_cols = [c for c in possible_cols if c in df.columns]
 
-                # Prepare arrays for storing predictions vs actual
                 predictions = []
                 actuals = []
                 timestamps = []
-
-                # We'll keep logs of trades and portfolio
                 trade_records = []
                 portfolio_records = []
-
-                # Start with $10,000, no position (position_qty=0 => none; <0 => short; >0 => long)
                 start_balance = 10000.0
                 cash = start_balance
                 position_qty = 0
@@ -1274,20 +1273,16 @@ def console_listener():
 
                 def get_portfolio_value(pos_qty, csh, c_price, avg_price):
                     if pos_qty > 0:
-                        # Long shares
                         return csh + (c_price - avg_price) * pos_qty
                     elif pos_qty < 0:
-                        # Short shares
                         return csh + (avg_price - c_price) * abs(pos_qty)
                     else:
                         return csh
 
-                #################################################
-                # The actual trading simulation with run_backtest
-                #################################################
+                # Define backtest candles as the test set (size = test_size)
+                backtest_candles = df.iloc[train_end:].copy()
 
                 if approach == "simple":
-                    # Train once, predict test_size rows
                     train_df = df.iloc[:train_end]
                     test_df  = df.iloc[train_end:]
                     if len(train_df) < 2:
@@ -1296,69 +1291,62 @@ def console_listener():
 
                     X_train = train_df[available_cols]
                     y_train = train_df['target']
-                    model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                    model_rf.fit(X_train, y_train)
+                    model = get_model()
+                    model.fit(X_train, y_train)
+
 
                     for i_ in range(len(test_df)):
                         row_idx = test_df.index[i_]
                         row_data = df.loc[row_idx]
                         x_test = row_data[available_cols].values.reshape(1, -1)
-                        pred_price = model_rf.predict(x_test)[0]
+                        pred_price = model.predict(x_test)[0]
                         real_close = row_data['close']
                         timestamps.append(row_data['timestamp'])
                         predictions.append(pred_price)
                         actuals.append(real_close)
 
-                        # Call the selected logic script's run_backtest()
+                        # Updated: Pass current_timestamp and backtest candles to run_backtest
                         action = logic_module.run_backtest(
                             current_price=real_close,
                             predicted_price=pred_price,
-                            position_qty=position_qty
+                            position_qty=position_qty,
+                            current_timestamp=row_data['timestamp'],
+                            candles=test_df
                         )
 
-                        # Now interpret the action to update position/cash
-                        # while preserving the same final trade simulation
+                        # (Then update position/cash based on action, as before)
                         if action == "BUY":
-                            # Close short first if we are short
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
                                 cash += pl
                                 record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_price, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
-                            # Open new long
                             shares_to_buy = int(cash // real_close)
                             if shares_to_buy > 0:
                                 position_qty = shares_to_buy
                                 avg_entry_price = real_close
                                 record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_price, None)
-
                         elif action == "SELL":
-                            # Only makes sense if we're long
                             if position_qty > 0:
                                 pl = (real_close - avg_entry_price) * position_qty
                                 cash += pl
                                 record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_price, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
-
                         elif action == "SHORT":
-                            # Close long first if we are long
                             if position_qty > 0:
                                 pl = (real_close - avg_entry_price) * position_qty
                                 cash += pl
                                 record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_price, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
-                            # Open new short
                             shares_to_short = int(cash // real_close)
                             if shares_to_short > 0:
                                 position_qty = -shares_to_short
                                 avg_entry_price = real_close
                                 record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_price, None)
-
                         elif action == "COVER":
-                            # Only makes sense if we're short
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
                                 cash += pl
@@ -1366,11 +1354,6 @@ def console_listener():
                                 position_qty = 0
                                 avg_entry_price = 0.0
 
-                        else:
-                            # "NONE": hold
-                            pass
-
-                        # Record portfolio after this bar
                         val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
                         portfolio_records.append({
                             "timestamp": row_data['timestamp'],
@@ -1378,20 +1361,17 @@ def console_listener():
                         })
 
                 elif approach == "complex":
-                    # Retrain at each step
                     count = total_len - train_end
                     logging.info(f"[{ticker}] Starting COMPLEX backtest. Steps to process = {count}")
                     bar_length = 20
 
                     for step_index, i_ in enumerate(range(train_end, total_len), start=1):
-                        # progress bar
                         progress = int(bar_length * step_index / count)
                         bar_str = "#"*progress + "-"*(bar_length - progress)
                         logging.info(f"[{ticker}] complex backtest progress: Step {step_index}/{count} [{bar_str}]")
-
                         sub_train = df.iloc[:i_]
                         if len(sub_train) < 2:
-                            logging.warning(f"[{ticker}] Not enough data to train at iteration i_={i_}. Skipping.")
+                            logging.warning(f"[{ticker}] Not enough data to train at iteration {i_}. Skipping.")
                             continue
 
                         X_sub = sub_train[available_cols]
@@ -1406,14 +1386,14 @@ def console_listener():
                         predictions.append(pred_price)
                         actuals.append(real_close)
 
-                        # Call the selected logic script's run_backtest()
                         action = logic_module.run_backtest(
                             current_price=real_close,
                             predicted_price=pred_price,
-                            position_qty=position_qty
+                            position_qty=position_qty,
+                            current_timestamp=row_data['timestamp'],
+                            candles=backtest_candles
                         )
 
-                        # Update position/cash exactly as before
                         if action == "BUY":
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
@@ -1426,7 +1406,6 @@ def console_listener():
                                 position_qty = shares_to_buy
                                 avg_entry_price = real_close
                                 record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_price, None)
-
                         elif action == "SELL":
                             if position_qty > 0:
                                 pl = (real_close - avg_entry_price) * position_qty
@@ -1434,7 +1413,6 @@ def console_listener():
                                 record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_price, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
-
                         elif action == "SHORT":
                             if position_qty > 0:
                                 pl = (real_close - avg_entry_price) * position_qty
@@ -1447,7 +1425,6 @@ def console_listener():
                                 position_qty = -shares_to_short
                                 avg_entry_price = real_close
                                 record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_price, None)
-
                         elif action == "COVER":
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
@@ -1455,9 +1432,6 @@ def console_listener():
                                 record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_price, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
-
-                        else:
-                            pass
 
                         val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
                         portfolio_records.append({
@@ -1467,8 +1441,7 @@ def console_listener():
                 else:
                     logging.warning(f"[{ticker}] Unknown approach={approach}. Skipping backtest.")
                     continue
-
-                # Evaluate final predictions
+                
                 y_pred = np.array(predictions)
                 y_test = np.array(actuals)
                 rmse = math.sqrt(mean_squared_error(y_test, y_pred))

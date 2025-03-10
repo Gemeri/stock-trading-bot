@@ -1,5 +1,5 @@
 change env.env to .env
 
 ```
-pip install openai pytz schedule numpy pandas scikit-learn python-dotenv matplotlib alpaca-trade-api yfinance transformers
+pip install pytz schedule numpy pandas matplotlib python-dotenv scikit-learn openai requests xgboost discord.py alpaca-trade-api transformers
 ```

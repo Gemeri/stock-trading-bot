@@ -34,9 +34,9 @@ API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-DISCORD_MODE = os.getenv("DISCORD_MODE", "off").lower().strip()  # "on" or "off"
+DISCORD_MODE = os.getenv("DISCORD_MODE", "off").lower().strip()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-DISCORD_USER_ID = os.getenv("DISCORD_USER_ID", "")  # The user to DM
+DISCORD_USER_ID = os.getenv("DISCORD_USER_ID", "")
 
 BING_API_KEY = os.getenv("BING_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -52,8 +52,7 @@ N_ESTIMATORS = 100
 RANDOM_SEED = 42
 NY_TZ = pytz.timezone("America/New_York")
 
-# A new environment variable controlling whether news fetching is on or off
-NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()  # "on" or "off"
+NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()
 
 if DISCORD_MODE == "on":
 
@@ -69,7 +68,6 @@ if DISCORD_MODE == "on":
         except Exception as e:
             logging.error(f"Discord bot failed to run: {e}")
 
-    # Start Discord bot in a separate thread so it runs concurrently.
     discord_thread = threading.Thread(target=run_discord_bot, daemon=True)
     discord_thread.start()
 
@@ -81,17 +79,14 @@ def get_model():
         logging.info("Using Random Forest model as per ML_MODEL configuration.")
         return RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
 
-# A new environment variable controlling which features are disabled
 DISABLED_FEATURES = os.getenv("DISABLED_FEATURES", "").strip()
 if DISABLED_FEATURES:
     DISABLED_FEATURES_SET = set([f.strip() for f in DISABLED_FEATURES.split(",") if f.strip()])
 else:
     DISABLED_FEATURES_SET = set()
 
-# A new environment variable controlling which trade logic is used
 TRADE_LOGIC = os.getenv("TRADE_LOGIC", "15").strip()
 
-# We define special sets for "main" and "base". 
 MAIN_FEATURES = {
     "timestamp","open","high","low","close","vwap",
     "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10",
@@ -142,10 +137,8 @@ def predict_sentiment(text):
 # -------------------------------
 # 4b. Dictionary to map TRADE_LOGIC to actual module filenames
 # -------------------------------
-# Define the path to the JSON file in the "logic" subdirectory
 json_file_path = os.path.join("logic", "logic_scripts.json")
 
-# Open the file and load its contents into LOGIC_MODULE_MAP
 with open(json_file_path, "r") as file:
     LOGIC_MODULE_MAP = json.load(file)
 
@@ -321,11 +314,6 @@ def save_news_to_csv(ticker: str, news_list: list):
     logging.info(f"[{ticker}] Saved articles with sentiment to {csv_filename}")
 
 def run_sentiment_job(skip_data=False):
-    """
-    Enhanced so that once we fetch candles, we also do
-    add_features, compute_custom_features, drop_disabled_features
-    before or after we assign sentiment (to keep consistent usage of DISABLED_FEATURES).
-    """
     for ticker in TICKERS:
         if skip_data:
             tf_code = timeframe_to_code(BAR_TIMEFRAME)
@@ -517,19 +505,6 @@ def train_and_predict(df: pd.DataFrame) -> float:
 ###################################################################################################
 
 def fetch_new_ai_tickers(num_needed, exclude_tickers):
-    """
-    Use the OpenAI (and optionally Bing) approach to find 'num_needed' new tickers 
-    expected to rise, excluding any in 'exclude_tickers'. Returns a list of ticker symbols.
-
-    NOTE: 
-    1) We now accept a list/array of search queries, each of which is searched on Bing 
-       to get a broader set of snippet contexts for the final prompt.
-    2) We have updated the OpenAI usage to the more modern .chat.completions.create() style 
-       (shown in your example). We also preserve references to anthropic and relevant 
-       environment variables from the previous functionality, without removing anything else.
-    """
-    # Create an OpenAI client in the updated style.
-    # (If needed, you can also specify additional parameters like api_base, etc.)
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
     def bing_web_search(query):
@@ -555,8 +530,6 @@ def fetch_new_ai_tickers(num_needed, exclude_tickers):
             logging.error(f"Bing search failed: {e}")
             return []
 
-    # 1) We do multiple Bing searches for broader context (list/array of queries).
-    #    You can change or extend these queries as needed.
     search_queries = [
         "best US stocks expected to rise soon",
         "top bullish stocks to watch in the US market"
@@ -568,12 +541,9 @@ def fetch_new_ai_tickers(num_needed, exclude_tickers):
         for item in results:
             snippet_contexts.append(f"{item['name']}: {item['snippet']}")
 
-    # Combine them into one large context block.
     joined_snippets = "\n".join(snippet_contexts)
 
-    # 2) Now form an OpenAI prompt that includes the snippet context plus instructions.
     exclude_list_str = ", ".join(sorted(exclude_tickers)) if exclude_tickers else "None"
-    # You can adjust model name or any other parameters as needed.
     prompt_text = (
         f"You are an AI that proposes exactly {num_needed} unique US stock tickers (one per line)\n"
         f"that are likely to rise soon, based on fundamental/technical analysis.\n"
@@ -582,72 +552,56 @@ def fetch_new_ai_tickers(num_needed, exclude_tickers):
         f"Output only {num_needed} lines, each line is a ticker symbol only, no extra text."
     )
 
-    # 3) Perform the OpenAI chat completion request using the updated approach.
     try:
-        # Example messages array mirroring your updated usage style.
         messages = [
             {"role": "system", "content": "You are a financial assistant that suggests promising tickers."},
             {"role": "user", "content": prompt_text}
         ]
 
-        # This is the updated usage, matching your example. Adjust model/params as you wish.
         completion = openai_client.chat.completions.create(
-            model="o1",  # or whichever model ID you prefer
+            model="o1",
             messages=messages,
             store=True
         )
 
-        # Extract the response text
         content = completion.choices[0].message.content.strip()
 
     except Exception as e:
         logging.error(f"Error calling OpenAI ChatCompletion: {e}")
         return []
 
-    # 4) Parse out the returned lines, filter out excluded symbols, and trim to 'num_needed'
     lines = content.split('\n')
     candidate_tickers = []
     for ln in lines:
         tck = ln.strip().upper()
-        # remove punctuation/spaces just in case
         tck = tck.replace('.', '').replace('-', '').replace(' ', '')
         if tck and tck not in exclude_tickers:
             candidate_tickers.append(tck)
 
-    # If there's more than we need, truncate:
     candidate_tickers = candidate_tickers[:num_needed]
     return candidate_tickers
 
 
 def _ensure_ai_tickers():
-    """
-    Ensures we maintain AI_TICKER_COUNT distinct AI tickers in positions.
-    If any AI ticker is not actually open, it is removed from AI_TICKERS.
-    If we have fewer AI tickers than AI_TICKER_COUNT, we fetch new ones automatically.
-    """
     global AI_TICKERS, AI_TICKER_COUNT
 
     if AI_TICKER_COUNT <= 0:
         return
 
-    # Identify which AI tickers are still open
     still_open = set()
     try:
         positions = api.list_positions()
         for p in positions:
-            # If p.symbol is in AI_TICKERS and the qty != 0, it's still open
             if p.symbol in AI_TICKERS and abs(float(p.qty)) > 0:
                 still_open.add(p.symbol)
     except Exception as e:
         logging.error(f"Error retrieving positions in _ensure_ai_tickers: {e}")
 
-    # Keep only those still open
     AI_TICKERS = [t for t in AI_TICKERS if t in still_open]
 
-    # If we have fewer than AI_TICKER_COUNT, fetch new tickers
     needed = AI_TICKER_COUNT - len(AI_TICKERS)
     if needed > 0:
-        exclude = set(TICKERS) | set(AI_TICKERS)  # avoid duplicates
+        exclude = set(TICKERS) | set(AI_TICKERS)
         new_ai_tickers = fetch_new_ai_tickers(needed, exclude)
         for new_tck in new_ai_tickers:
             if new_tck not in AI_TICKERS:
@@ -670,7 +624,6 @@ def send_discord_order_message(action, ticker, price, predicted_price, extra_inf
                 logging.info(f"Sent Discord DM for {ticker} order: {action}")
             except Exception as e:
                 logging.error(f"Discord DM failed: {e}")
-        # Schedule the DM send task on the discord client's event loop
         discord_client.loop.create_task(discord_send_dm())
     else:
         logging.info("Discord mode is off or DISCORD_USER_ID not set.")
@@ -836,34 +789,18 @@ def log_trade(action, ticker, qty, current_price, predicted_price, profit_loss):
 
 
 def _update_logic_json():
-    """
-    Scans the logic/ subdirectory for any Python files named logic_<number>_*.py.
-    Collects them in ascending order by <number>, then writes out a JSON file 
-    (logic_scripts.json) mapping from "1", "2", ... to the module base name 
-    (without .py extension). Example:
-
-      {
-        "1": "logic_1_no_trade_zone",
-        "2": "logic_2_keep_holding",
-        ...
-      }
-
-    So the user can easily create new scripts (logic_16_whatever.py, etc.),
-    and the system automatically updates the JSON file on each startup.
-    """
     logic_dir = "logic"
     if not os.path.isdir(logic_dir):
         os.makedirs(logic_dir)
 
-    # Regex to match logic_<number>_something.py
     pattern = re.compile(r"^logic_(\d+)_(\w+)\.py$")
 
     scripts_map = {}
     for fname in os.listdir(logic_dir):
         match = pattern.match(fname)
         if match:
-            num_str = match.group(1)  # the number part
-            script_base = fname[:-3]  # remove .py extension
+            num_str = match.group(1)
+            script_base = fname[:-3]
             try:
                 num_int = int(num_str)
                 scripts_map[num_int] = script_base
@@ -871,36 +808,26 @@ def _update_logic_json():
                 pass
 
     if not scripts_map:
-        # If no scripts found, just return (or we could create an empty JSON)
         with open(os.path.join(logic_dir, "logic_scripts.json"), "w") as f:
             json.dump({}, f, indent=2)
         return
 
-    # Sort by integer key and then build a new dict with string keys "1", "2", ...
     sorted_nums = sorted(scripts_map.keys())
     final_dict = {}
     for i in sorted_nums:
         final_dict[str(i)] = scripts_map[i]
 
-    # Write to logic_scripts.json
     with open(os.path.join(logic_dir, "logic_scripts.json"), "w") as f:
         json.dump(final_dict, f, indent=2)
 
 
 def _get_logic_script_name(logic_id: str) -> str:
-    """
-    Reads logic_scripts.json and returns the script base name (e.g. "logic_15_forecast_driven")
-    for the given logic_id (e.g. "15").
-    If not found, defaults to "logic_15_forecast_driven" (or any fallback).
-    """
     logic_dir = "logic"
     json_path = os.path.join(logic_dir, "logic_scripts.json")
     if not os.path.isfile(json_path):
-        # If the file doesn't exist, no scripts have been scanned. We do an update now.
         _update_logic_json()
 
     if not os.path.isfile(json_path):
-        # Could not create or find any. Fallback.
         return "logic_15_forecast_driven"
 
     with open(json_path, "r") as f:
@@ -908,7 +835,6 @@ def _get_logic_script_name(logic_id: str) -> str:
         if logic_id in data:
             return data[logic_id]
         else:
-            # fallback if user-specified ID isn't found
             return "logic_15_forecast_driven"
 
 # -------------------------------
@@ -921,10 +847,9 @@ def trade_logic(current_price: float, predicted_price: float, ticker: str):
     """
     try:
         import importlib
-        logic_module_name = _get_logic_script_name(TRADE_LOGIC)  # read from the JSON
+        logic_module_name = _get_logic_script_name(TRADE_LOGIC)
         module_path = f"logic.{logic_module_name}"
         logic_module = importlib.import_module(module_path)
-        # The subscript must define a function "run_logic(current_price, predicted_price, ticker)"
         logic_module.run_logic(current_price, predicted_price, ticker)
     except Exception as e:
         logging.error(f"Error dispatching to trade logic '{TRADE_LOGIC}': {e}")
@@ -1174,7 +1099,7 @@ def console_listener():
                 continue
 
             test_size_str = parts[1]
-            approach = "simple"  # default
+            approach = "simple"
             timeframe_for_backtest = BAR_TIMEFRAME
             possible_approaches = ["simple", "complex"]
             skip_data = ('-r' in parts)
@@ -1219,7 +1144,6 @@ def console_listener():
                     if df.empty:
                         logging.error(f"[{ticker}] No data to backtest.")
                         continue
-                    # (Fetch and assign news if needed, then add features etc.)
                     df = add_features(df)
                     df = compute_custom_features(df)
                     df = drop_disabled_features(df)
@@ -1279,7 +1203,6 @@ def console_listener():
                     else:
                         return csh
 
-                # Define backtest candles as the test set (size = test_size)
                 backtest_candles = df.iloc[train_end:].copy()
 
                 if approach == "simple":
@@ -1305,7 +1228,6 @@ def console_listener():
                         predictions.append(pred_price)
                         actuals.append(real_close)
 
-                        # Updated: Pass current_timestamp and backtest candles to run_backtest
                         action = logic_module.run_backtest(
                             current_price=real_close,
                             predicted_price=pred_price,
@@ -1314,7 +1236,6 @@ def console_listener():
                             candles=test_df
                         )
 
-                        # (Then update position/cash based on action, as before)
                         if action == "BUY":
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
@@ -1477,21 +1398,18 @@ def console_listener():
                 plt.close()
                 logging.info(f"[{ticker}] Saved backtest predictions plot to {out_img}.")
 
-                # Save the trade log
                 trade_log_df = pd.DataFrame(trade_records)
                 trade_log_csv = f"backtest_trades_{ticker}_{test_size}_{tf_code}_{approach}.csv"
                 if not trade_log_df.empty:
                     trade_log_df.to_csv(trade_log_csv, index=False)
                 logging.info(f"[{ticker}] Saved backtest trade log to {trade_log_csv}.")
 
-                # Save the portfolio values
                 port_df = pd.DataFrame(portfolio_records)
                 port_csv = f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.csv"
                 if not port_df.empty:
                     port_df.to_csv(port_csv, index=False)
                 logging.info(f"[{ticker}] Saved backtest portfolio records to {port_csv}.")
 
-                # Plot the portfolio growth
                 if not port_df.empty:
                     plt.figure(figsize=(10, 6))
                     plt.plot(port_df['timestamp'], port_df['portfolio_value'], label='Portfolio Value')
@@ -1509,19 +1427,6 @@ def console_listener():
                     logging.info(f"[{ticker}] Saved backtest portfolio plot to {out_port_img}.")
 
         elif cmd == "feature-importance":
-            """
-            Usage:
-            feature-importance
-            feature-importance -r
-
-            If '-r' is present, we use the existing CSV for each ticker in TICKERS.
-            Otherwise, we fetch new candle data and save to CSV first (similar to get-data),
-            then compute feature importance.
-
-            We'll train a single RandomForestRegressor on each TICKER's data 
-            (shifting close by -1 to create a 'target'), then log sorted feature importances.
-            """
-            # Decide whether to skip fresh data
             if skip_data:
                 logging.info("feature-importance -r: Will use existing CSV data for each ticker.")
             else:
@@ -1531,7 +1436,6 @@ def console_listener():
                 tf_code = timeframe_to_code(BAR_TIMEFRAME)
                 csv_filename = f"{ticker}_{tf_code}.csv"
 
-                # 1) Possibly fetch fresh data unless skip_data
                 if not skip_data:
                     df = fetch_candles(ticker, bars=N_BARS, timeframe=BAR_TIMEFRAME)
                     if df.empty:
@@ -1559,12 +1463,10 @@ def console_listener():
                         logging.error(f"[{ticker}] Could not convert sentiment to float: {e}")
                         continue
 
-                # 3) Re-run the typical pipeline (to ensure we have all relevant columns)
                 df = add_features(df)
                 df = compute_custom_features(df)
                 df = drop_disabled_features(df)
 
-                # 4) Create target as next close
                 if 'close' not in df.columns:
                     logging.error(f"[{ticker}] No 'close' column after processing. Cannot compute importance.")
                     continue
@@ -1574,7 +1476,6 @@ def console_listener():
                     logging.error(f"[{ticker}] Not enough rows after shift to train. Skipping.")
                     continue
 
-                # Prepare features
                 possible_cols = [
                     'open','high','low','close','volume','vwap',
                     'price_change','high_low_range','log_volume','sentiment',
@@ -1587,11 +1488,9 @@ def console_listener():
                 X = df[available_cols]
                 y = df['target']
 
-                # Train RandomForest
                 model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
                 model_rf.fit(X, y)
 
-                # 5) Compute & log feature importances
                 importances = model_rf.feature_importances_
                 feats_importances = sorted(zip(available_cols, importances), key=lambda x: x[1], reverse=True)
                 logging.info(f"[{ticker}] Feature importances (descending):")
@@ -1692,22 +1591,8 @@ def console_listener():
             logging.info(f"Updated DISABLED_FEATURES_SET to {DISABLED_FEATURES_SET}")
 
         elif cmd == "auto-feature":
-            """
-            Usage:
-            auto-feature
-            auto-feature -r
-
-            1) Similar to feature-importance, but after computing importances for each TICKER,
-            we gather all features with importance < 0.050 and add them to DISABLED_FEATURES in .env.
-            2) If '-r' is present, we skip fetching new data and use the existing CSV for each ticker.
-            3) This might lead to disabling many or few features, depending on the data.
-
-            The final result is that DISABLED_FEATURES in .env is updated to include all such 
-            "low-importance" features (unioned across TICKERS).
-            """
             low_import_set = set()
 
-            # Decide whether to skip fresh data
             if skip_data:
                 logging.info("auto-feature -r: Will use existing CSV data for each ticker.")
             else:
@@ -1717,7 +1602,6 @@ def console_listener():
                 tf_code = timeframe_to_code(BAR_TIMEFRAME)
                 csv_filename = f"{ticker}_{tf_code}.csv"
 
-                # 1) Possibly fetch fresh data unless skip_data
                 if not skip_data:
                     df = fetch_candles(ticker, bars=N_BARS, timeframe=BAR_TIMEFRAME)
                     if df.empty:
@@ -1737,7 +1621,6 @@ def console_listener():
                         logging.error(f"[{ticker}] CSV is empty, skipping.")
                         continue
 
-                # 2) Convert 'sentiment' if present
                 if 'sentiment' in df.columns and df["sentiment"].dtype == object:
                     try:
                         df["sentiment"] = df["sentiment"].astype(float)
@@ -1745,12 +1628,10 @@ def console_listener():
                         logging.error(f"[{ticker}] Could not convert sentiment to float: {e}")
                         continue
 
-                # 3) Re-run typical pipeline
                 df = add_features(df)
                 df = compute_custom_features(df)
                 df = drop_disabled_features(df)
 
-                # 4) Create target as next close
                 if 'close' not in df.columns:
                     logging.error(f"[{ticker}] No 'close' column after processing. Cannot compute auto-feature.")
                     continue
@@ -1790,16 +1671,11 @@ def console_listener():
                 else:
                     logging.info(f"[{ticker}] No features with < 0.050 importance found.")
 
-            # 6) Now update DISABLED_FEATURES in .env
             if low_import_set:
                 logging.info(f"Combining newly found low-importance features: {low_import_set}")
 
-                # Grab the current DISABLED_FEATURES
                 current_disabled = DISABLED_FEATURES if DISABLED_FEATURES else ""
                 if current_disabled in ["main", "base"]:
-                    # In these special cases, we can't append a list to 'main' or 'base'
-                    # because that logic would exclude everything but MAIN_FEATURES or BASE_FEATURES.
-                    # So we just warn that auto-feature won't have effect if DISABLED_FEATURES=main/base.
                     logging.warning(f"DISABLED_FEATURES is set to '{current_disabled}', ignoring auto-feature changes.")
                 else:
                     disabled_features_set_local = set()
@@ -1813,7 +1689,6 @@ def console_listener():
 
                     update_env_variable("DISABLED_FEATURES", new_disabled_str)
                     DISABLED_FEATURES = new_disabled_str
-                    # Also rebuild the DISABLED_FEATURES_SET
                     new_set_for_memory = set([f.strip() for f in new_disabled_str.split(",") if f.strip()])
                     new_set_for_memory.discard("sentiment")
                     DISABLED_FEATURES_SET = new_set_for_memory
@@ -1823,13 +1698,6 @@ def console_listener():
                 logging.info("No features fell below 0.050 threshold across all tickers. No .env changes made.")
             
         elif cmd == "set-ntickers":
-            """
-            Usage: set-ntickers <intValue>
-            Example: set-ntickers 3
-
-            This command updates AI_TICKER_COUNT in both .env and in-memory, allowing the system 
-            to maintain that many AI tickers automatically.
-            """
             if len(parts) < 2:
                 logging.info("Usage: set-ntickers <intValue>")
                 continue
@@ -1846,14 +1714,6 @@ def console_listener():
 
 
         elif cmd == "ai-tickers":
-            """
-            Usage: ai-tickers
-
-            This command calls fetch_new_ai_tickers() using the current AI_TICKER_COUNT.
-            It uses NO exclude_tickers (empty list), and logs whatever tickers are returned.
-            This is purely to see which tickers the AI might pick at this moment—it's not 
-            automatically opening positions, unless you manually trade them afterward.
-            """
             if AI_TICKER_COUNT <= 0:
                 logging.info("AI_TICKER_COUNT is 0 or not set. No AI tickers to fetch.")
                 continue
@@ -1866,28 +1726,11 @@ def console_listener():
                 logging.info(f"AI recommended tickers: {new_ai_list}")
 
         elif cmd == "create-script":
-            """
-            Usage: create-script <name>
-
-            Creates a new python script in the logic/ subdirectory, named logic_<nextNum>_<name>.py
-            The content is a simple template:
-
-            def run_logic(current_price, predicted_price, ticker):
-                from forest import api, buy_shares, sell_shares, short_shares, close_short
-
-            def run_backtest(current_price, predicted_price, position_qty):
-                return "NONE"
-
-            Where <nextNum> is 1 higher than the highest logic_*.py found in that directory.
-            The <name> must be alphanumeric (letters/numbers) and underscores only (no spaces, 
-            uppercase, or special chars). If you provide an invalid name, it won't create the script.
-            """
             if len(parts) < 2:
                 logging.info("Usage: create-script <name>")
                 continue
 
             user_provided_name = parts[1]
-            # Validate the name to allow only lowercase letters, digits, underscores
             import re
             pattern_name = re.compile(r'^[a-z0-9_]+$')
             if not pattern_name.match(user_provided_name):
@@ -1898,7 +1741,6 @@ def console_listener():
             if not os.path.isdir(logic_dir):
                 os.makedirs(logic_dir)
 
-            # Scan existing logic_<num>_*.py to find the highest <num>
             existing_nums = []
             for fname in os.listdir(logic_dir):
                 match = re.match(r'^logic_(\d+)_.*\.py$', fname)
@@ -1913,12 +1755,11 @@ def console_listener():
             new_script_name = f"logic_{new_num}_{user_provided_name}.py"
             new_script_path = os.path.join(logic_dir, new_script_name)
 
-            # Create the file with the template
             template_content = """def run_logic(current_price, predicted_price, ticker):
             from forest import api, buy_shares, sell_shares, short_shares, close_short
 
-        def run_backtest(current_price, predicted_price, position_qty):
-            return "NONE"
+            def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles):
+                return "NONE"
         """
             try:
                 with open(new_script_path, "w") as f:
@@ -1928,7 +1769,6 @@ def console_listener():
                 logging.error(f"Unable to create new logic script: {e}")
                 continue
 
-            # Now update the JSON file so the new script is recognized
             _update_logic_json()
             logging.info("Updated logic_scripts.json to include the newly created script.")
 

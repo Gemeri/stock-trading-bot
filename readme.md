@@ -101,7 +101,7 @@ ML_MODEL=forest         # Options: xgboost or forest
 Start the bot by running the main script:
 
 ```bash
-python main.py
+python forest.py
 ```
 
 The bot will:

@@ -185,5 +185,3 @@ This project is licensed under the [MIT License](LICENSE).
 - **Community Contributions:** Thanks to all contributors who helped improve this project.
 
 ---
-
-This README should serve as a complete guide to setting up, configuring, and running your stock trading bot. Enjoy automated trading and feel free to contribute to further improvements!

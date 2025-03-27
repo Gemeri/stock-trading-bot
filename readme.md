@@ -56,8 +56,6 @@ This project is designed to automate stock trading by:
    pip install -r requirements.txt
    ```
 
-   > **Note:** The project depends on packages such as `alpaca_trade_api`, `pandas`, `numpy`, `matplotlib`, `scikit-learn`, `xgboost`, `discord.py`, `transformers`, `python-dotenv`, and more.
-
 ---
 
 ## Configuration

@@ -1143,7 +1143,27 @@ def console_listener():
         elif cmd == "run-sentiment":
             logging.info("Running sentiment update job...")
             run_sentiment_job(skip_data=skip_data)
+            # After run_sentiment_job, merge the sentiment data into the full candle CSV
+            for ticker in TICKERS:
+                tf_code = timeframe_to_code(BAR_TIMEFRAME)
+                candle_csv = f"{ticker}_{tf_code}.csv"
+                if not os.path.exists(candle_csv):
+                    logging.error(f"[{ticker}] Candle CSV {candle_csv} not found, skipping merge.")
+                    continue
+                try:
+                    df = pd.read_csv(candle_csv)
+                except Exception as e:
+                    logging.error(f"[{ticker}] Error reading candle CSV: {e}")
+                    continue
+
+                df_updated = merge_sentiment_from_csv(df, ticker)
+                try:
+                    df_updated.to_csv(candle_csv, index=False)
+                    logging.info(f"[{ticker}] Updated unified candle CSV with sentiment: {candle_csv}")
+                except Exception as e:
+                    logging.error(f"[{ticker}] Error saving unified candle CSV: {e}")
             logging.info("Sentiment update job completed.")
+
 
         elif cmd == "force-run":
             logging.info("Force-running job now (ignoring market open check).")

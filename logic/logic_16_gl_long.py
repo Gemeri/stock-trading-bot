@@ -396,6 +396,7 @@ def run_logic(current_price, predicted_price, ticker):
     Live trading logic:
       - Loads the CSV dynamically using .env settings (first ticker and timeframe suffix).
       - Filters out disabled features and sets sentiment to 0 if NEWS_MODE is off.
+      - If a required column like 'rsi' was disabled, it is recomputed.
       - Trains GA, XGBoost, and RL models on the entire CSV.
       - Computes normalized indicators on the latest (current) candle.
       - Determines a combined GA+ML decision.
@@ -437,6 +438,14 @@ def run_logic(current_price, predicted_price, ticker):
         for feat in disabled_list:
             if feat in df.columns:
                 df.drop(columns=[feat], inplace=True)
+
+    # Recompute 'rsi' if it was disabled but is needed
+    if 'rsi' not in df.columns:
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+        loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+        rs = gain / (loss + 1e-10)
+        df['rsi'] = 100 - (100 / (1 + rs))
 
     # If NEWS_MODE is off, set sentiment to 0 regardless of CSV content
     if news_mode == "off":
@@ -523,6 +532,7 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     Backtesting logic:
       - Loads the CSV using .env settings (first ticker and timeframe suffix).
       - Filters out disabled features and sets sentiment to 0 if NEWS_MODE is off.
+      - If a required column like 'rsi' was disabled, it is recomputed.
       - From the CSV, selects training data up to current_timestamp.
       - Trains GA, XGBoost, and RL models on this training set.
       - Uses the candle corresponding to current_timestamp (or the last one if not found)
@@ -567,6 +577,14 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
             if feat in df.columns:
                 df.drop(columns=[feat], inplace=True)
 
+    # Recompute 'rsi' if it was disabled but is needed
+    if 'rsi' not in df.columns:
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+        loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+        rs = gain / (loss + 1e-10)
+        df['rsi'] = 100 - (100 / (1 + rs))
+
     # If NEWS_MODE is off, set sentiment to 0
     if news_mode == "off":
         df['sentiment'] = 0.0
@@ -594,8 +612,10 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     candle['open'] = current_price
     candle['close'] = current_price
 
+    # Compute additional indicator: ema_diff
     candle['ema_diff'] = candle['ema_short'] - candle['ema_long']
 
+    # Compute normalized indicators using training_data for rolling calculation
     norm_momentum = (candle['momentum'] / 
                      (training_data['momentum'].abs().rolling(14).mean().iloc[-1] + 1e-10)
                      if 'momentum' in candle else 0)
@@ -607,12 +627,14 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     norm_ema_diff = (candle['ema_diff'] / (current_price + 1e-10)
                      if current_price != 0 else 0)
 
+    # Calculate GA weighted signal
     ga_signal = (best_strategy.momentum_weight * norm_momentum +
                  best_strategy.sentiment_weight * norm_sentiment +
                  best_strategy.atr_weight * norm_atr +
                  best_strategy.vwap_weight * norm_vwap +
                  best_strategy.ema_diff_weight * norm_ema_diff)
 
+    # Prepare feature vector for XGBoost prediction
     feature_cols = ['momentum', 'atr', 'vwap', 'ema_short', 'ema_long', 'macd', 'rsi',
                     'bollinger_upper', 'bollinger_lower',
                     'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
@@ -623,6 +645,10 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     features_df = pd.DataFrame([feature_data])
     prob_up = xgb_model.predict_proba(features_df)[:, 1][0]
 
+    # Determine action based on the trained models and current indicators:
+    # - If no open position and conditions for long are met → BUY (action 0)
+    # - If in position and conditions for exit are met → SELL (action 1)
+    # - Otherwise, do nothing.
     if position_qty <= 0 and ga_signal > best_strategy.entry_threshold and prob_up > 0.6:
         action = 0  # BUY
     elif position_qty > 0 and (ga_signal < -best_strategy.entry_threshold or prob_up < 0.4):
@@ -630,6 +656,7 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     else:
         action = 4  # HOLD
 
+    # Return a string corresponding to the decided action
     if action == 0 and position_qty <= 0:
         return "BUY"
     elif action == 1 and position_qty > 0:

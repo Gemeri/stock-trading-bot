@@ -501,14 +501,21 @@ def run_logic(current_price, predicted_price, ticker):
     # Load and preprocess the full CSV data
     df = load_and_preprocess_data(csv_filename)
 
-    # Filter out disabled features (except for rsi, which is computed in the script)
+    # Filter out disabled features BUT ensure essential columns are kept.
+    essential_cols = [
+        "ema_short", "ema_long", "macd", "rsi", "atr", "vwap",
+        "momentum", "bollinger_upper", "bollinger_lower",
+        "lagged_close_1", "lagged_close_2", "lagged_close_3",
+        "lagged_close_5", "lagged_close_10"
+    ]
     disabled_list = [feat.strip() for feat in disabled_features.split(",") if feat.strip()]
     for col in disabled_list:
-        if col.lower() == "sentiment" and news_mode == "off":
+        if col.lower() == "sentiment":
+            if news_mode == "off" and col in df.columns:
+                df.drop(columns=[col], inplace=True)
+        elif col.lower() not in [e.lower() for e in essential_cols]:
             if col in df.columns:
                 df.drop(columns=[col], inplace=True)
-        elif col.lower() != "rsi" and col in df.columns:
-            df.drop(columns=[col], inplace=True)
 
     # Train models on the entire dataset (live training)
     best_strategy = run_genetic_algorithm(df, pop_size=30, generations=15)
@@ -517,19 +524,18 @@ def run_logic(current_price, predicted_price, ticker):
 
     # Compute normalized indicators for the latest candle (using the last row of df)
     latest = df.iloc[-1].copy()
-    latest['ema_diff'] = latest['ema_short'] - latest['ema_long']
+    latest["ema_diff"] = latest["ema_short"] - latest["ema_long"]
 
-    # For rolling calculations, use the full series from df
-    if 'momentum' in df.columns:
-        roll_mean = df['momentum'].abs().rolling(14).mean()
-        norm_momentum = df['momentum'].iloc[-1] / (roll_mean.iloc[-1] + 1e-10)
+    # Normalize indicators (use rolling calculations from the full df if available)
+    if "momentum" in df.columns:
+        roll_mean = df["momentum"].abs().rolling(14).mean()
+        norm_momentum = df["momentum"].iloc[-1] / (roll_mean.iloc[-1] + 1e-10)
     else:
         norm_momentum = 0
-    # For sentiment: use the latest value if available and if news_mode is on; otherwise 0.
-    norm_sentiment = latest['sentiment'] if ("sentiment" in latest and news_mode != "off") else 0
-    norm_atr = latest['atr'] / (latest['close'] + 1e-10) if 'atr' in latest else 0
-    norm_vwap = latest['vwap'] / (latest['close'] + 1e-10) if 'vwap' in latest else 0
-    norm_ema_diff = latest['ema_diff'] / (latest['close'] + 1e-10)
+    norm_sentiment = latest["sentiment"] if ("sentiment" in latest and news_mode != "off") else 0
+    norm_atr = latest["atr"] / (latest["close"] + 1e-10) if "atr" in latest else 0
+    norm_vwap = latest["vwap"] / (latest["close"] + 1e-10) if "vwap" in latest else 0
+    norm_ema_diff = latest["ema_diff"] / (latest["close"] + 1e-10)
 
     # Compute GA signal using best_strategy parameters
     ga_signal = (
@@ -540,16 +546,17 @@ def run_logic(current_price, predicted_price, ticker):
         best_strategy.ema_diff_weight * norm_ema_diff
     )
 
-    # Prepare features for XGBoost prediction from the latest candle
+    # Prepare features for XGBoost prediction from the latest candle.
+    # Explicitly convert to float to ensure proper dtypes.
     feature_cols = [
-        'momentum', 'atr', 'vwap', 'ema_short', 'ema_long',
-        'macd', 'rsi', 'bollinger_upper', 'bollinger_lower',
-        'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
-        'lagged_close_5', 'lagged_close_10'
+        "momentum", "atr", "vwap", "ema_short", "ema_long",
+        "macd", "rsi", "bollinger_upper", "bollinger_lower",
+        "lagged_close_1", "lagged_close_2", "lagged_close_3",
+        "lagged_close_5", "lagged_close_10"
     ]
     if news_mode != "off":
         feature_cols.append("sentiment")
-    xgb_features = latest[feature_cols].to_frame().T
+    xgb_features = latest[feature_cols].to_frame().T.astype(float)
     prob_up = xgb_model.predict_proba(xgb_features)[:, 1][0]
 
     # Determine trade action based on GA signal and XGB probability.
@@ -641,21 +648,28 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     # Load full CSV training data and preprocess
     df_full = load_and_preprocess_data(csv_filename)
 
-    # Filter out disabled features as before
+    # Filter out disabled features BUT ensure essential columns are kept.
+    essential_cols = [
+        "ema_short", "ema_long", "macd", "rsi", "atr", "vwap",
+        "momentum", "bollinger_upper", "bollinger_lower",
+        "lagged_close_1", "lagged_close_2", "lagged_close_3",
+        "lagged_close_5", "lagged_close_10"
+    ]
     disabled_list = [feat.strip() for feat in disabled_features.split(",") if feat.strip()]
     for col in disabled_list:
-        if col.lower() == "sentiment" and news_mode == "off":
+        if col.lower() == "sentiment":
+            if news_mode == "off" and col in df_full.columns:
+                df_full.drop(columns=[col], inplace=True)
+        elif col.lower() not in [e.lower() for e in essential_cols]:
             if col in df_full.columns:
                 df_full.drop(columns=[col], inplace=True)
-        elif col.lower() != "rsi" and col in df_full.columns:
-            df_full.drop(columns=[col], inplace=True)
 
     # Ensure current_timestamp is a datetime object
     if not isinstance(current_timestamp, pd.Timestamp):
         current_timestamp = pd.to_datetime(current_timestamp)
 
     # Use all training data up to the current candle timestamp
-    train_data = df_full[df_full['timestamp'] <= current_timestamp].copy()
+    train_data = df_full[df_full["timestamp"] <= current_timestamp].copy()
     if train_data.empty:
         logging.info("No training data available up to the current timestamp.")
         return "NONE"
@@ -666,7 +680,6 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     rl_model, rl_env = train_rl_agent(train_data, timesteps=20000)
 
     # Identify the current backtest candle from the provided candles dataframe.
-    # If a candle matching current_timestamp is not found, use the most recent candle.
     if "timestamp" in candles.columns:
         candle_row = candles[candles["timestamp"] == current_timestamp]
         if candle_row.empty:
@@ -675,22 +688,31 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
             candle_row = candle_row.iloc[[0]]
     else:
         candle_row = candles.iloc[[-1]]
-    current_candle = candle_row.squeeze()  # Convert to Series
+    # Create an explicit copy to avoid SettingWithCopyWarning
+    current_candle = candle_row.squeeze().copy()
 
-    # Compute normalized indicators for the current candle.
-    # For rolling calculations, use the train_data series.
-    train_data["ema_diff"] = train_data["ema_short"] - train_data["ema_long"]
+    # If essential computed columns are missing, populate them using training data.
+    if "ema_short" not in current_candle or "ema_long" not in current_candle:
+        current_candle["ema_short"] = train_data["close"].ewm(span=10, adjust=False).mean().iloc[-1]
+        current_candle["ema_long"] = train_data["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+    current_candle["ema_diff"] = current_candle["ema_short"] - current_candle["ema_long"]
+
+    if "macd" not in current_candle:
+        current_candle["macd"] = (train_data["ema12"].iloc[-1] - train_data["ema26"].iloc[-1]
+                                  if "ema12" in train_data.columns and "ema26" in train_data.columns
+                                  else 0)
+    if "rsi" not in current_candle:
+        current_candle["rsi"] = train_data["rsi"].iloc[-1] if "rsi" in train_data.columns else 0
+
     if "momentum" in train_data.columns:
         roll_mean = train_data["momentum"].abs().rolling(14).mean()
         norm_momentum = train_data["momentum"].iloc[-1] / (roll_mean.iloc[-1] + 1e-10)
     else:
         norm_momentum = 0
-    norm_sentiment = (current_candle["sentiment"] if ("sentiment" in current_candle and news_mode != "off")
-                      else 0)
+    norm_sentiment = current_candle["sentiment"] if ("sentiment" in current_candle and news_mode != "off") else 0
     norm_atr = current_candle["atr"] / (current_candle["close"] + 1e-10) if "atr" in current_candle else 0
     norm_vwap = current_candle["vwap"] / (current_candle["close"] + 1e-10) if "vwap" in current_candle else 0
-    ema_diff = current_candle["ema_short"] - current_candle["ema_long"]
-    norm_ema_diff = ema_diff / (current_candle["close"] + 1e-10)
+    norm_ema_diff = current_candle["ema_diff"] / (current_candle["close"] + 1e-10)
 
     ga_signal = (
         best_strategy.momentum_weight * norm_momentum +
@@ -700,7 +722,8 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
         best_strategy.ema_diff_weight * norm_ema_diff
     )
 
-    # Prepare feature set for XGBoost prediction from the current candle
+    # Prepare feature set for XGBoost prediction from the current candle.
+    # Convert features to float to satisfy XGBoost requirements.
     feature_cols = [
         "momentum", "atr", "vwap", "ema_short", "ema_long",
         "macd", "rsi", "bollinger_upper", "bollinger_lower",
@@ -709,17 +732,11 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     ]
     if news_mode != "off":
         feature_cols.append("sentiment")
-    xgb_features = current_candle[feature_cols].to_frame().T
+    xgb_features = current_candle[feature_cols].to_frame().T.astype(float)
     prob_up = xgb_model.predict_proba(xgb_features)[:, 1][0]
 
     # Determine trade action based on computed signal and probability.
-    # The logic follows:
-    #   - If flat (position_qty == 0) and ga_signal > entry_threshold and prob_up > 0.6: BUY.
-    #   - If long (position_qty > 0) and (ga_signal < -entry_threshold or prob_up < 0.4): SELL.
-    #   - If flat (position_qty == 0) and ga_signal < -entry_threshold and prob_up < 0.4: SHORT.
-    #   - If short (position_qty < 0) and (ga_signal > entry_threshold or prob_up > 0.6): COVER.
     action = 4  # Default HOLD
-
     if position_qty == 0:
         if ga_signal > best_strategy.entry_threshold and prob_up > 0.6:
             action = 0  # BUY

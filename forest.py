@@ -22,37 +22,46 @@ import json
 import re
 import discord
 import xgboost as xgb
+from timeframe import TIMEFRAME_SCHEDULE
 
 # -------------------------------
 # 1. Load Configuration (from .env)
 # -------------------------------
 load_dotenv()
 
-ML_MODEL = os.getenv("ML_MODEL", "forest")
+# trading / model selection ------------------------------------------------------------------
+ML_MODEL  = os.getenv("ML_MODEL", "forest")
 
-API_KEY = os.getenv("ALPACA_API_KEY", "")
-API_SECRET = os.getenv("ALPACA_API_SECRET", "")
+API_KEY   = os.getenv("ALPACA_API_KEY", "")
+API_SECRET= os.getenv("ALPACA_API_SECRET", "")
 API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-DISCORD_MODE = os.getenv("DISCORD_MODE", "off").lower().strip()
+# scheduling & run‑mode ----------------------------------------------------------------------
+RUN_SCHEDULE            = os.getenv("RUN_SCHEDULE", "on").lower().strip()           # <‑‑ NEW
+SENTIMENT_OFFSET_MINUTES= int(os.getenv("SENTIMENT_OFFSET_MINUTES", "20"))           # <‑‑ NEW
+
+BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
+N_BARS        = int(os.getenv("N_BARS", "5000"))
+
+# discord / ai / news ------------------------------------------------------------------------
+DISCORD_MODE  = os.getenv("DISCORD_MODE", "off").lower().strip()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DISCORD_USER_ID = os.getenv("DISCORD_USER_ID", "")
-
-BING_API_KEY = os.getenv("BING_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+BING_API_KEY  = os.getenv("BING_API_KEY", "")
+OPENAI_API_KEY= os.getenv("OPENAI_API_KEY", "")
 AI_TICKER_COUNT = int(os.getenv("AI_TICKER_COUNT", "0"))
-AI_TICKERS = []
+AI_TICKERS: list[str] = []
 
-TICKERS = os.getenv("TICKERS", "TSLA").split(",")
-BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
-N_BARS = int(os.getenv("N_BARS", "5000"))
+TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "TSLA").split(",") if t.strip()]
 TRADE_LOG_FILENAME = "trade_log.csv"
 
+# misc ---------------------------------------------------------------------------------------
 N_ESTIMATORS = 100
-RANDOM_SEED = 42
+RANDOM_SEED  = 42
 NY_TZ = pytz.timezone("America/New_York")
 
 NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()
+
 
 if DISCORD_MODE == "on":
 
@@ -980,27 +989,51 @@ TIMEFRAME_SCHEDULE = {
 }
 
 
-def setup_schedule_for_timeframe(timeframe: str):
+def setup_schedule_for_timeframe(timeframe: str) -> None:
+    """
+    Build the daily schedule for the requested bar length.
+
+    • Skips all scheduling when RUN_SCHEDULE == "off"
+    • Uses SENTIMENT_OFFSET_MINUTES from .env for the news‑model lead‑in
+    • Relies on TIMEFRAME_SCHEDULE imported from timeframe.py
+    """
     import schedule
-    valid_keys = list(TIMEFRAME_SCHEDULE.keys())
-    if timeframe not in valid_keys:
-        logging.warning(f"{timeframe} not recognized. Falling back to 1Day schedule at 09:30.")
+
+    # --- honour master switch --------------------------------------------------------------
+    if RUN_SCHEDULE == "off":
+        schedule.clear()
+        logging.info("RUN_SCHEDULE=off – no jobs have been queued.")
+        return
+    # ---------------------------------------------------------------------------------------
+
+    # choose a known table key --------------------------------------------------------------
+    if timeframe not in TIMEFRAME_SCHEDULE:
+        logging.warning(f"{timeframe} not recognised; defaulting to 1Day.")
         timeframe = "1Day"
+
     times_list = TIMEFRAME_SCHEDULE[timeframe]
     schedule.clear()
+
+    # build the jobs ------------------------------------------------------------------------
     for t in times_list:
+        # trading run
         schedule.every().day.at(t).do(lambda t=t: run_job(t))
+
+        # optional sentiment lead‑in
         if NEWS_MODE == "on":
             try:
-                base_time = datetime.strptime(t, "%H:%M")
-                sentiment_time = (base_time - timedelta(minutes=20)).strftime("%H:%M")
+                base_time      = datetime.strptime(t, "%H:%M")
+                offset_minutes = SENTIMENT_OFFSET_MINUTES          # ← env‑controlled
+                sentiment_time = (base_time - timedelta(minutes=offset_minutes)).strftime("%H:%M")
                 schedule.every().day.at(sentiment_time).do(run_sentiment_job)
-                logging.info(f"Scheduled sentiment update at {sentiment_time} NY time and trading at {t} (NEWS_MODE=on).")
+                logging.info(f"Scheduled sentiment update {sentiment_time} NY & trade {t} NY.")
             except Exception as e:
-                logging.error(f"Error scheduling sentiment job: {e}")
+                logging.error(f"Error scheduling sentiment lead‑in for {t}: {e}")
         else:
-            logging.info(f"NEWS_MODE={NEWS_MODE}. No sentiment scheduling before {t}.")
-    logging.info(f"Scheduled run_job() for timeframe={timeframe} at NY times: {times_list}")
+            logging.info(f"NEWS_MODE={NEWS_MODE}. Sentiment run skipped before {t}.")
+
+    logging.info(f"Scheduling prepared for {timeframe}: {times_list}")
+
 
 
 def run_job(scheduled_time_ny: str):

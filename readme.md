@@ -1,4 +1,4 @@
-# Algorithmic Trading Platform – Documentation
+# Stock Trading Bot – Documentation
 
 ---
 

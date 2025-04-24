@@ -283,7 +283,7 @@ All commands can be typed **at the console** after starting `forest.py`:
 | predict-next [-r]                 | Predict next close for all tickers (use -r for cached data)   |
 | run-sentiment [-r]                | Analyze news/sentiment and merge to CSV                       |
 | force-run [-r]                    | Execute trade logic immediately (bypassing schedule)          |
-| backtest <N> [simple|complex]     | Run backtest for N candles/rows (outputs CSV/plots)           |
+| backtest <N> [simple/complex] ... | Run backtest for N candles/rows (outputs CSV/plots)           |
 | feature-importance [-r]           | Report feature importances on latest data                     |
 | set-tickers T1,T2,...             | Change ticker list in .env + memory                           |
 | set-timeframe [frame]             | E.g. 4Hour, 15Min, 1Hour, etc.                               |

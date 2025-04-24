@@ -151,30 +151,64 @@ json_file_path = os.path.join("logic", "logic_scripts.json")
 with open(json_file_path, "r") as file:
     LOGIC_MODULE_MAP = json.load(file)
 
-# -------------------------------
-# 5. Candles Helper Functions
-# -------------------------------
+_CANONICAL_TF = {
+    # minutes
+    "15min":  "15Min",
+    "30min":  "30Min",
+    # hours
+    "1h":     "1Hour",  "1hour": "1Hour",
+    "2h":     "2Hour",  "2hour": "2Hour",
+    "4h":     "4Hour",  "4hour": "4Hour",
+    # days
+    "1d":     "1Day",   "1day":  "1Day",
+}
+
+def canonical_timeframe(tf: str) -> str:
+    """
+    Return the canonical camel-cased timeframe (e.g. '4Hour')
+    regardless of the capitalisation or abbreviation the user typed.
+    Unknown strings are returned unchanged.
+    """
+    if not tf:
+        return tf
+    tf_clean = tf.strip().lower()
+    return _CANONICAL_TF.get(tf_clean, tf)
+
+
+# ==============================================================
+# 1.  timeframe_to_code
+# ==============================================================
+
 def timeframe_to_code(tf: str) -> str:
+    tf = canonical_timeframe(tf)                 # ← normalise first
     mapping = {
         "15Min": "M15",
         "30Min": "M30",
         "1Hour": "H1",
         "2Hour": "H2",
         "4Hour": "H4",
-        "1Day": "D1"
+        "1Day":  "D1",
     }
-    return mapping.get(tf, tf)
+    return mapping.get(tf, tf)                   # fall-through: return original
+
+
+# ==============================================================
+# 2.  get_bars_per_day
+# ==============================================================
 
 def get_bars_per_day(tf: str) -> float:
+    tf = canonical_timeframe(tf)
     mapping = {
         "15Min": 32,
         "30Min": 16,
-        "1Hour": 8,
-        "2Hour": 4,
-        "4Hour": 2,
-        "1Day": 1
+        "1Hour":  8,
+        "2Hour":  4,
+        "4Hour":  2,
+        "1Day":   1,
     }
-    return mapping.get(tf, 1)
+    return mapping.get(tf, 1)                    # default ⇒ 1 bar/day
+
+BAR_TIMEFRAME = canonical_timeframe(BAR_TIMEFRAME)
 
 def fetch_candles(ticker: str, bars: int = 10000, timeframe: str = None) -> pd.DataFrame:
     if not timeframe:

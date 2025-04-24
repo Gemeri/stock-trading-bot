@@ -23,6 +23,20 @@ import re
 import discord
 import xgboost as xgb
 from timeframe import TIMEFRAME_SCHEDULE
+import ast
+from sklearn.linear_model import RidgeCV
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# LSTM/TF/Keras for deep learning models
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.preprocessing import StandardScaler
+
+from transformers import BertModel, BertConfig
+import torch
+import torch.nn as nn
 
 # -------------------------------
 # 1. Load Configuration (from .env)
@@ -37,8 +51,8 @@ API_SECRET= os.getenv("ALPACA_API_SECRET", "")
 API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # scheduling & run‑mode ----------------------------------------------------------------------
-RUN_SCHEDULE            = os.getenv("RUN_SCHEDULE", "on").lower().strip()           # <‑‑ NEW
-SENTIMENT_OFFSET_MINUTES= int(os.getenv("SENTIMENT_OFFSET_MINUTES", "20"))           # <‑‑ NEW
+RUN_SCHEDULE            = os.getenv("RUN_SCHEDULE", "on").lower().strip()
+SENTIMENT_OFFSET_MINUTES= int(os.getenv("SENTIMENT_OFFSET_MINUTES", "20"))
 
 BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
 N_BARS        = int(os.getenv("N_BARS", "5000"))
@@ -80,12 +94,96 @@ if DISCORD_MODE == "on":
     discord_thread = threading.Thread(target=run_discord_bot, daemon=True)
     discord_thread.start()
 
-def get_model():
-    if ML_MODEL.lower() == "xgboost":
-        logging.info("Using XGBoost model as per ML_MODEL configuration.")
+def parse_ml_models():
+    models = [m.strip().lower() for m in ML_MODEL.split(",") if m.strip()]
+    if "all" in models:
+        # Add special logic: all 5 (forest, xgboost, lstm, transformer_reg, transformer_cls)
+        models = ["forest", "xgboost", "lstm", "transformer", "transformer_cls"]
+    return models
+
+def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=60):
+    if model_name in ["forest", "rf", "randomforest"]:
+        return RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+    elif model_name == "xgboost":
         return xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+    elif model_name == "lstm":
+        # --- Deep, robust LSTM stack with regularization ---
+        if input_shape is None and num_features is not None:
+            input_shape = (lstm_seq, num_features)
+        model = keras.Sequential([
+            layers.Input(shape=input_shape),
+            layers.Masking(mask_value=0.),  # handles missing/zero padding if present
+            layers.LSTM(128, return_sequences=True, dropout=0.25, recurrent_dropout=0.25),
+            layers.BatchNormalization(),
+            layers.LSTM(64, return_sequences=True, dropout=0.20, recurrent_dropout=0.20),
+            layers.BatchNormalization(),
+            layers.LSTM(32, return_sequences=False, dropout=0.10, recurrent_dropout=0.10),
+            layers.BatchNormalization(),
+            layers.Dense(32, activation="relu"),
+            layers.Dropout(0.15),
+            layers.Dense(1)
+        ])
+        model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss="mae")
+        return model
+    elif model_name == "transformer":
+        # --- Deep Transformer for regression with regularization ---
+        class LargeTransformerRegressor(nn.Module):
+            def __init__(self, num_features, seq_len=60):
+                super().__init__()
+                d_model = 64
+                self.embedding = nn.Linear(num_features, d_model)
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=8,
+                    dim_feedforward=256,
+                    dropout=0.20,
+                    batch_first=True
+                )
+                self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+                self.dropout = nn.Dropout(0.20)
+                self.fc1 = nn.Linear(seq_len * d_model, 32)
+                self.relu = nn.ReLU()
+                self.out = nn.Linear(32, 1)
+            def forward(self, x):
+                # x: [batch, seq, features]
+                em = self.embedding(x)
+                out = self.transformer(em)
+                out = self.dropout(out)
+                out = out.reshape(out.size(0), -1)
+                out = self.fc1(out)
+                out = self.relu(out)
+                return self.out(out)
+        return LargeTransformerRegressor
+    elif model_name == "transformer_cls":
+        # --- Large Transformer for classification (up/down, binary) ---
+        class LargeTransformerClassifier(nn.Module):
+            def __init__(self, num_features, seq_len=60):
+                super().__init__()
+                d_model = 64
+                self.embedding = nn.Linear(num_features, d_model)
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=8,
+                    dim_feedforward=256,
+                    dropout=0.20,
+                    batch_first=True
+                )
+                self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+                self.dropout = nn.Dropout(0.20)
+                self.fc1 = nn.Linear(seq_len * d_model, 32)
+                self.relu = nn.ReLU()
+                self.out = nn.Linear(32, 2)
+            def forward(self, x):
+                em = self.embedding(x)
+                out = self.transformer(em)
+                out = self.dropout(out)
+                out = out.reshape(out.size(0), -1)
+                out = self.fc1(out)
+                out = self.relu(out)
+                return self.out(out)
+        return LargeTransformerClassifier
     else:
-        logging.info("Using Random Forest model as per ML_MODEL configuration.")
+        logging.warning(f"Unknown model type {model_name}. Using RandomForest.")
         return RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
 
 DISABLED_FEATURES = os.getenv("DISABLED_FEATURES", "").strip()
@@ -152,14 +250,11 @@ with open(json_file_path, "r") as file:
     LOGIC_MODULE_MAP = json.load(file)
 
 _CANONICAL_TF = {
-    # minutes
     "15min":  "15Min",
     "30min":  "30Min",
-    # hours
     "1h":     "1Hour",  "1hour": "1Hour",
     "2h":     "2Hour",  "2hour": "2Hour",
     "4h":     "4Hour",  "4hour": "4Hour",
-    # days
     "1d":     "1Day",   "1day":  "1Day",
 }
 
@@ -180,7 +275,7 @@ def canonical_timeframe(tf: str) -> str:
 # ==============================================================
 
 def timeframe_to_code(tf: str) -> str:
-    tf = canonical_timeframe(tf)                 # ← normalise first
+    tf = canonical_timeframe(tf)
     mapping = {
         "15Min": "M15",
         "30Min": "M30",
@@ -189,7 +284,7 @@ def timeframe_to_code(tf: str) -> str:
         "4Hour": "H4",
         "1Day":  "D1",
     }
-    return mapping.get(tf, tf)                   # fall-through: return original
+    return mapping.get(tf, tf)
 
 
 # ==============================================================
@@ -206,7 +301,7 @@ def get_bars_per_day(tf: str) -> float:
         "4Hour":  2,
         "1Day":   1,
     }
-    return mapping.get(tf, 1)                    # default ⇒ 1 bar/day
+    return mapping.get(tf, 1)
 
 BAR_TIMEFRAME = canonical_timeframe(BAR_TIMEFRAME)
 
@@ -513,7 +608,7 @@ def drop_disabled_features(df: pd.DataFrame) -> pd.DataFrame:
 # -------------------------------
 # 8. Enhanced Train & Predict Pipeline
 # -------------------------------
-def train_and_predict(df: pd.DataFrame) -> float:
+def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     if 'sentiment' in df.columns and df["sentiment"].dtype == object:
         try:
             df["sentiment"] = df["sentiment"].astype(float)
@@ -538,28 +633,261 @@ def train_and_predict(df: pd.DataFrame) -> float:
     if 'close' not in df.columns:
         logging.error("No 'close' in DataFrame, cannot create target.")
         return None
+
+    df = df.copy()
     df['target'] = df['close'].shift(-1)
     df.dropna(inplace=True)
-    if len(df) < 10:
+    if len(df) < 70:  # more needed for deep models
         logging.error("Not enough rows after shift to train. Need more candles.")
         return None
 
     X = df[available_cols]
     y = df['target']
-    logging.info(f"Training model with {len(X)} rows and {len(available_cols)} features (others are disabled).")
-    model = get_model()
-    model.fit(X, y)
+
+    # --- Check for NaN or Inf in data or target. Skip transformer if found
+    if np.isnan(X.values).any() or np.isnan(y.values).any() or np.isinf(X.values).any() or np.isinf(y.values).any():
+        logging.error("NaN or Inf detected in features or targets! Will skip any deep models (LSTM/Transformer) for this call.")
+        use_transformer = False
+    else:
+        use_transformer = True
 
     last_row_features = df.iloc[-1][available_cols]
     last_row_df = pd.DataFrame([last_row_features], columns=available_cols)
-    predicted_close = model.predict(last_row_df)[0]
-    return predicted_close
+    last_X_np = np.array(last_row_df)
 
-###################################################################################################
-# 1) New helper function to fetch AI tickers via OpenAI + Bing, inspired by your provided example.
-#    This function attempts to follow the same structure of making a query, optionally using Bing
-#    results, then generating a final list of stock tickers from OpenAI. It is fully automatic.
-###################################################################################################
+    ml_models = parse_ml_models()
+    out_preds = []
+    out_names = []
+
+    # --- SEQUENCE Models (LSTM, Transformer, Transformer_cls only) need sequences
+    seq_len = 60
+
+    def series_to_supervised(Xvalues, yvalues, seq_length):
+        n_samples = Xvalues.shape[0]
+        n_features = Xvalues.shape[1]
+        Xs, ys = [], []
+        for i in range(n_samples - seq_length):
+            Xs.append(Xvalues[i:i+seq_length,:])
+            ys.append(yvalues[i+seq_length])
+        Xs, ys = np.array(Xs), np.array(ys)
+        return Xs, ys
+
+    # --- LSTM -- Tensorflow/Keras (will be handled only if no NaN/Inf)
+    if "lstm" in ml_models and use_transformer:
+        X_lstm_np = np.array(X)
+        y_lstm_np = np.array(y)
+        X_lstm_win, y_lstm_win = series_to_supervised(X_lstm_np, y_lstm_np, seq_len)
+        lstm_model = get_single_model("lstm", input_shape=(seq_len, X_lstm_np.shape[1]), num_features=X_lstm_np.shape[1], lstm_seq=seq_len)
+        es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=12, verbose=1, restore_best_weights=True)
+        cp = keras.callbacks.ModelCheckpoint("lstm_best_model.keras", save_best_only=True, monitor="val_loss", mode="min", verbose=0)
+        lstm_model.fit(
+            X_lstm_win, y_lstm_win,
+            epochs=80,
+            batch_size=32,
+            verbose=0,
+            validation_split=0.18,
+            callbacks=[es, cp]
+        )
+        lstm_model.load_weights("lstm_best_model.keras")
+        last_seq = X_lstm_np[-seq_len:,:].reshape(1,seq_len,-1)
+        lstm_pred = lstm_model.predict(last_seq, verbose=0)[0][0]
+        out_preds.append(lstm_pred)
+        out_names.append("lstm_pred")
+
+    # --- XGBoost
+    if "xgboost" in ml_models:
+        xgb_model = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+        xgb_model.fit(X, y)
+        xgb_pred = xgb_model.predict(last_row_df)[0]
+        out_preds.append(xgb_pred)
+        out_names.append("xgb_pred")
+
+    # --- Random Forest
+    if "forest" in ml_models or "rf" in ml_models or "randomforest" in ml_models:
+        rf_model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+        rf_model.fit(X, y)
+        rf_pred = rf_model.predict(last_row_df)[0]
+        out_preds.append(rf_pred)
+        out_names.append("rf_pred")
+
+    # ========== Transformer REGRESSION (PyTorch) ========== #
+    if "transformer" in ml_models and use_transformer:
+        try:
+            # --- Scale input features --- (required for deep NNs)
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X.values)
+            y_scale_mean = y.mean()
+            y_scale_std = y.std() if y.std() > 1e-5 else 1.0
+
+            Xtr_np = X_scaled
+            ytr_np = ((y.values - y_scale_mean) / y_scale_std)
+
+            if np.isnan(Xtr_np).any() or np.isnan(ytr_np).any():
+                logging.error("NaN in scaled Transformer input or target, skipping Transformer!")
+                use_this_transformer = False
+            else:
+                use_this_transformer = True
+
+            if use_this_transformer:
+                Xtr_win, ytr_win = series_to_supervised(Xtr_np, ytr_np, seq_len)
+                Xtr_win_torch = torch.tensor(Xtr_win, dtype=torch.float32)
+                ytr_win_torch = torch.tensor(ytr_win, dtype=torch.float32)
+
+                TransformerReg = get_single_model("transformer", num_features=Xtr_np.shape[1])
+                tr_reg_model = TransformerReg(num_features=Xtr_np.shape[1], seq_len=seq_len)
+                opt = torch.optim.Adam(tr_reg_model.parameters(), lr=0.0005)  # smaller learning rate
+                loss_fn = torch.nn.L1Loss()
+                tr_reg_model.train()
+
+                for epoch in range(50):
+                    opt.zero_grad()
+                    y_pred = tr_reg_model(Xtr_win_torch).squeeze()
+                    if torch.isnan(y_pred).any():
+                        logging.error("NaN in TransformerReg model output! Skipping transformer this fit.")
+                        break
+                    loss = loss_fn(y_pred, ytr_win_torch)
+                    if torch.isnan(loss):
+                        logging.error("NaN loss in TransformerReg training loop, skipping this Transformer fit!")
+                        break
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(tr_reg_model.parameters(), max_norm=2.0)
+                    opt.step()
+                    if epoch % 10 == 0:
+                        logging.info(f"TransformerReg (epoch {epoch}): train loss = {loss.item():.5f}")
+                tr_reg_model.eval()
+                # Predict last seq using scaling
+                last_x_seq = X_scaled[-seq_len:,:].reshape(1,seq_len,-1)
+                last_seq_torch = torch.tensor(last_x_seq, dtype=torch.float32)
+                with torch.no_grad():
+                    y_pred_scaled = tr_reg_model(last_seq_torch).cpu().numpy()[0,0]
+                tr_reg_pred = (y_pred_scaled * y_scale_std) + y_scale_mean  # invert scaling
+                if not np.isnan(tr_reg_pred) and not np.isinf(tr_reg_pred):
+                    out_preds.append(tr_reg_pred)
+                    out_names.append("tr_reg_pred")
+        except Exception as e:
+            logging.error(f"TransformerReg failed to train: {e}")
+
+    # ========== Transformer CLASSIFIER (PyTorch, scaled) ========== #
+    if "transformer_cls" in ml_models and use_transformer:
+        try:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X.values)
+            Xtr_np = X_scaled
+            ytr_np = y.values
+            Xtr_win, ytr_win = series_to_supervised(Xtr_np, ytr_np, seq_len)
+            ytr_cls = (ytr_win > Xtr_win[:,-1,-1])
+            ytr_cls = ytr_cls.astype(np.long)
+            Xtr_win_torch = torch.tensor(Xtr_win, dtype=torch.float32)
+            ytr_win_torch = torch.tensor(ytr_cls, dtype=torch.long)
+
+            TransformerCls = get_single_model("transformer_cls", num_features=Xtr_np.shape[1])
+            tr_cls_model = TransformerCls(num_features=Xtr_np.shape[1], seq_len=seq_len)
+            opt = torch.optim.Adam(tr_cls_model.parameters(), lr=0.0005)
+            loss_fn = torch.nn.CrossEntropyLoss()
+            tr_cls_model.train()
+
+            for epoch in range(30):
+                opt.zero_grad()
+                out_logits = tr_cls_model(Xtr_win_torch)
+                if torch.isnan(out_logits).any():
+                    logging.error("NaN outputs in TransformerCls! Skipping.")
+                    break
+                loss = loss_fn(out_logits, ytr_win_torch)
+                if torch.isnan(loss):
+                    logging.error("NaN loss in TransformerCls! Skipping fit.")
+                    break
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(tr_cls_model.parameters(), max_norm=2.0)
+                opt.step()
+                if epoch % 8 == 0:
+                    logging.info(f"TransformerCls (epoch {epoch}): train loss = {loss.item():.5f}")
+            tr_cls_model.eval()
+            last_x_seq = X_scaled[-seq_len:,:].reshape(1,seq_len,-1)
+            last_seq_torch = torch.tensor(last_x_seq, dtype=torch.float32)
+            with torch.no_grad():
+                logits = tr_cls_model(last_seq_torch)[0]
+                softmax_scores = torch.softmax(logits,dim=0).cpu().numpy()
+                cls_dir_pred = softmax_scores[1]-softmax_scores[0]
+            if not np.isnan(cls_dir_pred) and not np.isinf(cls_dir_pred):
+                out_preds.append(cls_dir_pred)
+                out_names.append("tr_cls_pred")
+        except Exception as e:
+            logging.error(f"TransformerCls failed to train: {e}")
+
+    # Final output - meta model?
+    if len(out_preds)==1:
+        if return_model_stack:
+            return out_preds[0], {out_names[0]:out_preds[0]}
+        else:
+            return out_preds[0]
+
+    # Otherwise, meta-stack
+    meta_X_list = []
+    meta_y_list = []
+    valid_idx_start = 69   # skip period lost by sequence windows
+    for i in range(valid_idx_start, len(df)-1):  # for stacking meta-train
+        features_i = df.iloc[i][available_cols].values
+        meta_features = []
+        for m_idx, mname in enumerate(out_names):
+            val = None
+            if mname == "lstm_pred":
+                seq = np.array(df.iloc[i-seq_len+1:i+1][available_cols])
+                if seq.shape[0]==seq_len:
+                    seq = seq.reshape(1,seq_len,-1)
+                    lstm_pred_meta = lstm_model.predict(seq,verbose=0)[0][0]
+                    meta_features.append(lstm_pred_meta)
+                else:
+                    meta_features.append(np.nan)
+            elif mname == "xgb_pred":
+                meta_features.append(xgb_model.predict(features_i.reshape(1,-1))[0])
+            elif mname == "rf_pred":
+                meta_features.append(rf_model.predict(features_i.reshape(1,-1))[0])
+            elif mname == "tr_reg_pred":
+                seq = np.array(df.iloc[i-seq_len+1:i+1][available_cols])
+                if seq.shape[0]==seq_len and use_transformer:
+                    seq_scaled = scaler.transform(seq)
+                    seq_t = torch.tensor(seq_scaled.reshape(1,seq_len,-1),dtype=torch.float32)
+                    with torch.no_grad():
+                        y_pred_scaled = tr_reg_model(seq_t).cpu().numpy()[0,0]
+                    y_pred_rescaled = (y_pred_scaled * y_scale_std) + y_scale_mean
+                    meta_features.append(y_pred_rescaled)
+                else:
+                    meta_features.append(np.nan)
+            elif mname == "tr_cls_pred":
+                seq = np.array(df.iloc[i-seq_len+1:i+1][available_cols])
+                if seq.shape[0]==seq_len and use_transformer:
+                    seq_scaled = scaler.transform(seq)
+                    seq_t = torch.tensor(seq_scaled.reshape(1,seq_len,-1),dtype=torch.float32)
+                    with torch.no_grad():
+                        logits = tr_cls_model(seq_t)[0]
+                        softmax_scores = torch.softmax(logits,dim=0).cpu().numpy()
+                        cls_dir_pred = softmax_scores[1]-softmax_scores[0]
+                        meta_features.append(cls_dir_pred)
+                else:
+                    meta_features.append(np.nan)
+            else:
+                meta_features.append(np.nan)
+        if not any(np.isnan(meta_features)):
+            meta_X_list.append(meta_features)
+            meta_y_list.append(df.iloc[i+1]['close'])
+    if len(meta_X_list)<3:
+        logging.warning(f"Meta-model: Not enough meta training data, falling back to mean of predictions.")
+        pred = np.mean([p for p in out_preds])
+        if return_model_stack:
+            return pred, dict(zip(out_names,out_preds))
+        else:
+            return pred
+
+    meta_X = np.array(meta_X_list)
+    meta_y = np.array(meta_y_list)
+    meta_model = RidgeCV().fit(meta_X, meta_y)
+    pred_stack = np.array(out_preds).reshape(1,-1)
+    final_pred = float(meta_model.predict(pred_stack)[0])
+    if return_model_stack:
+        pred_details = dict(zip(out_names, out_preds))
+        return final_pred, pred_details
+    else:
+        return final_pred
 
 def fetch_new_ai_tickers(num_needed, exclude_tickers):
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -616,7 +944,7 @@ def fetch_new_ai_tickers(num_needed, exclude_tickers):
         ]
 
         completion = openai_client.chat.completions.create(
-            model="o1",
+            model="gpt-4.1",
             messages=messages,
             store=True
         )
@@ -1357,29 +1685,25 @@ def console_listener():
                 if approach == "simple":
                     train_df = df.iloc[:train_end]
                     test_df  = df.iloc[train_end:]
-                    if len(train_df) < 2:
+                    if len(train_df) < 70:
                         logging.error(f"[{ticker}] Not enough training rows for simple approach.")
                         continue
 
-                    X_train = train_df[available_cols]
-                    y_train = train_df['target']
-                    model = get_model()
-                    model.fit(X_train, y_train)
-
-
+                    # Fit models, but only on train
+                    pred_stack = []
                     for i_ in range(len(test_df)):
+                        sub_df = pd.concat([train_df, test_df.iloc[:i_+1]], axis=0, ignore_index=True)
+                        pred_close = train_and_predict(sub_df)
                         row_idx = test_df.index[i_]
                         row_data = df.loc[row_idx]
-                        x_test = row_data[available_cols].values.reshape(1, -1)
-                        pred_price = model.predict(x_test)[0]
                         real_close = row_data['close']
                         timestamps.append(row_data['timestamp'])
-                        predictions.append(pred_price)
+                        predictions.append(pred_close)
                         actuals.append(real_close)
 
                         action = logic_module.run_backtest(
                             current_price=real_close,
-                            predicted_price=pred_price,
+                            predicted_price=pred_close,
                             position_qty=position_qty,
                             current_timestamp=row_data['timestamp'],
                             candles=test_df
@@ -1389,38 +1713,38 @@ def console_listener():
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
                                 cash += pl
-                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_price, pl)
+                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
                             shares_to_buy = int(cash // real_close)
                             if shares_to_buy > 0:
                                 position_qty = shares_to_buy
                                 avg_entry_price = real_close
-                                record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_price, None)
+                                record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_close, None)
                         elif action == "SELL":
                             if position_qty > 0:
                                 pl = (real_close - avg_entry_price) * position_qty
                                 cash += pl
-                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_price, pl)
+                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
                         elif action == "SHORT":
                             if position_qty > 0:
                                 pl = (real_close - avg_entry_price) * position_qty
                                 cash += pl
-                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_price, pl)
+                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
                             shares_to_short = int(cash // real_close)
                             if shares_to_short > 0:
                                 position_qty = -shares_to_short
                                 avg_entry_price = real_close
-                                record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_price, None)
+                                record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_close, None)
                         elif action == "COVER":
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
                                 cash += pl
-                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_price, pl)
+                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
 
@@ -1440,25 +1764,20 @@ def console_listener():
                         bar_str = "#"*progress + "-"*(bar_length - progress)
                         logging.info(f"[{ticker}] complex backtest progress: Step {step_index}/{count} [{bar_str}]")
                         sub_train = df.iloc[:i_]
-                        if len(sub_train) < 2:
+                        if len(sub_train) < 70:
                             logging.warning(f"[{ticker}] Not enough data to train at iteration {i_}. Skipping.")
                             continue
 
-                        X_sub = sub_train[available_cols]
-                        y_sub = sub_train['target']
-                        model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                        model_rf.fit(X_sub, y_sub)
-
+                        pred_close = train_and_predict(sub_train)
                         row_data = df.iloc[i_]
-                        pred_price = model_rf.predict(row_data[available_cols].values.reshape(1, -1))[0]
                         real_close = row_data['close']
                         timestamps.append(row_data['timestamp'])
-                        predictions.append(pred_price)
+                        predictions.append(pred_close)
                         actuals.append(real_close)
 
                         action = logic_module.run_backtest(
                             current_price=real_close,
-                            predicted_price=pred_price,
+                            predicted_price=pred_close,
                             position_qty=position_qty,
                             current_timestamp=row_data['timestamp'],
                             candles=backtest_candles
@@ -1468,38 +1787,38 @@ def console_listener():
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
                                 cash += pl
-                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_price, pl)
+                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
                             shares_to_buy = int(cash // real_close)
                             if shares_to_buy > 0:
                                 position_qty = shares_to_buy
                                 avg_entry_price = real_close
-                                record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_price, None)
+                                record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_close, None)
                         elif action == "SELL":
                             if position_qty > 0:
                                 pl = (real_close - avg_entry_price) * position_qty
                                 cash += pl
-                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_price, pl)
+                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
                         elif action == "SHORT":
                             if position_qty > 0:
                                 pl = (real_close - avg_entry_price) * position_qty
                                 cash += pl
-                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_price, pl)
+                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
                             shares_to_short = int(cash // real_close)
                             if shares_to_short > 0:
                                 position_qty = -shares_to_short
                                 avg_entry_price = real_close
-                                record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_price, None)
+                                record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_close, None)
                         elif action == "COVER":
                             if position_qty < 0:
                                 pl = (avg_entry_price - real_close) * abs(position_qty)
                                 cash += pl
-                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_price, pl)
+                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
                                 position_qty = 0
                                 avg_entry_price = 0.0
 

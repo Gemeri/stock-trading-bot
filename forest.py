@@ -944,7 +944,7 @@ def fetch_new_ai_tickers(num_needed, exclude_tickers):
         ]
 
         completion = openai_client.chat.completions.create(
-            model="gpt-4.1",
+            model="",
             messages=messages,
             store=True
         )
@@ -1017,30 +1017,68 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
     if qty <= 0:
         return
     try:
+        pos = None
+        try:
+            pos = api.get_position(ticker)
+            pos_qty = float(pos.qty)
+        except Exception:
+            pos = None
+            pos_qty = 0.0
+
+        already_long = pos_qty > 0
+        already_short = pos_qty < 0
+        abs_short_qty = abs(pos_qty) if already_short else 0.0
+
+        # Step 1: If short, fully cover first (to flat)
+        if already_short and abs_short_qty > 0:
+            if DISCORD_MODE == "on":
+                send_discord_order_message(
+                    "COVER", ticker, buy_price, predicted_price,
+                    extra_info="Auto-covering short before BUY."
+                )
+            else:
+                api.submit_order(
+                    symbol=ticker,
+                    qty=int(abs_short_qty),
+                    side='buy',
+                    type='market',
+                    time_in_force='day'
+                )
+                logging.info(f"[{ticker}] Auto-COVER {int(abs_short_qty)} at {buy_price:.2f} before BUY")
+                log_trade("COVER", ticker, abs_short_qty, buy_price, None, None)
+            pos_qty = 0.0   # Now flat
+
+        # Step 2: If already long, avoid duplicate buy
+        if already_long:
+            logging.info(f"[{ticker}] Already long {int(pos_qty)} shares. Skipping new BUY to prevent duplicate long position.")
+            return
+
+        # Step 3: Proceed to new BUY for desired qty
         if DISCORD_MODE == "on":
-            send_discord_order_message("BUY", ticker, buy_price, predicted_price,
-                                       extra_info="Buying shares via Discord bot.")
+            send_discord_order_message(
+                "BUY", ticker, buy_price, predicted_price,
+                extra_info="Buying shares via Discord bot."
+            )
         else:
+            # Risk allocation as before
             account = api.get_account()
             available_cash = float(account.cash)
-            base_tickers_count = len(TICKERS) if TICKERS else 0
-            total_ticker_slots = base_tickers_count + AI_TICKER_COUNT
-            if total_ticker_slots <= 0:
-                total_ticker_slots = 1
+            total_ticker_slots = (len(TICKERS) if TICKERS else 0) + AI_TICKER_COUNT
+            total_ticker_slots = max(total_ticker_slots, 1)
             split_cash = available_cash / total_ticker_slots
-            max_shares_for_this_ticker = int(split_cash // buy_price)
-            final_qty = min(qty, max_shares_for_this_ticker)
+            max_shares = int(split_cash // buy_price)
+            final_qty = min(qty, max_shares)
             if final_qty <= 0:
                 logging.info(f"[{ticker}] Not enough split cash to buy any shares. Skipping.")
                 return
             api.submit_order(
                 symbol=ticker,
-                qty=final_qty,
+                qty=int(final_qty),
                 side='buy',
                 type='market',
                 time_in_force='day'
             )
-            logging.info(f"[{ticker}] BUY {final_qty} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
+            logging.info(f"[{ticker}] BUY {int(final_qty)} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
             log_trade("BUY", ticker, final_qty, buy_price, predicted_price, None)
             if ticker not in TICKERS and ticker not in AI_TICKERS:
                 AI_TICKERS.append(ticker)
@@ -1051,32 +1089,50 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
     if qty <= 0:
         return
     try:
-        if DISCORD_MODE == "on":
-            send_discord_order_message("SELL", ticker, sell_price, predicted_price,
-                                       extra_info="Selling shares via Discord bot.")
-        else:
+        pos = None
+        try:
+            pos = api.get_position(ticker)
+            pos_qty = float(pos.qty)
+        except Exception:
             pos = None
-            try:
-                pos = api.get_position(ticker)
-            except:
-                pass
+            pos_qty = 0.0
+
+        already_long = pos_qty > 0
+        already_short = pos_qty < 0
+        abs_long_qty = pos_qty if already_long else 0.0
+
+        if not already_long or abs_long_qty <= 0:
+            logging.info(f"[{ticker}] No long position to SELL. Skipping.")
+            return
+
+        sellable_qty = min(qty, abs_long_qty)
+        if sellable_qty <= 0:
+            logging.info(f"[{ticker}] No shares to SELL.")
+            return
+
+        if DISCORD_MODE == "on":
+            send_discord_order_message(
+                "SELL", ticker, sell_price, predicted_price,
+                extra_info="Selling shares via Discord bot."
+            )
+        else:
             avg_entry = float(pos.avg_entry_price) if pos else 0.0
             api.submit_order(
                 symbol=ticker,
-                qty=qty,
+                qty=int(sellable_qty),
                 side='sell',
                 type='market',
                 time_in_force='day'
             )
-            pl = (sell_price - avg_entry) * qty
-            logging.info(f"[{ticker}] SELL {qty} at {sell_price:.2f} (Predicted: {predicted_price:.2f}, P/L: {pl:.2f})")
-            log_trade("SELL", ticker, qty, sell_price, predicted_price, pl)
+            pl = (sell_price - avg_entry) * sellable_qty
+            logging.info(f"[{ticker}] SELL {int(sellable_qty)} at {sell_price:.2f} (Predicted: {predicted_price:.2f}, P/L: {pl:.2f})")
+            log_trade("SELL", ticker, sellable_qty, sell_price, predicted_price, pl)
             try:
                 new_pos = api.get_position(ticker)
                 if float(new_pos.qty) == 0 and ticker in AI_TICKERS:
                     AI_TICKERS.remove(ticker)
                     _ensure_ai_tickers()
-            except:
+            except Exception:
                 if ticker in AI_TICKERS:
                     AI_TICKERS.remove(ticker)
                     _ensure_ai_tickers()
@@ -1087,30 +1143,70 @@ def short_shares(ticker, qty, short_price, predicted_price):
     if qty <= 0:
         return
     try:
+        pos = None
+        try:
+            pos = api.get_position(ticker)
+            pos_qty = float(pos.qty)
+        except Exception:
+            pos = None
+            pos_qty = 0.0
+
+        already_long = pos_qty > 0
+        already_short = pos_qty < 0
+        abs_long_qty = pos_qty if already_long else 0.0
+        abs_short_qty = abs(pos_qty) if already_short else 0.0
+
+        # Step 1: If long, fully sell to flat
+        if already_long and abs_long_qty > 0:
+            if DISCORD_MODE == "on":
+                send_discord_order_message(
+                    "SELL", ticker, short_price, predicted_price,
+                    extra_info="Auto-selling long before SHORT."
+                )
+            else:
+                avg_entry = float(pos.avg_entry_price)
+                api.submit_order(
+                    symbol=ticker,
+                    qty=int(abs_long_qty),
+                    side='sell',
+                    type='market',
+                    time_in_force='day'
+                )
+                pl = (short_price - avg_entry) * abs_long_qty
+                logging.info(f"[{ticker}] Auto-SELL {int(abs_long_qty)} at {short_price:.2f} before SHORT")
+                log_trade("SELL", ticker, abs_long_qty, short_price, predicted_price, pl)
+            pos_qty = 0.0  # Flat
+
+        # Step 2: If already short, avoid duplicate short
+        if already_short:
+            logging.info(f"[{ticker}] Already short {int(abs_short_qty)} shares. Skipping new SHORT to prevent duplicate short position.")
+            return
+
+        # Step 3: Proceed to open new SHORT for qty
         if DISCORD_MODE == "on":
-            send_discord_order_message("SHORT", ticker, short_price, predicted_price,
-                                       extra_info="Shorting shares via Discord bot.")
+            send_discord_order_message(
+                "SHORT", ticker, short_price, predicted_price,
+                extra_info="Shorting shares via Discord bot."
+            )
         else:
             account = api.get_account()
             available_cash = float(account.cash)
-            base_tickers_count = len(TICKERS) if TICKERS else 0
-            total_ticker_slots = base_tickers_count + AI_TICKER_COUNT
-            if total_ticker_slots <= 0:
-                total_ticker_slots = 1
+            total_ticker_slots = (len(TICKERS) if TICKERS else 0) + AI_TICKER_COUNT
+            total_ticker_slots = max(total_ticker_slots, 1)
             split_cash = available_cash / total_ticker_slots
-            max_shares_for_this_ticker = int(split_cash // short_price)
-            final_qty = min(qty, max_shares_for_this_ticker)
+            max_shares = int(split_cash // short_price)
+            final_qty = min(qty, max_shares)
             if final_qty <= 0:
                 logging.info(f"[{ticker}] Not enough split cash/margin to short any shares. Skipping.")
                 return
             api.submit_order(
                 symbol=ticker,
-                qty=final_qty,
+                qty=int(final_qty),
                 side='sell',
                 type='market',
                 time_in_force='day'
             )
-            logging.info(f"[{ticker}] SHORT {final_qty} at {short_price:.2f} (Predicted: {predicted_price:.2f})")
+            logging.info(f"[{ticker}] SHORT {int(final_qty)} at {short_price:.2f} (Predicted: {predicted_price:.2f})")
             log_trade("SHORT", ticker, final_qty, short_price, predicted_price, None)
             if ticker not in TICKERS and ticker not in AI_TICKERS:
                 AI_TICKERS.append(ticker)
@@ -1121,38 +1217,54 @@ def close_short(ticker, qty, cover_price):
     if qty <= 0:
         return
     try:
-        if DISCORD_MODE == "on":
-            send_discord_order_message("COVER", ticker, cover_price, 0,
-                                       extra_info="Covering short via Discord bot.")
-        else:
+        pos = None
+        try:
+            pos = api.get_position(ticker)
+            pos_qty = float(pos.qty)
+        except Exception:
             pos = None
-            try:
-                pos = api.get_position(ticker)
-            except:
-                pass
-            avg_short_price = float(pos.avg_entry_price) if pos else 0.0
+            pos_qty = 0.0
+
+        already_short = pos_qty < 0
+        abs_short_qty = abs(pos_qty) if already_short else 0.0
+
+        if not already_short or abs_short_qty <= 0:
+            logging.info(f"[{ticker}] No short position to COVER. Skipping.")
+            return
+
+        coverable_qty = min(qty, abs_short_qty)
+        if coverable_qty <= 0:
+            logging.info(f"[{ticker}] No shares to COVER.")
+            return
+
+        if DISCORD_MODE == "on":
+            send_discord_order_message(
+                "COVER", ticker, cover_price, 0,
+                extra_info="Covering short via Discord bot."
+            )
+        else:
+            avg_entry = float(pos.avg_entry_price) if pos else 0.0
             api.submit_order(
                 symbol=ticker,
-                qty=qty,
+                qty=int(coverable_qty),
                 side='buy',
                 type='market',
                 time_in_force='day'
             )
-            pl = (avg_short_price - cover_price) * qty
-            logging.info(f"[{ticker}] COVER SHORT {qty} at {cover_price:.2f} (P/L: {pl:.2f})")
-            log_trade("COVER", ticker, qty, cover_price, None, pl)
+            pl = (avg_entry - cover_price) * coverable_qty
+            logging.info(f"[{ticker}] COVER SHORT {int(coverable_qty)} at {cover_price:.2f} (P/L: {pl:.2f})")
+            log_trade("COVER", ticker, coverable_qty, cover_price, None, pl)
             try:
                 new_pos = api.get_position(ticker)
                 if float(new_pos.qty) == 0 and ticker in AI_TICKERS:
                     AI_TICKERS.remove(ticker)
                     _ensure_ai_tickers()
-            except:
+            except Exception:
                 if ticker in AI_TICKERS:
                     AI_TICKERS.remove(ticker)
                     _ensure_ai_tickers()
     except Exception as e:
         logging.error(f"[{ticker}] Cover short failed: {e}")
-
 
 def log_trade(action, ticker, qty, current_price, predicted_price, profit_loss):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

@@ -6,7 +6,7 @@ from stable_baselines3 import PPO
 from sklearn.ensemble import RandomForestRegressor
 import gym
 from gym import spaces
-from forest import api, buy_shares, sell_shares, short_shares, close_short
+from forest import api, buy_shares, sell_shares  # <-- Remove short_shares, close_short
 import logging
 from xgboost import XGBRegressor
 
@@ -26,7 +26,7 @@ ENABLED_FEATURES = [
 
 # Map the timeframe from the .env value to the file suffix
 timeframe_conversion = {"4Hour": "H4", "2Hour": "H2", "1Hour": "H1", "30Min": "M30", "15Min": "M15"}
-timeframe_suffix = timeframe_conversion.get(BAR_TIMEFRAME, "H1")
+timeframe_suffix = timeframe_conversion.get(BAR_TIMEFRAME)
 
 
 def get_csv_path(ticker):
@@ -76,9 +76,7 @@ class TradingEnv(gym.Env):
     Action Space:
       0: BUY
       1: SELL
-      2: SHORT
-      3: COVER
-      4: HOLD (None)
+      2: HOLD (None)
     Reward: Based on realized profit/loss with a small transaction cost.
     """
     metadata = {"render.modes": ["human"]}
@@ -88,14 +86,14 @@ class TradingEnv(gym.Env):
         self.df = df.reset_index(drop=True)
         self.feature_columns = feature_columns
         self.current_step = 0
-        self.action_space = spaces.Discrete(5)
+        self.action_space = spaces.Discrete(3)  # <-- Only 3 actions: BUY, SELL, HOLD
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(len(self.feature_columns),), dtype=np.float32
         )
         # For simulation of trading performance (not used in RL decision)
         self.initial_balance = 100000.0
         self.balance = self.initial_balance
-        self.position = 0    # +1 for long, -1 for short, 0 for flat
+        self.position = 0    # +1 for long, 0 for flat
         self.last_trade_price = 0.0
         self.transaction_cost = 0.001  # 0.1% cost per trade
 
@@ -121,42 +119,25 @@ class TradingEnv(gym.Env):
         next_close = self.df.iloc[self.current_step]["close"]
         reward = 0.0
 
-        # Execute action if it avoids duplicate trades
+        # Only BUY, SELL, HOLD allowed
         if action == 0:  # BUY
-            if self.position <= 0:
-                if self.position < 0:  # Cover short if needed
-                    reward += (self.last_trade_price - current_close) * abs(self.position)
-                    self.position = 0
+            if self.position == 0:
                 self.last_trade_price = current_close
                 self.position = 1
         elif action == 1:  # SELL
             if self.position > 0:
                 reward += (current_close - self.last_trade_price) * self.position
                 self.position = 0
-        elif action == 2:  # SHORT
-            if self.position >= 0:
-                if self.position > 0:  # Sell long if needed
-                    reward += (current_close - self.last_trade_price) * self.position
-                    self.position = 0
-                self.last_trade_price = current_close
-                self.position = -1
-        elif action == 3:  # COVER
-            if self.position < 0:
-                reward += (self.last_trade_price - current_close) * abs(self.position)
-                self.position = 0
-        elif action == 4:  # HOLD / NONE
+        elif action == 2:  # HOLD / NONE
             reward = 0.0
 
-        # Apply a transaction cost if a trade occurred
-        if action in [0, 1, 2, 3]:
+        # Apply transaction cost if a trade occurred
+        if action in [0, 1]:
             reward -= self.transaction_cost * current_close
 
         # Additional reward for the position held over the period
         if self.position != 0:
-            if self.position > 0:
-                reward += (next_close - current_close)
-            elif self.position < 0:
-                reward += (current_close - next_close)
+            reward += (next_close - current_close)
 
         obs = self._get_observation() if not done else np.zeros(self.observation_space.shape, dtype=np.float32)
         return obs, reward, done, {}
@@ -200,9 +181,9 @@ def run_logic(current_price, predicted_price, ticker):
       2. Compute predicted_price via a model.
       3. Create and train the RL (PPO) model.
       4. Retrieve the current open position from the live API.
-      5. Execute a trade (buy, sell, short, or cover) if appropriate.
+      5. Execute a trade (buy, sell) if appropriate.
     """
-    
+
     # Load historical data
     df = load_data(ticker)
     # Train model to predict close price
@@ -215,7 +196,7 @@ def run_logic(current_price, predicted_price, ticker):
     feature_columns = ENABLED_FEATURES + ["predicted_price"]
     current_state = env.df.iloc[-1][feature_columns].values.astype(np.float32)
     action, _ = rl_model.predict(current_state)
-    
+
     # Get live position (if none exists, assume 0)
     try:
         pos = api.get_position(ticker)
@@ -235,15 +216,7 @@ def run_logic(current_price, predicted_price, ticker):
     elif action == 1 and position_qty > 0:
         logging.info("sell")
         sell_shares(ticker, position_qty, current_price, predicted_price)
-    elif action == 2 and position_qty >= 0:
-        max_shares = int(cash // current_price)
-        logging.info("short")
-        short_shares(ticker, max_shares, current_price, predicted_price)
-    elif action == 3 and position_qty < 0:
-        qty_to_close = abs(position_qty)
-        logging.info("cover")
-        close_short(ticker, qty_to_close, current_price)
-    # Action 4 is HOLD (do nothing)
+    # Action 2 is HOLD (do nothing)
 
 
 def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles):
@@ -254,7 +227,7 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
       3. Compute predicted_price and build the RL environment.
       4. Train the RL (PPO) agent.
       5. Using current_timestamp, find the current state.
-      6. Return one of: "BUY", "SELL", "SHORT", "COVER", or "NONE".
+      6. Return one of: "BUY", "SELL", or "NONE".
     """
     ticker = TICKERS[0]
     df = load_data(ticker)
@@ -263,14 +236,14 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
         df_backtest = df.iloc[-500:].reset_index(drop=True)
     else:
         df_backtest = df.copy().reset_index(drop=True)
-    
+
     # Train model on the backtest dataset
     rf_model, rf_features = train_rf_model(df_backtest)
     # Create the RL environment for backtesting
     env = create_rl_env(df_backtest, rf_model, rf_features)
     # Train the RL agent
     rl_model = train_rl_model(env)
-    
+
     # Locate the row corresponding to the current timestamp using the updated DataFrame from the environment
     current_row = env.df[env.df["timestamp"] == pd.to_datetime(current_timestamp)]
     if current_row.empty:
@@ -278,15 +251,11 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     feature_columns = ENABLED_FEATURES + ["predicted_price"]
     current_state = current_row.iloc[0][feature_columns].values.astype(np.float32)
     action, _ = rl_model.predict(current_state)
-    
+
     # Determine signal based on RL action and current position
     if action == 0 and position_qty <= 0:
         return "BUY"
     elif action == 1 and position_qty > 0:
         return "SELL"
-    elif action == 2 and position_qty >= 0:
-        return "SHORT"
-    elif action == 3 and position_qty < 0:
-        return "COVER"
     else:
         return "NONE"

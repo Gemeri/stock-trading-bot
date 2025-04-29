@@ -27,6 +27,8 @@ import ast
 from sklearn.linear_model import RidgeCV
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
+from alpaca_trade_api.rest import REST, QuoteV2, APIError
+
 
 # LSTM/TF/Keras for deep learning models
 import tensorflow as tf
@@ -1334,6 +1336,29 @@ def _get_logic_script_name(logic_id: str) -> str:
         else:
             return "logic_15_forecast_driven"
 
+def get_current_price() -> float:
+    """
+    Fetches the latest quote for TSLA and returns its estimated current price
+    (midpoint of bid and ask) as a float.
+    Expects ALPACA_API_KEY and ALPACA_API_SECRET in the environment.
+    """
+    key    = os.getenv("ALPACA_API_KEY", "")
+    secret = os.getenv("ALPACA_API_SECRET", "")
+    if not key or not secret:
+        print("Error: set ALPACA_API_KEY and ALPACA_API_SECRET in your environment.", file=sys.stderr)
+        sys.exit(1)
+
+    api = REST(key, secret, "https://paper-api.alpaca.markets", api_version="v2")
+
+    try:
+        quote: QuoteV2 = api.get_latest_quote("TSLA")
+    except APIError as e:
+        print(f"API error fetching quote: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # return a float, not a formatted string
+    return (quote.bid_price + quote.ask_price) / 2
+
 # -------------------------------
 # 9b. The central "trade_logic" placeholder
 # -------------------------------
@@ -1344,6 +1369,7 @@ def trade_logic(current_price: float, predicted_price: float, ticker: str):
         module_path = f"logic.{logic_module_name}"
         logic_module = importlib.import_module(module_path)
         logging.info(f"This is a test with {logic_module}")
+        real_current = get_current_price()
         logic_module.run_logic(current_price, predicted_price, ticker)
     except Exception as e:
         logging.error(f"Error dispatching to trade logic '{TRADE_LOGIC}': {e}")

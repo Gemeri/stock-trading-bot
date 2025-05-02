@@ -28,6 +28,8 @@ from sklearn.linear_model import RidgeCV
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 from alpaca_trade_api.rest import REST, QuoteV2, APIError
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.inspection import permutation_importance
 
 
 # LSTM/TF/Keras for deep learning models
@@ -77,6 +79,21 @@ RANDOM_SEED  = 42
 NY_TZ = pytz.timezone("America/New_York")
 
 NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()
+
+# -----------------------------------------------------------------------------
+# list of every feature column your models know about (including the new ones)
+# -----------------------------------------------------------------------------
+POSSIBLE_FEATURE_COLS = [
+    'open', 'high', 'low', 'close', 'volume', 'vwap',
+    'price_change', 'high_low_range', 'log_volume', 'sentiment',
+    'price_return', 'candle_rise', 'body_size', 'wick_to_body',
+    'macd_line', 'macd_signal', 'macd_histogram',
+    'rsi', 'momentum', 'roc', 'atr', 'hist_vol', 'obv', 'volume_change',
+    'stoch_k', 'bollinger_upper', 'bollinger_lower',
+    'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx',
+    'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
+    'lagged_close_5', 'lagged_close_10'
+]
 
 
 if DISCORD_MODE == "on":
@@ -523,74 +540,135 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute a variety of technical features on price data:
+      - price_return, candle_rise, body_size, wick_to_body
+      - MACD (12,26,9), ADX (14), EMAs (9,21,50,200)
+      - RSI, momentum, ROC, ATR, historical volatility, OBV, volume_change
+      - stochastic K, Bollinger Bands, lagged closes
+    """
+    # --- PRICE-BASED FEATURES ---
     if 'close' in df.columns:
         df['price_return'] = df['close'].pct_change().fillna(0)
-    if all(x in df.columns for x in ['high','low']):
+    if all(c in df.columns for c in ['high', 'low']):
         df['candle_rise'] = df['high'] - df['low']
-    if all(x in df.columns for x in ['close','open']):
+    if all(c in df.columns for c in ['close', 'open']):
         df['body_size'] = df['close'] - df['open']
-        body = (df['close'] - df['open']).replace(0, np.nan)
-        if all(x in df.columns for x in ['high','low']):
+        body = df['body_size'].replace(0, np.nan)
+        if all(c in df.columns for c in ['high', 'low']):
             df['wick_to_body'] = ((df['high'] - df['low']) / body).replace(np.nan, 0)
+
+    # --- MACD (12,26,9) ---
     if 'close' in df.columns:
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
         ema26 = df['close'].ewm(span=26, adjust=False).mean()
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False).mean()
-        df['macd_line'] = (macd - signal)
+        macd_line    = ema12 - ema26
+        signal_line  = macd_line.ewm(span=9, adjust=False).mean()
+        df['macd_line']      = macd_line
+        df['macd_signal']    = signal_line
+        df['macd_histogram'] = macd_line - signal_line
+
+    # --- EMAs (9,21,50,200) ---
+    if 'close' in df.columns:
+        for span in [9, 21, 50, 200]:
+            df[f'ema_{span}'] = df['close'].ewm(span=span, adjust=False).mean()
+
+    # --- ADX (14) ---
+    if all(c in df.columns for c in ['high', 'low', 'close']):
+        period = 14
+        high  = df['high']
+        low   = df['low']
+        close = df['close']
+
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low  - close.shift(1)).abs()
+        tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        up_move   = high.diff()
+        down_move = low.shift(1) - low
+        plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm  = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+        tr_smooth       = tr.rolling(window=period).sum()
+        plus_dm_smooth  = plus_dm.rolling(window=period).sum()
+        minus_dm_smooth = minus_dm.rolling(window=period).sum()
+
+        plus_di  = 100 * plus_dm_smooth  / tr_smooth
+        minus_di = 100 * minus_dm_smooth / tr_smooth
+        dx       = (plus_di.subtract(minus_di).abs() / (plus_di + minus_di)) * 100
+
+        df['adx'] = dx.rolling(window=period).mean()
+
+    # --- RSI (14) ---
     if 'close' in df.columns:
         window = 14
         delta = df['close'].diff()
-        up = delta.clip(lower=0)
-        down = -1*delta.clip(upper=0)
-        ema_up = up.ewm(com=window-1, adjust=False).mean()
+        up    = delta.clip(lower=0)
+        down  = -delta.clip(upper=0)
+        ema_up   = up.ewm(com=window-1, adjust=False).mean()
         ema_down = down.ewm(com=window-1, adjust=False).mean()
         rs = ema_up / ema_down.replace(0, np.nan)
         df['rsi'] = 100 - (100 / (1 + rs))
         df['rsi'] = df['rsi'].fillna(50)
+
+    # --- MOMENTUM and ROC ---
     if 'close' in df.columns:
-        df['momentum'] = df['close'] - df['close'].shift(14)
-        df['momentum'] = df['momentum'].fillna(0)
-    if 'close' in df.columns:
+        df['momentum'] = (df['close'] - df['close'].shift(14)).fillna(0)
         shifted = df['close'].shift(14)
-        df['roc'] = ((df['close'] - shifted) / shifted.replace(0, np.nan))*100
-        df['roc'] = df['roc'].fillna(0)
-    if all(x in df.columns for x in ['high','low','close']):
-        high_low = df['high'] - df['low']
+        df['roc'] = ((df['close'] - shifted) / shifted.replace(0, np.nan) * 100).fillna(0)
+
+    # --- ATR (14) ---
+    if all(c in df.columns for c in ['high', 'low', 'close']):
+        high_low   = df['high'] - df['low']
         high_close = (df['high'] - df['close'].shift(1)).abs()
-        low_close = (df['low'] - df['close'].shift(1)).abs()
-        tr = high_low.combine(high_close, max).combine(low_close, max)
-        df['atr'] = tr.ewm(span=14, adjust=False).mean().fillna(0)
+        low_close  = (df['low'] - df['close'].shift(1)).abs()
+        tr_calc    = high_low.combine(high_close, max).combine(low_close, max)
+        df['atr']  = tr_calc.ewm(span=14, adjust=False).mean().fillna(0)
+
+    # --- HISTORICAL VOLATILITY ---
     if 'close' in df.columns:
         ret = df['close'].pct_change()
-        rolling_std = ret.rolling(window=14).std()
-        df['hist_vol'] = rolling_std * np.sqrt(14)
-        df['hist_vol'] = df['hist_vol'].fillna(0)
-    if 'close' in df.columns and 'volume' in df.columns:
+        vol_std = ret.rolling(window=14).std()
+        df['hist_vol'] = (vol_std * np.sqrt(14)).fillna(0)
+
+    # --- ON-BALANCE VOLUME ---
+    if all(c in df.columns for c in ['close', 'volume']):
         df['obv'] = 0
         for i in range(1, len(df)):
-            if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                df.loc[i, 'obv'] = df.loc[i-1, 'obv'] + df.loc[i, 'volume']
-            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                df.loc[i, 'obv'] = df.loc[i-1, 'obv'] - df.loc[i, 'volume']
+            prev = df.at[i-1, 'obv']
+            if df.at[i, 'close'] > df.at[i-1, 'close']:
+                df.at[i, 'obv'] = prev + df.at[i, 'volume']
+            elif df.at[i, 'close'] < df.at[i-1, 'close']:
+                df.at[i, 'obv'] = prev - df.at[i, 'volume']
             else:
-                df.loc[i, 'obv'] = df.loc[i-1, 'obv']
+                df.at[i, 'obv'] = prev
+
+    # --- VOLUME CHANGE ---
     if 'volume' in df.columns:
         df['volume_change'] = df['volume'].pct_change().fillna(0)
-    if all(x in df.columns for x in ['close','high','low']):
-        low14 = df['low'].rolling(window=14).min()
+
+    # --- STOCHASTIC %K (14) ---
+    if all(c in df.columns for c in ['close', 'high', 'low']):
+        low14  = df['low'].rolling(window=14).min()
         high14 = df['high'].rolling(window=14).max()
-        stoch_k = (df['close'] - low14) / (high14 - low14.replace(0, np.nan))*100
-        df['stoch_k'] = stoch_k.fillna(50)
+        stoch_k = ((df['close'] - low14) / (high14 - low14.replace(0, np.nan)) * 100).fillna(50)
+        df['stoch_k'] = stoch_k
+
+    # --- BOLLINGER BANDS (20,2) ---
     if 'close' in df.columns:
         ma20 = df['close'].rolling(window=20).mean()
-        std20 = df['close'].rolling(window=20).std()
-        df['bollinger_upper'] = ma20 + 2*std20
-        df['bollinger_lower'] = ma20 - 2*std20
+        std20= df['close'].rolling(window=20).std()
+        df['bollinger_upper'] = ma20 + 2 * std20
+        df['bollinger_lower'] = ma20 - 2 * std20
+
+    # --- LAGGED CLOSES ---
     if 'close' in df.columns:
-        for lag in [1,2,3,5,10]:
+        for lag in [1, 2, 3, 5, 10]:
             df[f'lagged_close_{lag}'] = df['close'].shift(lag).fillna(df['close'].iloc[0])
+
     return df
+
 
 def drop_disabled_features(df: pd.DataFrame) -> pd.DataFrame:
     global DISABLED_FEATURES, DISABLED_FEATURES_SET
@@ -622,15 +700,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     df = compute_custom_features(df)
     df = drop_disabled_features(df)
 
-    possible_cols = [
-        'open','high','low','close','volume','vwap',
-        'price_change','high_low_range','log_volume','sentiment',
-        'price_return','candle_rise','body_size','wick_to_body','macd_line',
-        'rsi','momentum','roc','atr','hist_vol','obv','volume_change',
-        'stoch_k','bollinger_upper','bollinger_lower',
-        'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10'
-    ]
-    available_cols = [c for c in possible_cols if c in df.columns]
+    available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
 
     if 'close' not in df.columns:
         logging.error("No 'close' in DataFrame, cannot create target.")
@@ -1044,7 +1114,7 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
                     qty=int(abs_short_qty),
                     side='buy',
                     type='market',
-                    time_in_force='day'
+                    time_in_force='gtc'
                 )
                 logging.info(f"[{ticker}] Auto-COVER {int(abs_short_qty)} at {buy_price:.2f} before BUY")
                 log_trade("COVER", ticker, abs_short_qty, buy_price, None, None)
@@ -1078,7 +1148,7 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
                 qty=int(final_qty),
                 side='buy',
                 type='market',
-                time_in_force='day'
+                time_in_force='gtc'
             )
             logging.info(f"[{ticker}] BUY {int(final_qty)} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
             log_trade("BUY", ticker, final_qty, buy_price, predicted_price, None)
@@ -1124,7 +1194,7 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
                 qty=int(sellable_qty),
                 side='sell',
                 type='market',
-                time_in_force='day'
+                time_in_force='gtc'
             )
             pl = (sell_price - avg_entry) * sellable_qty
             logging.info(f"[{ticker}] SELL {int(sellable_qty)} at {sell_price:.2f} (Predicted: {predicted_price:.2f}, P/L: {pl:.2f})")
@@ -1172,7 +1242,7 @@ def short_shares(ticker, qty, short_price, predicted_price):
                     qty=int(abs_long_qty),
                     side='sell',
                     type='market',
-                    time_in_force='day'
+                    time_in_force='gtc'
                 )
                 pl = (short_price - avg_entry) * abs_long_qty
                 logging.info(f"[{ticker}] Auto-SELL {int(abs_long_qty)} at {short_price:.2f} before SHORT")
@@ -1206,7 +1276,7 @@ def short_shares(ticker, qty, short_price, predicted_price):
                 qty=int(final_qty),
                 side='sell',
                 type='market',
-                time_in_force='day'
+                time_in_force='gtc'
             )
             logging.info(f"[{ticker}] SHORT {int(final_qty)} at {short_price:.2f} (Predicted: {predicted_price:.2f})")
             log_trade("SHORT", ticker, final_qty, short_price, predicted_price, None)
@@ -1251,7 +1321,7 @@ def close_short(ticker, qty, cover_price):
                 qty=int(coverable_qty),
                 side='buy',
                 type='market',
-                time_in_force='day'
+                time_in_force='gtc'
             )
             pl = (avg_entry - cover_price) * coverable_qty
             logging.info(f"[{ticker}] COVER SHORT {int(coverable_qty)} at {cover_price:.2f} (P/L: {pl:.2f})")
@@ -1761,15 +1831,7 @@ def console_listener():
                     logging.error(f"[{ticker}] train_end < 1. Not enough data for that test_size.")
                     continue
 
-                possible_cols = [
-                    'open','high','low','close','volume','vwap',
-                    'price_change','high_low_range','log_volume','sentiment',
-                    'price_return','candle_rise','body_size','wick_to_body','macd_line',
-                    'rsi','momentum','roc','atr','hist_vol','obv','volume_change',
-                    'stoch_k','bollinger_upper','bollinger_lower',
-                    'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10'
-                ]
-                available_cols = [c for c in possible_cols if c in df.columns]
+                available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
 
                 predictions = []
                 actuals = []
@@ -2018,9 +2080,10 @@ def console_listener():
                 logging.info("feature-importance: Will fetch fresh data for each ticker, then compute importance.")
 
             for ticker in TICKERS:
-                tf_code = timeframe_to_code(BAR_TIMEFRAME)
-                csv_filename = f"{ticker}_{tf_code}.csv"
+                tf_code  = timeframe_to_code(BAR_TIMEFRAME)
+                csv_file = f"{ticker}_{tf_code}.csv"
 
+                # ─── FETCH OR LOAD ──────────────────────────────────────────────────────
                 if not skip_data:
                     df = fetch_candles(ticker, bars=N_BARS, timeframe=BAR_TIMEFRAME)
                     if df.empty:
@@ -2029,57 +2092,74 @@ def console_listener():
                     df = add_features(df)
                     df = compute_custom_features(df)
                     df = drop_disabled_features(df)
-                    df.to_csv(csv_filename, index=False)
+                    df.to_csv(csv_file, index=False)
                     logging.info(f"[{ticker}] Fetched data & saved CSV for feature-importance.")
                 else:
-                    if not os.path.exists(csv_filename):
-                        logging.error(f"[{ticker}] CSV file {csv_filename} not found, skipping.")
+                    if not os.path.exists(csv_file):
+                        logging.error(f"[{ticker}] CSV {csv_file} not found, skipping.")
                         continue
-                    df = pd.read_csv(csv_filename)
+                    df = pd.read_csv(csv_file)
                     if df.empty:
                         logging.error(f"[{ticker}] CSV is empty, skipping.")
                         continue
 
-                if 'sentiment' in df.columns and df["sentiment"].dtype == object:
+                # ─── CLEAN & ENGINEER ───────────────────────────────────────────────────
+                if 'sentiment' in df.columns and df['sentiment'].dtype == object:
                     try:
-                        df["sentiment"] = df["sentiment"].astype(float)
+                        df['sentiment'] = df['sentiment'].astype(float)
                     except Exception as e:
-                        logging.error(f"[{ticker}] Could not convert sentiment to float: {e}")
+                        logging.error(f"[{ticker}] Could not convert sentiment: {e}")
                         continue
 
                 df = add_features(df)
                 df = compute_custom_features(df)
                 df = drop_disabled_features(df)
 
-                if 'close' not in df.columns:
-                    logging.error(f"[{ticker}] No 'close' column after processing. Cannot compute importance.")
-                    continue
-                df['target'] = df['close'].shift(-1)
+                # ─── DEFINE TARGET AS NEXT-DAY RETURN ───────────────────────────────────
+                df['target'] = df['close'].pct_change().shift(-1)
                 df.dropna(inplace=True)
-                if len(df) < 10:
-                    logging.error(f"[{ticker}] Not enough rows after shift to train. Skipping.")
+                if len(df) < 30:
+                    logging.error(f"[{ticker}] Not enough data after shift, skipping.")
                     continue
 
-                possible_cols = [
-                    'open','high','low','close','volume','vwap',
-                    'price_change','high_low_range','log_volume','sentiment',
-                    'price_return','candle_rise','body_size','wick_to_body','macd_line',
-                    'rsi','momentum','roc','atr','hist_vol','obv','volume_change',
-                    'stoch_k','bollinger_upper','bollinger_lower',
-                    'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10'
-                ]
-                available_cols = [c for c in possible_cols if c in df.columns]
-                X = df[available_cols]
-                y = df['target']
+                # ─── PREPARE FEATURES (INCLUDING RAW CLOSE) ─────────────────────────────
+                features = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
+                X_all   = df[features]
+                y_all   = df['target']
 
-                model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                model_rf.fit(X, y)
+                # ─── EXPANDING-WINDOW ROLLING FORECAST & IMPORTANCE ACCUMULATION ────────
+                train_size = int(len(df) * 0.8)           # e.g. 2394 of 2992
+                imp_accum  = np.zeros(len(features))
+                n_models   = 0
 
-                importances = model_rf.feature_importances_
-                feats_importances = sorted(zip(available_cols, importances), key=lambda x: x[1], reverse=True)
-                logging.info(f"[{ticker}] Feature importances (descending):")
-                for feat, imp in feats_importances:
-                    logging.info(f"   {feat}: {imp:.3f}")
+                for i in range(train_size, len(df)):
+                    X_train = X_all.iloc[:i]
+                    y_train = y_all.iloc[:i]
+                    X_test  = X_all.iloc[i:i+1]
+                    y_test  = y_all.iloc[i]
+
+                    # train on [0:i), predict i, then include i in next train
+                    model = RandomForestRegressor(
+                        n_estimators=N_ESTIMATORS,
+                        random_state=RANDOM_SEED,
+                        n_jobs=-1
+                    )
+                    model.fit(X_train, y_train)
+
+                    # optional: capture rolling predictions
+                    y_pred = model.predict(X_test)[0]
+                    # (you could store y_pred vs y_test here for metrics)
+
+                    imp_accum += model.feature_importances_
+                    n_models  += 1
+
+                # ─── AVERAGE IMPORTANCES & LOG ─────────────────────────────────────────
+                avg_imps = imp_accum / n_models
+                ranked   = sorted(zip(features, avg_imps), key=lambda x: x[1], reverse=True)
+
+                logging.info(f"[{ticker}] Rolling-window feature importances (avg over {n_models} models):")
+                for feat, imp in ranked:
+                    logging.info(f"   {feat}: {imp:.4f}")
 
         elif cmd == "commands":
             logging.info("Available commands:")
@@ -2225,15 +2305,7 @@ def console_listener():
                     logging.error(f"[{ticker}] Not enough rows for training. Skipping.")
                     continue
 
-                possible_cols = [
-                    'open','high','low','close','volume','vwap',
-                    'price_change','high_low_range','log_volume','sentiment',
-                    'price_return','candle_rise','body_size','wick_to_body','macd_line',
-                    'rsi','momentum','roc','atr','hist_vol','obv','volume_change',
-                    'stoch_k','bollinger_upper','bollinger_lower',
-                    'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10'
-                ]
-                available_cols = [c for c in possible_cols if c in df.columns]
+                available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
                 X = df[available_cols]
                 y = df['target']
 

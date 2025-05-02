@@ -322,7 +322,7 @@ def fetch_candles(ticker: str, bars: int = 10000, timeframe: str = None) -> pd.D
             limit=bars,
             start=start_dt.isoformat(),
             end=end_dt.isoformat(),
-            adjustment='raw',
+            adjustment='all',
             feed='iex'
         )
     except Exception as e:

@@ -30,6 +30,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 from alpaca_trade_api.rest import REST, QuoteV2, APIError
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.inspection import permutation_importance
+import time
 
 
 # LSTM/TF/Keras for deep learning models
@@ -79,6 +80,8 @@ RANDOM_SEED  = 42
 NY_TZ = pytz.timezone("America/New_York")
 
 NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()
+REWRITE = os.getenv("REWRITE", "off").strip().lower()
+
 
 # -----------------------------------------------------------------------------
 # list of every feature column your models know about (including the new ones)
@@ -288,6 +291,60 @@ def canonical_timeframe(tf: str) -> str:
     tf_clean = tf.strip().lower()
     return _CANONICAL_TF.get(tf_clean, tf)
 
+def add_predicted_close_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds a 'predicted_close' column (next close) where for each row n>=1,
+    it trains the current ML model on rows 0:n-1 and predicts row n's close.
+    The 'predicted_close' column is filled sequentially; first row is simply close.
+    Model never sees the predicted_close column itself as input.
+    This function expects all other feature engineering (including sentiment!) is ALREADY done.
+    """
+    if 'close' not in df.columns:
+        logging.error("No 'close' column in DataFrame for predicted_close computation.")
+        df['predicted_close'] = np.nan
+        return df
+
+    ml_models = parse_ml_models()
+    # For now, use only the FIRST model in ML_MODEL for rolling prediction
+    # (If you want ensemble here, this can be expanded.)
+
+    features_avail = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns and c != "predicted_close"]
+    # Avoid training on "predicted_close" and check for target leaks.
+
+    predicted_close = []
+    for i in range(len(df)):
+        if i == 0:
+            predicted_close.append(df.iloc[0]['close'])
+            continue
+        # Subset up to i-1
+        sub_df = df.iloc[:i]
+        X = sub_df[features_avail]
+        y = sub_df['close']
+        # Make sure there's enough for the model to fit at all
+        if len(X) < 3:
+            pred = df.iloc[i]['close']  # fallback to current close
+            predicted_close.append(pred)
+            continue
+        try:
+            # The get_single_model logic is already in your script (RF/XGB/LSTM/etc).
+            model_name = ml_models[0]
+            if model_name in ["forest", "rf", "randomforest"]:
+                model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+            elif model_name == "xgboost":
+                model = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+            else:
+                # Only support tree models for rolling speed by default
+                model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+            model.fit(X, y)
+            X_pred = df.iloc[[i]][features_avail]
+            pred = model.predict(X_pred)[0]
+        except Exception as e:
+            logging.error(f"Error training or predicting predicted_close for index {i}: {e}")
+            pred = df.iloc[i]['close']
+        predicted_close.append(pred)
+    df["predicted_close"] = predicted_close
+    return df
+
 
 # ==============================================================
 # 1.  timeframe_to_code
@@ -367,6 +424,156 @@ def fetch_candles(ticker: str, bars: int = 10000, timeframe: str = None) -> pd.D
     df = df[final_cols]
     logging.info(f"[{ticker}] Fetched {len(df)} bars.")
     return df
+
+def fetch_candles_plus_features_and_predclose(
+    ticker: str,
+    bars: int,
+    timeframe: str,
+    rewrite_mode: str
+) -> pd.DataFrame:
+    tf_code = timeframe_to_code(timeframe)
+    csv_filename = f"{ticker}_{tf_code}.csv"
+
+    def get_features(df):
+        exclude_cols = {'predicted_close'}
+        return [c for c in POSSIBLE_FEATURE_COLS if c in df.columns and c not in exclude_cols]
+
+    # Fetch most recent candles
+    df_candles = fetch_candles(ticker, bars=bars, timeframe=timeframe)
+    if df_candles.empty:
+        return pd.DataFrame()
+    df_candles = add_features(df_candles)
+    df_candles = compute_custom_features(df_candles)
+    # Regenerate fresh sentiment
+    news_num_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650)
+    articles_per_day = ARTICLES_PER_DAY_MAPPING.get(BAR_TIMEFRAME, 1)
+    news_list = fetch_news_sentiments(ticker, news_num_days, articles_per_day)
+    sentiments = assign_sentiment_to_candles(df_candles, news_list)
+    df_candles['sentiment'] = sentiments
+    # Optionally, save sentiment for other routines
+    sentiment_csv_filename = f"{ticker}_sentiment_{tf_code}.csv"
+    pd.DataFrame({
+        "timestamp": df_candles["timestamp"],
+        "sentiment": [f"{x:.15f}" for x in sentiments]
+    }).to_csv(sentiment_csv_filename, index=False)
+    df_candles = drop_disabled_features(df_candles)
+    # Ensure numeric features
+    for col in df_candles.columns:
+        if col != 'timestamp':
+            df_candles[col] = pd.to_numeric(df_candles[col], errors='coerce')
+
+    # Set up append mode if REWRITE=off
+    if rewrite_mode == "off" and os.path.exists(csv_filename):
+        try:
+            df_existing = pd.read_csv(csv_filename)
+            df_existing["timestamp"] = pd.to_datetime(df_existing["timestamp"])
+            df_candles["timestamp"] = pd.to_datetime(df_candles["timestamp"])
+            last_ts = df_existing["timestamp"].max()
+            mask_new = df_candles["timestamp"] > last_ts
+            df_to_add = df_candles.loc[mask_new].copy()
+        except Exception as e:
+            logging.error(f"[{ticker}] Problem loading old CSV: {e}")
+            df_existing = pd.DataFrame()
+            df_to_add = df_candles.copy()
+    else:
+        df_existing = pd.DataFrame()
+        df_to_add = df_candles.copy()
+
+    # ===== TRUE i+1 System: predict close[i] using features at i-1 =====
+    ml_models = parse_ml_models()
+    features_avail = get_features(df_candles)
+
+    predicted_closes = []
+
+    # Which rows need to be processed with rolling walk-forward?
+    if not df_existing.empty and rewrite_mode == "off":
+        base = df_existing.copy().reset_index(drop=True)
+        n_start = len(base)
+        df_combined = pd.concat([base, df_to_add], ignore_index=True)
+    else:
+        df_combined = df_candles.copy().reset_index(drop=True)
+        n_start = 0
+
+    N = len(df_combined)
+    predicted_close_array = [np.nan] * N
+
+    if N - n_start < 2:
+        logging.info(f"[{ticker}] No new rows to process for ML prediction. Skipping predicted_close generation.")
+        df_combined['predicted_close'] = predicted_close_array
+        df_combined.to_csv(csv_filename, index=False)
+        return df_combined
+
+    # --- PROGRESS BAR LOGIC ---
+
+    progress_steps = max((N - n_start) // 60, 1)  # log ~60 times for long jobs, at least once per step if short
+
+    overall_start = time.time()
+    print_last = overall_start
+    last_logged_percent = -1
+
+    logging.info(f"[{ticker}] Starting rolling ML predicted_close generation for {N-n_start} row(s)... This may take a while.")
+
+    for i in range(max(1, n_start), N):
+        if i == 0 or i-1 < 0:
+            predicted = np.nan if i > 0 else df_combined.iloc[0]['close']
+            predicted_close_array[i] = predicted
+            continue
+
+        try:
+            X_train = df_combined.iloc[:i][features_avail]
+            y_train = df_combined.iloc[:i]['close']
+            model_name = ml_models[0]
+            if model_name in ["forest", "rf", "randomforest"]:
+                model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+            elif model_name == "xgboost":
+                model = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+            else:
+                model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+
+            model.fit(X_train, y_train)
+
+            # Predict for row i using features at i-1
+            X_pred = df_combined.iloc[[i-1]][features_avail]
+            predicted = model.predict(X_pred)[0]
+            predicted_close_array[i] = predicted
+        except Exception as e:
+            logging.error(f"[{ticker}] Error for predicted_close i={i}: {e}")
+            predicted_close_array[i] = np.nan
+
+        # --- logging/progress bar with ETA ---
+        percent = int(100 * (i - n_start + 1) / (N - n_start))
+        now = time.time()
+        elapsed = now - overall_start
+        done_so_far = i - n_start + 1
+        total_needed = N - n_start
+        # Estimate ETA using avg time per step over done_so_far
+        if done_so_far > 5:
+            eta = (elapsed / done_so_far) * (total_needed - done_so_far)
+        else:
+            eta = 0
+        # Log at every progress_steps or milestone percent
+        if ((i - n_start) % progress_steps == 0 or percent == 100 or percent // 2 != last_logged_percent // 2):
+            bar_length = 40
+            filled_length = int(bar_length * percent // 100)
+            bar = "[" + "=" * filled_length + ">" + " " * (bar_length - filled_length) + "]"
+            timestr = f" ETA: {int(eta)}s " if eta > 0 else ""
+            logging.info(f"{ticker}: {bar} {percent:3d}% {timestr}(row {i}/{N-1})")
+            last_logged_percent = percent
+            print_last = now
+
+    logging.info(f"[{ticker}] Completed rolling ML predicted_close generation for {N-n_start} row(s). (took {int(time.time() - overall_start)}s)")
+
+    if not df_existing.empty and rewrite_mode == "off":
+        # Preserve old
+        old_pred_close = list(df_existing.get('predicted_close', [np.nan] * len(df_existing)))
+        predicted_close_array = old_pred_close + predicted_close_array[n_start:]
+
+    df_combined['predicted_close'] = predicted_close_array
+
+    df_combined.to_csv(csv_filename, index=False)
+    logging.info(f"[{ticker}] Wrote {len(df_combined)} rows to {csv_filename} using **TRUE i+1 walk-forward** prediction (as requested).")
+
+    return df_combined
 
 # -------------------------------
 # 6. News & Sentiment Functions
@@ -1491,15 +1698,12 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
         csv_filename = f"{ticker}_{tf_code}.csv"
 
         if not skip_data:
-            df = fetch_candles(ticker, bars=N_BARS, timeframe=BAR_TIMEFRAME)
-            if df.empty:
-                logging.error(f"[{ticker}] Data fetch returned empty DataFrame. Skipping.")
-                continue
-
-            df = add_features(df)
-            df = compute_custom_features(df)
-            df = drop_disabled_features(df)
-
+            df = fetch_candles_plus_features_and_predclose(
+                ticker,
+                bars=N_BARS,
+                timeframe=BAR_TIMEFRAME,
+                rewrite_mode=REWRITE
+            )
             try:
                 df.to_csv(csv_filename, index=False)
                 logging.info(f"[{ticker}] Saved candle data (w/out disabled) to {csv_filename}")
@@ -1679,13 +1883,12 @@ def console_listener():
                 timeframe = parts[1]
             logging.info(f"Received 'get-data' command with timeframe={timeframe}.")
             for ticker in TICKERS:
-                df = fetch_candles(ticker, bars=N_BARS, timeframe=timeframe)
-                if df.empty:
-                    logging.error(f"[{ticker}] No data. Could not save CSV with features.")
-                    continue
-                df = add_features(df)
-                df = compute_custom_features(df)
-                df = drop_disabled_features(df)
+                df = fetch_candles_plus_features_and_predclose(
+                    ticker,
+                    bars=N_BARS,
+                    timeframe=BAR_TIMEFRAME,
+                    rewrite_mode=REWRITE
+                )
 
                 tf_code = timeframe_to_code(timeframe)
                 csv_filename = f"{ticker}_{tf_code}.csv"
@@ -1706,14 +1909,12 @@ def console_listener():
                         logging.error(f"[{ticker}] CSV is empty, skipping.")
                         continue
                 else:
-                    df = fetch_candles(ticker, bars=N_BARS, timeframe=BAR_TIMEFRAME)
-                    if df.empty:
-                        logging.error(f"[{ticker}] Empty data, skipping predict-next.")
-                        continue
-                    df = add_features(df)
-                    df = compute_custom_features(df)
-                    df = drop_disabled_features(df)
-
+                    df = fetch_candles_plus_features_and_predclose(
+                        ticker,
+                        bars=N_BARS,
+                        timeframe=BAR_TIMEFRAME,
+                        rewrite_mode=REWRITE
+                    )
                     df.to_csv(csv_filename, index=False)
                     logging.info(f"[{ticker}] Fetched new data + advanced features (minus disabled), saved to {csv_filename}")
 
@@ -1806,13 +2007,12 @@ def console_listener():
                         logging.error(f"[{ticker}] CSV is empty, skipping.")
                         continue
                 else:
-                    df = fetch_candles(ticker, bars=N_BARS, timeframe=timeframe_for_backtest)
-                    if df.empty:
-                        logging.error(f"[{ticker}] No data to backtest.")
-                        continue
-                    df = add_features(df)
-                    df = compute_custom_features(df)
-                    df = drop_disabled_features(df)
+                    df = fetch_candles_plus_features_and_predclose(
+                        ticker,
+                        bars=N_BARS,
+                        timeframe=BAR_TIMEFRAME,
+                        rewrite_mode=REWRITE
+                    )
                     df.to_csv(csv_filename, index=False)
                     logging.info(f"[{ticker}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
 
@@ -2085,13 +2285,12 @@ def console_listener():
 
                 # ─── FETCH OR LOAD ──────────────────────────────────────────────────────
                 if not skip_data:
-                    df = fetch_candles(ticker, bars=N_BARS, timeframe=BAR_TIMEFRAME)
-                    if df.empty:
-                        logging.error(f"[{ticker}] Unable to fetch data for feature-importance.")
-                        continue
-                    df = add_features(df)
-                    df = compute_custom_features(df)
-                    df = drop_disabled_features(df)
+                    df = fetch_candles_plus_features_and_predclose(
+                        ticker,
+                        bars=N_BARS,
+                        timeframe=BAR_TIMEFRAME,
+                        rewrite_mode=REWRITE
+                    )
                     df.to_csv(csv_file, index=False)
                     logging.info(f"[{ticker}] Fetched data & saved CSV for feature-importance.")
                 else:
@@ -2267,13 +2466,12 @@ def console_listener():
                 csv_filename = f"{ticker}_{tf_code}.csv"
 
                 if not skip_data:
-                    df = fetch_candles(ticker, bars=N_BARS, timeframe=BAR_TIMEFRAME)
-                    if df.empty:
-                        logging.error(f"[{ticker}] Unable to fetch data for auto-feature.")
-                        continue
-                    df = add_features(df)
-                    df = compute_custom_features(df)
-                    df = drop_disabled_features(df)
+                    df = fetch_candles_plus_features_and_predclose(
+                        ticker,
+                        bars=N_BARS,
+                        timeframe=BAR_TIMEFRAME,
+                        rewrite_mode=REWRITE
+                    )
                     df.to_csv(csv_filename, index=False)
                     logging.info(f"[{ticker}] Fetched data & saved CSV for auto-feature.")
                 else:

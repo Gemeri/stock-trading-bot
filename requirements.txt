@@ -16,3 +16,7 @@ shimmy
 gym
 tensorflow
 torch
+faiss-cpu
+chromadb
+sentence-transformers
+deap

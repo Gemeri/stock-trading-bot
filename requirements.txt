@@ -20,3 +20,4 @@ faiss-cpu
 chromadb
 sentence-transformers
 deap
+tf-keras

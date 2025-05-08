@@ -30,6 +30,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 from alpaca_trade_api.rest import REST, QuoteV2, APIError
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.inspection import permutation_importance
+import lightgbm as lgb
 import time
 
 
@@ -83,19 +84,29 @@ NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()
 REWRITE = os.getenv("REWRITE", "off").strip().lower()
 
 
-# -----------------------------------------------------------------------------
-# list of every feature column your models know about (including the new ones)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------
+# list of every feature column your models know about
+# ----------------------------------------------------
 POSSIBLE_FEATURE_COLS = [
-    'open', 'high', 'low', 'close', 'volume', 'vwap',
-    'price_change', 'high_low_range', 'log_volume', 'sentiment',
-    'price_return', 'candle_rise', 'body_size', 'wick_to_body',
+    'open', 'high', 'low', 'close', 'volume', 'vwap', 'sentiment',
     'macd_line', 'macd_signal', 'macd_histogram',
-    'rsi', 'momentum', 'roc', 'atr', 'hist_vol', 'obv', 'volume_change',
-    'stoch_k', 'bollinger_upper', 'bollinger_lower',
+    'rsi', 'momentum', 'roc', 'atr', 'obv',
+    'bollinger_upper', 'bollinger_lower',
     'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx',
     'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
-    'lagged_close_5', 'lagged_close_10'
+    'lagged_close_5', 'lagged_close_10',
+    'candle_body_ratio'
+    'wick_dominance',
+    'gap_vs_prev',
+    'volume_zscore',
+    'atr_zscore',
+    'rsi_zscore',
+    'adx_trend',
+    'macd_cross',
+    'macd_hist_flip',
+    'day_of_week',
+    'days_since_high',
+    'days_since_low',
 ]
 
 
@@ -119,22 +130,30 @@ if DISCORD_MODE == "on":
 def parse_ml_models():
     models = [m.strip().lower() for m in ML_MODEL.split(",") if m.strip()]
     if "all" in models:
-        # Add special logic: all 5 (forest, xgboost, lstm, transformer_reg, transformer_cls)
-        models = ["forest", "xgboost", "lstm", "transformer", "transformer_cls"]
-    return models
+        # Meta model: now includes forest/xgboost/lightgbm/lstm/transformer
+        models = ["forest", "xgboost", "lightgbm", "lstm", "transformer"]
+    # Accept lgbm or lightgbm as synonyms for LightGBM
+    canonical = []
+    for m in models:
+        if m in ["lgbm", "lightgbm"]:
+            canonical.append("lightgbm")
+        else:
+            canonical.append(m)
+    return canonical
 
 def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=60):
     if model_name in ["forest", "rf", "randomforest"]:
         return RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
     elif model_name == "xgboost":
         return xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+    elif model_name == "lightgbm":
+        return lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
     elif model_name == "lstm":
-        # --- Deep, robust LSTM stack with regularization ---
         if input_shape is None and num_features is not None:
             input_shape = (lstm_seq, num_features)
         model = keras.Sequential([
             layers.Input(shape=input_shape),
-            layers.Masking(mask_value=0.),  # handles missing/zero padding if present
+            layers.Masking(mask_value=0.),
             layers.LSTM(128, return_sequences=True, dropout=0.25, recurrent_dropout=0.25),
             layers.BatchNormalization(),
             layers.LSTM(64, return_sequences=True, dropout=0.20, recurrent_dropout=0.20),
@@ -148,7 +167,6 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
         model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss="mae")
         return model
     elif model_name == "transformer":
-        # --- Deep Transformer for regression with regularization ---
         class LargeTransformerRegressor(nn.Module):
             def __init__(self, num_features, seq_len=60):
                 super().__init__()
@@ -167,7 +185,6 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
                 self.relu = nn.ReLU()
                 self.out = nn.Linear(32, 1)
             def forward(self, x):
-                # x: [batch, seq, features]
                 em = self.embedding(x)
                 out = self.transformer(em)
                 out = self.dropout(out)
@@ -176,8 +193,8 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
                 out = self.relu(out)
                 return self.out(out)
         return LargeTransformerRegressor
-    elif model_name == "transformer_cls":
-        # --- Large Transformer for classification (up/down, binary) ---
+    elif model_name == "classifier":
+        # If you want the classifier model (not used in meta stack)
         class LargeTransformerClassifier(nn.Module):
             def __init__(self, num_features, seq_len=60):
                 super().__init__()
@@ -207,12 +224,6 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
     else:
         logging.warning(f"Unknown model type {model_name}. Using RandomForest.")
         return RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-
-DISABLED_FEATURES = os.getenv("DISABLED_FEATURES", "").strip()
-if DISABLED_FEATURES:
-    DISABLED_FEATURES_SET = set([f.strip() for f in DISABLED_FEATURES.split(",") if f.strip()])
-else:
-    DISABLED_FEATURES_SET = set()
 
 TRADE_LOGIC = os.getenv("TRADE_LOGIC", "15").strip()
 
@@ -290,60 +301,6 @@ def canonical_timeframe(tf: str) -> str:
         return tf
     tf_clean = tf.strip().lower()
     return _CANONICAL_TF.get(tf_clean, tf)
-
-def add_predicted_close_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds a 'predicted_close' column (next close) where for each row n>=1,
-    it trains the current ML model on rows 0:n-1 and predicts row n's close.
-    The 'predicted_close' column is filled sequentially; first row is simply close.
-    Model never sees the predicted_close column itself as input.
-    This function expects all other feature engineering (including sentiment!) is ALREADY done.
-    """
-    if 'close' not in df.columns:
-        logging.error("No 'close' column in DataFrame for predicted_close computation.")
-        df['predicted_close'] = np.nan
-        return df
-
-    ml_models = parse_ml_models()
-    # For now, use only the FIRST model in ML_MODEL for rolling prediction
-    # (If you want ensemble here, this can be expanded.)
-
-    features_avail = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns and c != "predicted_close"]
-    # Avoid training on "predicted_close" and check for target leaks.
-
-    predicted_close = []
-    for i in range(len(df)):
-        if i == 0:
-            predicted_close.append(df.iloc[0]['close'])
-            continue
-        # Subset up to i-1
-        sub_df = df.iloc[:i]
-        X = sub_df[features_avail]
-        y = sub_df['close']
-        # Make sure there's enough for the model to fit at all
-        if len(X) < 3:
-            pred = df.iloc[i]['close']  # fallback to current close
-            predicted_close.append(pred)
-            continue
-        try:
-            # The get_single_model logic is already in your script (RF/XGB/LSTM/etc).
-            model_name = ml_models[0]
-            if model_name in ["forest", "rf", "randomforest"]:
-                model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-            elif model_name == "xgboost":
-                model = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-            else:
-                # Only support tree models for rolling speed by default
-                model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-            model.fit(X, y)
-            X_pred = df.iloc[[i]][features_avail]
-            pred = model.predict(X_pred)[0]
-        except Exception as e:
-            logging.error(f"Error training or predicting predicted_close for index {i}: {e}")
-            pred = df.iloc[i]['close']
-        predicted_close.append(pred)
-    df["predicted_close"] = predicted_close
-    return df
 
 
 # ==============================================================
@@ -438,31 +395,26 @@ def fetch_candles_plus_features_and_predclose(
         exclude_cols = {'predicted_close'}
         return [c for c in POSSIBLE_FEATURE_COLS if c in df.columns and c not in exclude_cols]
 
-    # Fetch most recent candles
     df_candles = fetch_candles(ticker, bars=bars, timeframe=timeframe)
     if df_candles.empty:
         return pd.DataFrame()
     df_candles = add_features(df_candles)
     df_candles = compute_custom_features(df_candles)
-    # Regenerate fresh sentiment
     news_num_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650)
     articles_per_day = ARTICLES_PER_DAY_MAPPING.get(BAR_TIMEFRAME, 1)
     news_list = fetch_news_sentiments(ticker, news_num_days, articles_per_day)
     sentiments = assign_sentiment_to_candles(df_candles, news_list)
     df_candles['sentiment'] = sentiments
-    # Optionally, save sentiment for other routines
     sentiment_csv_filename = f"{ticker}_sentiment_{tf_code}.csv"
     pd.DataFrame({
         "timestamp": df_candles["timestamp"],
         "sentiment": [f"{x:.15f}" for x in sentiments]
     }).to_csv(sentiment_csv_filename, index=False)
-    df_candles = drop_disabled_features(df_candles)
-    # Ensure numeric features
+    # Remove feature-disabling logic. Use all features.
     for col in df_candles.columns:
         if col != 'timestamp':
             df_candles[col] = pd.to_numeric(df_candles[col], errors='coerce')
 
-    # Set up append mode if REWRITE=off
     if rewrite_mode == "off" and os.path.exists(csv_filename):
         try:
             df_existing = pd.read_csv(csv_filename)
@@ -479,101 +431,100 @@ def fetch_candles_plus_features_and_predclose(
         df_existing = pd.DataFrame()
         df_to_add = df_candles.copy()
 
-    # ===== TRUE i+1 System: predict close[i] using features at i-1 =====
     ml_models = parse_ml_models()
-    features_avail = get_features(df_candles)
+    has_regressor = any(m in ["xgboost", "forest", "rf", "randomforest", "lstm", "transformer"] for m in ml_models)
 
-    predicted_closes = []
+    predicted_close_array = [np.nan] * (len(df_existing) + len(df_to_add))
 
-    # Which rows need to be processed with rolling walk-forward?
-    if not df_existing.empty and rewrite_mode == "off":
-        base = df_existing.copy().reset_index(drop=True)
-        n_start = len(base)
-        df_combined = pd.concat([base, df_to_add], ignore_index=True)
-    else:
-        df_combined = df_candles.copy().reset_index(drop=True)
-        n_start = 0
+    # Only generate predicted_close if a regression ML_MODEL is present
+    if has_regressor:
+        # i+1 rolling prediction as before!
+        if not df_existing.empty and rewrite_mode == "off":
+            base = df_existing.copy().reset_index(drop=True)
+            n_start = len(base)
+            df_combined = pd.concat([base, df_to_add], ignore_index=True)
+        else:
+            df_combined = df_candles.copy().reset_index(drop=True)
+            n_start = 0
 
-    N = len(df_combined)
-    predicted_close_array = [np.nan] * N
+        N = len(df_combined)
+        predicted_close_array = [np.nan] * N
+        if N - n_start < 2:
+            logging.info(f"[{ticker}] No new rows to process for ML prediction. Skipping predicted_close generation.")
+            df_combined['predicted_close'] = predicted_close_array
+            df_combined.to_csv(csv_filename, index=False)
+            return df_combined
 
-    if N - n_start < 2:
-        logging.info(f"[{ticker}] No new rows to process for ML prediction. Skipping predicted_close generation.")
+        progress_steps = max((N - n_start) // 60, 1)
+        overall_start = time.time()
+        print_last = overall_start
+        last_logged_percent = -1
+
+        logging.info(f"[{ticker}] Starting rolling ML predicted_close generation for {N-n_start} row(s)... This may take a while.")
+
+        for i in range(max(1, n_start), N):
+            if i == 0 or i-1 < 0:
+                predicted = np.nan if i > 0 else df_combined.iloc[0]['close']
+                predicted_close_array[i] = predicted
+                continue
+            try:
+                X_train = df_combined.iloc[:i][get_features(df_combined)]
+                y_train = df_combined.iloc[:i]['close']
+                model_name = ml_models[0]
+                if model_name in ["forest", "rf", "randomforest"]:
+                    model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                elif model_name == "xgboost":
+                    model = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                elif model_name in ["lightgbm", "lgbm"]:
+                    model = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                elif model_name == "lstm":
+                    model = get_single_model("lstm", input_shape=(X_train.shape[0], X_train.shape[1]), num_features=X_train.shape[1], lstm_seq=X_train.shape[0])
+                elif model_name == "transformer":
+                    Transformer = get_single_model("transformer", num_features=X_train.shape[1], lstm_seq=X_train.shape[0])
+                    model = Transformer(num_features=X_train.shape[1], seq_len=X_train.shape[0])
+                else:
+                    model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                model.fit(X_train, y_train)
+                X_pred = df_combined.iloc[[i-1]][get_features(df_combined)]
+                predicted = model.predict(X_pred)[0]
+                predicted_close_array[i] = predicted
+            except Exception as e:
+                logging.error(f"[{ticker}] Error for predicted_close i={i}: {e}")
+                predicted_close_array[i] = np.nan
+            percent = int(100 * (i - n_start + 1) / (N - n_start))
+            now = time.time()
+            elapsed = now - overall_start
+            done_so_far = i - n_start + 1
+            total_needed = N - n_start
+            if done_so_far > 5:
+                eta = (elapsed / done_so_far) * (total_needed - done_so_far)
+            else:
+                eta = 0
+            if ((i - n_start) % progress_steps == 0 or percent == 100 or percent // 2 != last_logged_percent // 2):
+                bar_length = 40
+                filled_length = int(bar_length * percent // 100)
+                bar = "[" + "=" * filled_length + ">" + " " * (bar_length - filled_length) + "]"
+                timestr = f" ETA: {int(eta)}s " if eta > 0 else ""
+                logging.info(f"{ticker}: {bar} {percent:3d}% {timestr}(row {i}/{N-1})")
+                last_logged_percent = percent
+                print_last = now
+
+        logging.info(f"[{ticker}] Completed rolling ML predicted_close generation for {N-n_start} row(s). (took {int(time.time() - overall_start)}s)")
+
+        if not df_existing.empty and rewrite_mode == "off":
+            old_pred_close = list(df_existing.get('predicted_close', [np.nan] * len(df_existing)))
+            predicted_close_array = old_pred_close + predicted_close_array[n_start:]
+
         df_combined['predicted_close'] = predicted_close_array
         df_combined.to_csv(csv_filename, index=False)
+        logging.info(f"[{ticker}] Wrote {len(df_combined)} rows to {csv_filename} using **TRUE i+1 walk-forward** prediction (as requested).")
+
         return df_combined
-
-    # --- PROGRESS BAR LOGIC ---
-
-    progress_steps = max((N - n_start) // 60, 1)  # log ~60 times for long jobs, at least once per step if short
-
-    overall_start = time.time()
-    print_last = overall_start
-    last_logged_percent = -1
-
-    logging.info(f"[{ticker}] Starting rolling ML predicted_close generation for {N-n_start} row(s)... This may take a while.")
-
-    for i in range(max(1, n_start), N):
-        if i == 0 or i-1 < 0:
-            predicted = np.nan if i > 0 else df_combined.iloc[0]['close']
-            predicted_close_array[i] = predicted
-            continue
-
-        try:
-            X_train = df_combined.iloc[:i][features_avail]
-            y_train = df_combined.iloc[:i]['close']
-            model_name = ml_models[0]
-            if model_name in ["forest", "rf", "randomforest"]:
-                model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-            elif model_name == "xgboost":
-                model = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-            else:
-                model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-
-            model.fit(X_train, y_train)
-
-            # Predict for row i using features at i-1
-            X_pred = df_combined.iloc[[i-1]][features_avail]
-            predicted = model.predict(X_pred)[0]
-            predicted_close_array[i] = predicted
-        except Exception as e:
-            logging.error(f"[{ticker}] Error for predicted_close i={i}: {e}")
-            predicted_close_array[i] = np.nan
-
-        # --- logging/progress bar with ETA ---
-        percent = int(100 * (i - n_start + 1) / (N - n_start))
-        now = time.time()
-        elapsed = now - overall_start
-        done_so_far = i - n_start + 1
-        total_needed = N - n_start
-        # Estimate ETA using avg time per step over done_so_far
-        if done_so_far > 5:
-            eta = (elapsed / done_so_far) * (total_needed - done_so_far)
-        else:
-            eta = 0
-        # Log at every progress_steps or milestone percent
-        if ((i - n_start) % progress_steps == 0 or percent == 100 or percent // 2 != last_logged_percent // 2):
-            bar_length = 40
-            filled_length = int(bar_length * percent // 100)
-            bar = "[" + "=" * filled_length + ">" + " " * (bar_length - filled_length) + "]"
-            timestr = f" ETA: {int(eta)}s " if eta > 0 else ""
-            logging.info(f"{ticker}: {bar} {percent:3d}% {timestr}(row {i}/{N-1})")
-            last_logged_percent = percent
-            print_last = now
-
-    logging.info(f"[{ticker}] Completed rolling ML predicted_close generation for {N-n_start} row(s). (took {int(time.time() - overall_start)}s)")
-
-    if not df_existing.empty and rewrite_mode == "off":
-        # Preserve old
-        old_pred_close = list(df_existing.get('predicted_close', [np.nan] * len(df_existing)))
-        predicted_close_array = old_pred_close + predicted_close_array[n_start:]
-
-    df_combined['predicted_close'] = predicted_close_array
-
-    df_combined.to_csv(csv_filename, index=False)
-    logging.info(f"[{ticker}] Wrote {len(df_combined)} rows to {csv_filename} using **TRUE i+1 walk-forward** prediction (as requested).")
-
-    return df_combined
+    else:
+        # For other ML_MODEL, don't generate/update predicted_close column
+        df = df_candles.reset_index(drop=True)
+        df.to_csv(csv_filename, index=False)
+        return df
 
 # -------------------------------
 # 6. News & Sentiment Functions
@@ -748,32 +699,45 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute a variety of technical features on price data:
-      - price_return, candle_rise, body_size, wick_to_body
-      - MACD (12,26,9), ADX (14), EMAs (9,21,50,200)
-      - RSI, momentum, ROC, ATR, historical volatility, OBV, volume_change
-      - stochastic K, Bollinger Bands, lagged closes
+    Compute advanced technical features and requested custom ones.
     """
-    # --- PRICE-BASED FEATURES ---
-    if 'close' in df.columns:
-        df['price_return'] = df['close'].pct_change().fillna(0)
-    if all(c in df.columns for c in ['high', 'low']):
-        df['candle_rise'] = df['high'] - df['low']
-    if all(c in df.columns for c in ['close', 'open']):
-        df['body_size'] = df['close'] - df['open']
-        body = df['body_size'].replace(0, np.nan)
-        if all(c in df.columns for c in ['high', 'low']):
-            df['wick_to_body'] = ((df['high'] - df['low']) / body).replace(np.nan, 0)
 
-    # --- MACD (12,26,9) ---
+    # --- MACD (12,26,9) & classic indicators ---
     if 'close' in df.columns:
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
         ema26 = df['close'].ewm(span=26, adjust=False).mean()
         macd_line    = ema12 - ema26
         signal_line  = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist    = macd_line - signal_line
         df['macd_line']      = macd_line
         df['macd_signal']    = signal_line
-        df['macd_histogram'] = macd_line - signal_line
+        df['macd_histogram'] = macd_hist
+
+    # --- RSI (14) ---
+    if 'close' in df.columns:
+        window = 14
+        delta = df['close'].diff()
+        up    = delta.clip(lower=0)
+        down  = -delta.clip(upper=0)
+        ema_up   = up.ewm(com=window-1, adjust=False).mean()
+        ema_down = down.ewm(com=window-1, adjust=False).mean()
+        rs = ema_up / ema_down.replace(0, np.nan)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        df['rsi'] = df['rsi'].fillna(50)
+
+    # --- MOMENTUM and ROC ---
+    if 'close' in df.columns:
+        df['momentum'] = (df['close'] - df['close'].shift(14)).fillna(0)
+        shifted = df['close'].shift(14)
+        df['roc'] = ((df['close'] - shifted) / shifted.replace(0, np.nan) * 100).fillna(0)
+
+    # --- ATR (14) ---
+    if all(c in df.columns for c in ['high', 'low', 'close']):
+        high_low   = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift(1)).abs()
+        low_close  = (df['low'] - df['close'].shift(1)).abs()
+        tr_calc    = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['atr']  = tr_calc.ewm(span=14, adjust=False).mean().fillna(0)
 
     # --- EMAs (9,21,50,200) ---
     if 'close' in df.columns:
@@ -807,41 +771,9 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
 
         df['adx'] = dx.rolling(window=period).mean()
 
-    # --- RSI (14) ---
-    if 'close' in df.columns:
-        window = 14
-        delta = df['close'].diff()
-        up    = delta.clip(lower=0)
-        down  = -delta.clip(upper=0)
-        ema_up   = up.ewm(com=window-1, adjust=False).mean()
-        ema_down = down.ewm(com=window-1, adjust=False).mean()
-        rs = ema_up / ema_down.replace(0, np.nan)
-        df['rsi'] = 100 - (100 / (1 + rs))
-        df['rsi'] = df['rsi'].fillna(50)
-
-    # --- MOMENTUM and ROC ---
-    if 'close' in df.columns:
-        df['momentum'] = (df['close'] - df['close'].shift(14)).fillna(0)
-        shifted = df['close'].shift(14)
-        df['roc'] = ((df['close'] - shifted) / shifted.replace(0, np.nan) * 100).fillna(0)
-
-    # --- ATR (14) ---
-    if all(c in df.columns for c in ['high', 'low', 'close']):
-        high_low   = df['high'] - df['low']
-        high_close = (df['high'] - df['close'].shift(1)).abs()
-        low_close  = (df['low'] - df['close'].shift(1)).abs()
-        tr_calc    = high_low.combine(high_close, max).combine(low_close, max)
-        df['atr']  = tr_calc.ewm(span=14, adjust=False).mean().fillna(0)
-
-    # --- HISTORICAL VOLATILITY ---
-    if 'close' in df.columns:
-        ret = df['close'].pct_change()
-        vol_std = ret.rolling(window=14).std()
-        df['hist_vol'] = (vol_std * np.sqrt(14)).fillna(0)
-
     # --- ON-BALANCE VOLUME ---
     if all(c in df.columns for c in ['close', 'volume']):
-        df['obv'] = 0
+        df['obv'] = 0.0
         for i in range(1, len(df)):
             prev = df.at[i-1, 'obv']
             if df.at[i, 'close'] > df.at[i-1, 'close']:
@@ -850,17 +782,6 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
                 df.at[i, 'obv'] = prev - df.at[i, 'volume']
             else:
                 df.at[i, 'obv'] = prev
-
-    # --- VOLUME CHANGE ---
-    if 'volume' in df.columns:
-        df['volume_change'] = df['volume'].pct_change().fillna(0)
-
-    # --- STOCHASTIC %K (14) ---
-    if all(c in df.columns for c in ['close', 'high', 'low']):
-        low14  = df['low'].rolling(window=14).min()
-        high14 = df['high'].rolling(window=14).max()
-        stoch_k = ((df['close'] - low14) / (high14 - low14.replace(0, np.nan)) * 100).fillna(50)
-        df['stoch_k'] = stoch_k
 
     # --- BOLLINGER BANDS (20,2) ---
     if 'close' in df.columns:
@@ -874,23 +795,76 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
         for lag in [1, 2, 3, 5, 10]:
             df[f'lagged_close_{lag}'] = df['close'].shift(lag).fillna(df['close'].iloc[0])
 
-    return df
+    # ========== CUSTOM FEATURES REQUIRED ==========
 
+    # 1. Candle Body Ratio: (close – open) / (high – low)
+    if all(x in df.columns for x in ['close', 'open', 'high', 'low']):
+        denominator = (df['high'] - df['low']).replace(0, np.nan)
+        df['candle_body_ratio'] = ((df['close'] - df['open']) / denominator).replace([np.inf, -np.inf], 0).fillna(0)
 
-def drop_disabled_features(df: pd.DataFrame) -> pd.DataFrame:
-    global DISABLED_FEATURES, DISABLED_FEATURES_SET
-    if DISABLED_FEATURES == "main":
-        keep_set = MAIN_FEATURES.union({"sentiment"})
-        keep_cols = [c for c in df.columns if c in keep_set]
-        return df[keep_cols]
-    elif DISABLED_FEATURES == "base":
-        keep_set = BASE_FEATURES.union({"sentiment"})
-        keep_cols = [c for c in df.columns if c in keep_set]
-        return df[keep_cols]
+    # 2. Wick Dominance: max(upper wick, lower wick) as % of full candle
+    if all(x in df.columns for x in ['close', 'open', 'high', 'low']):
+        upper_wick = (df[['close', 'open']].max(axis=1))
+        lower_wick = (df[['close', 'open']].min(axis=1))
+        upper_wick_len = df['high'] - upper_wick
+        lower_wick_len = lower_wick - df['low']
+        candle_range = (df['high'] - df['low']).replace(0, np.nan)
+        wick_dom = np.maximum(upper_wick_len, lower_wick_len) / candle_range
+        df['wick_dominance'] = wick_dom.replace([np.inf, -np.inf], 0).fillna(0)
+
+    # 3. Gap vs Previous Close: open - lagged_close_1
+    if 'open' in df.columns and 'lagged_close_1' in df.columns:
+        df['gap_vs_prev'] = df['open'] - df['lagged_close_1']
+
+    # 4. Z-score for volume, ATR, RSI (window=30)
+    for feat, z_feat in [('volume', 'volume_zscore'), ('atr', 'atr_zscore'), ('rsi', 'rsi_zscore')]:
+        if feat in df.columns:
+            roll = df[feat].rolling(window=30, min_periods=10)
+            mean = roll.mean()
+            std = roll.std().replace(0, np.nan)
+            df[z_feat] = ((df[feat] - mean) / std).fillna(0)
+
+    # 5. ADX Regime flag: 1 if ADX>30 (trending), else 0
+    df['adx_trend'] = ((df['adx'] > 30).astype(int)) if 'adx' in df.columns else 0
+
+    # 6A. MACD crossing (signal): 1 if crossing up (MACD crosses above signal), -1 if crossing below, 0 otherwise
+    if 'macd_line' in df.columns and 'macd_signal' in df.columns:
+        macd_cross = np.where(
+            (df['macd_line'].shift(1) < df['macd_signal'].shift(1)) &
+            (df['macd_line'] >= df['macd_signal']), 1,
+            np.where(
+                (df['macd_line'].shift(1) > df['macd_signal'].shift(1)) &
+                (df['macd_line'] <= df['macd_signal']), -1, 0
+            )
+        )
+        df['macd_cross'] = macd_cross
+
+        # 6B. MACD histogram sign change
+        macd_hist_flip = np.where(
+            (df['macd_histogram'].shift(1) * df['macd_histogram']) < 0,
+            1, 0
+        )
+        df['macd_hist_flip'] = macd_hist_flip
     else:
-        temp = {c for c in DISABLED_FEATURES_SET if c.lower() != 'sentiment'}
-        final_cols = [c for c in df.columns if c not in temp]
-        return df[final_cols]
+        df['macd_cross'] = 0
+        df['macd_hist_flip'] = 0
+
+    # 7. Day of week (0=Mon..4=Fri, NaN for missing timestamp)
+    if 'timestamp' in df.columns:
+        df['day_of_week'] = pd.to_datetime(df['timestamp']).dt.dayofweek.fillna(-1).astype(int)
+
+    # 8. Days since last N-bar high/low (window=14)
+    N = 14  # lookback for swing
+    if 'high' in df.columns:
+        highs = df['high'].rolling(window=N, min_periods=1)
+        last_high = highs.apply(lambda x: np.argmax(x[::-1]), raw=True)
+        df['days_since_high'] = last_high
+    if 'low' in df.columns:
+        lows = df['low'].rolling(window=N, min_periods=1)
+        last_low = lows.apply(lambda x: np.argmax(x[::-1]), raw=True)
+        df['days_since_low'] = last_low
+
+    return df
 
 # -------------------------------
 # 8. Enhanced Train & Predict Pipeline
@@ -905,7 +879,6 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
 
     df = add_features(df)
     df = compute_custom_features(df)
-    df = drop_disabled_features(df)
 
     available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
 
@@ -916,14 +889,14 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     df = df.copy()
     df['target'] = df['close'].shift(-1)
     df.dropna(inplace=True)
-    if len(df) < 70:  # more needed for deep models
+    if len(df) < 70:
         logging.error("Not enough rows after shift to train. Need more candles.")
         return None
 
     X = df[available_cols]
     y = df['target']
 
-    # --- Check for NaN or Inf in data or target. Skip transformer if found
+    # NaN/Inf check
     if np.isnan(X.values).any() or np.isnan(y.values).any() or np.isinf(X.values).any() or np.isinf(y.values).any():
         logging.error("NaN or Inf detected in features or targets! Will skip any deep models (LSTM/Transformer) for this call.")
         use_transformer = False
@@ -938,7 +911,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     out_preds = []
     out_names = []
 
-    # --- SEQUENCE Models (LSTM, Transformer, Transformer_cls only) need sequences
+    # Sequence models
     seq_len = 60
 
     def series_to_supervised(Xvalues, yvalues, seq_length):
@@ -951,13 +924,183 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
         Xs, ys = np.array(Xs), np.array(ys)
         return Xs, ys
 
-    # --- LSTM -- Tensorflow/Keras (will be handled only if no NaN/Inf)
+    regression_model_ids = ["forest", "rf", "randomforest", "xgboost", "lightgbm", "lstm", "transformer"]
+    use_meta_model = sorted(ml_models) == sorted(["forest", "xgboost", "lightgbm", "lstm", "transformer"])
+
+    # -- Separate classifier logic --
+    if "classifier" in ml_models:
+        # Only run classifier, not meta/stacking
+        try:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X.values)
+            Xtr_np = X_scaled
+            ytr_np = y.values
+            Xtr_win, ytr_win = series_to_supervised(Xtr_np, ytr_np, seq_len)
+            ytr_cls = (ytr_win > Xtr_win[:,-1,-1])
+            ytr_cls = ytr_cls.astype(np.long)
+            Xtr_win_torch = torch.tensor(Xtr_win, dtype=torch.float32)
+            ytr_win_torch = torch.tensor(ytr_cls, dtype=torch.long)
+
+            TransformerCls = get_single_model("classifier", num_features=Xtr_np.shape[1])
+            tr_cls_model = TransformerCls(num_features=Xtr_np.shape[1], seq_len=seq_len)
+            opt = torch.optim.Adam(tr_cls_model.parameters(), lr=0.0005)
+            loss_fn = torch.nn.CrossEntropyLoss()
+            tr_cls_model.train()
+            for epoch in range(30):
+                opt.zero_grad()
+                out_logits = tr_cls_model(Xtr_win_torch)
+                if torch.isnan(out_logits).any():
+                    logging.error("NaN outputs in Classifier! Skipping.")
+                    break
+                loss = loss_fn(out_logits, ytr_win_torch)
+                if torch.isnan(loss):
+                    logging.error("NaN loss in Classifier! Skipping fit.")
+                    break
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(tr_cls_model.parameters(), max_norm=2.0)
+                opt.step()
+                if epoch % 8 == 0:
+                    logging.info(f"Classifier (epoch {epoch}): train loss = {loss.item():.5f}")
+            tr_cls_model.eval()
+            last_x_seq = X_scaled[-seq_len:,:].reshape(1,seq_len,-1)
+            last_seq_torch = torch.tensor(last_x_seq, dtype=torch.float32)
+            with torch.no_grad():
+                logits = tr_cls_model(last_seq_torch)[0]
+                softmax_scores = torch.softmax(logits,dim=0).cpu().numpy()
+                cls_dir_pred = softmax_scores[1]-softmax_scores[0]
+            if return_model_stack:
+                return cls_dir_pred, {"classifier_pred": cls_dir_pred}
+            else:
+                return cls_dir_pred
+        except Exception as e:
+            logging.error(f"Classifier failed to train: {e}")
+            return None
+
+    # --- If meta model (all 5 regressors selected) ---
+    if use_meta_model:
+        model_names_for_meta = ["forest", "xgboost", "lightgbm", "lstm", "transformer"]
+        N = len(df)
+        # Start walk-forward after first seq_len+1 points for LSTM/transformer
+        start_idx = max(seq_len+1, 70)
+        preds_dict = {name:[] for name in model_names_for_meta}
+        y_true = []
+        logging.info(f"Meta model expanding-window walk-forward: {start_idx} ... {N-2}")
+        for i in range(start_idx, N-1):
+            train_idx = range(i)  # up-to-but-not-including i (predict i)
+            local_X = X.iloc[train_idx]
+            local_y = y.iloc[train_idx]
+            X_pred_row = X.iloc[[i]]
+            # FOREST
+            try:
+                rf_model_meta = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                rf_model_meta.fit(local_X, local_y)
+                rf_pred = rf_model_meta.predict(X_pred_row)[0]
+            except:
+                rf_pred = np.nan
+            preds_dict["forest"].append(rf_pred)
+            # XGBOOST
+            try:
+                xgb_model_meta = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                xgb_model_meta.fit(local_X, local_y)
+                xgb_pred = xgb_model_meta.predict(X_pred_row)[0]
+            except:
+                xgb_pred = np.nan
+            preds_dict["xgboost"].append(xgb_pred)
+            # LIGHTGBM
+            try:
+                lgbm_model_meta = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                lgbm_model_meta.fit(local_X, local_y)
+                lgbm_pred = lgbm_model_meta.predict(X_pred_row)[0]
+            except:
+                lgbm_pred = np.nan
+            preds_dict["lightgbm"].append(lgbm_pred)
+            # LSTM
+            try:
+                if use_transformer and i > seq_len+1:
+                    X_lstm_np = local_X.values
+                    y_lstm_np = local_y.values
+                    X_lstm_win, y_lstm_win = series_to_supervised(X_lstm_np, y_lstm_np, seq_len)
+                    lstm_model_meta = get_single_model("lstm", input_shape=(seq_len, X_lstm_np.shape[1]), num_features=X_lstm_np.shape[1], lstm_seq=seq_len)
+                    es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, verbose=0, restore_best_weights=True)
+                    cp = keras.callbacks.ModelCheckpoint("lstm_meta_model.keras", save_best_only=True, monitor="val_loss", mode="min", verbose=0)
+                    lstm_model_meta.fit(
+                        X_lstm_win, y_lstm_win,
+                        epochs=10,
+                        batch_size=32,
+                        verbose=0,
+                        validation_split=0.18,
+                        callbacks=[es, cp]
+                    )
+                    last_seq = local_X.iloc[-seq_len:].values.reshape(1,seq_len,-1)
+                    lstm_pred = lstm_model_meta.predict(last_seq, verbose=0)[0][0]
+                else:
+                    lstm_pred = np.nan
+            except:
+                lstm_pred = np.nan
+            preds_dict["lstm"].append(lstm_pred)
+            # TRANSFORMER
+            try:
+                if use_transformer and i > seq_len+1:
+                    scaler = StandardScaler()
+                    tr_X = scaler.fit_transform(local_X.values)
+                    tr_y = local_y.values
+                    Xtr_win, ytr_win = series_to_supervised(tr_X, tr_y, seq_len)
+                    TransformerRegMeta = get_single_model("transformer", num_features=tr_X.shape[1])
+                    tr_reg_model_meta = TransformerRegMeta(num_features=tr_X.shape[1], seq_len=seq_len)
+                    opt = torch.optim.Adam(tr_reg_model_meta.parameters(), lr=0.0008)
+                    loss_fn = torch.nn.L1Loss()
+                    tr_reg_model_meta.train()
+                    Xtr_win_torch = torch.tensor(Xtr_win, dtype=torch.float32)
+                    ytr_win_torch = torch.tensor(ytr_win, dtype=torch.float32)
+                    for epoch in range(5):
+                        opt.zero_grad()
+                        loss = loss_fn(tr_reg_model_meta(Xtr_win_torch).squeeze(), ytr_win_torch)
+                        loss.backward()
+                        opt.step()
+                    last_seq = scaler.transform(local_X.iloc[-seq_len:].values).reshape(1,seq_len,-1)
+                    last_seq_torch = torch.tensor(last_seq, dtype=torch.float32)
+                    tr_pred = tr_reg_model_meta(last_seq_torch).detach().numpy()[0,0]
+                else:
+                    tr_pred = np.nan
+            except:
+                tr_pred = np.nan
+            preds_dict["transformer"].append(tr_pred)
+            # Save true y
+            y_true.append(y.iloc[i])
+        # -- Stack predictions and fit meta-model
+        preds_arr = np.vstack([preds_dict["forest"],
+                               preds_dict["xgboost"],
+                               preds_dict["lightgbm"],
+                               preds_dict["lstm"],
+                               preds_dict["transformer"]]).T
+        y_true = np.array(y_true)
+        valid_mask = ~np.isnan(preds_arr).any(axis=1) & ~np.isnan(y_true)
+        preds_arr_valid = preds_arr[valid_mask]
+        y_true_valid = y_true[valid_mask]
+        if len(y_true_valid) < 5:
+            logging.error("Meta model: Not enough valid rows for fitting.")
+            pred = np.nanmean([preds_arr_valid[-1,i] for i in range(preds_arr_valid.shape[1]) if not np.isnan(preds_arr_valid[-1,i])])
+            if return_model_stack:
+                return pred, {k: preds_arr_valid[-1, idx] for idx, k in enumerate(model_names_for_meta)}
+            else:
+                return pred
+        meta_model = RidgeCV().fit(preds_arr_valid[:-1], y_true_valid[:-1])  # last one = test
+        pred_stack = preds_arr_valid[-1].reshape(1,-1)
+        final_pred = float(meta_model.predict(pred_stack)[0])
+        if return_model_stack:
+            out = {k: preds_arr_valid[-1, idx] for idx, k in enumerate(model_names_for_meta)}
+            out['meta_pred'] = final_pred
+            return final_pred, out
+        else:
+            return final_pred
+
+    # If not meta: just pick single selected regressor
     if "lstm" in ml_models and use_transformer:
         X_lstm_np = np.array(X)
         y_lstm_np = np.array(y)
         X_lstm_win, y_lstm_win = series_to_supervised(X_lstm_np, y_lstm_np, seq_len)
         lstm_model = get_single_model("lstm", input_shape=(seq_len, X_lstm_np.shape[1]), num_features=X_lstm_np.shape[1], lstm_seq=seq_len)
-        es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=12, verbose=1, restore_best_weights=True)
+        es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=12, verbose=0, restore_best_weights=True)
         cp = keras.callbacks.ModelCheckpoint("lstm_best_model.keras", save_best_only=True, monitor="val_loss", mode="min", verbose=0)
         lstm_model.fit(
             X_lstm_win, y_lstm_win,
@@ -973,7 +1116,6 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
         out_preds.append(lstm_pred)
         out_names.append("lstm_pred")
 
-    # --- XGBoost
     if "xgboost" in ml_models:
         xgb_model = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
         xgb_model.fit(X, y)
@@ -981,7 +1123,13 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
         out_preds.append(xgb_pred)
         out_names.append("xgb_pred")
 
-    # --- Random Forest
+    if "lightgbm" in ml_models or "lgbm" in ml_models:
+        lgbm_model = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+        lgbm_model.fit(X, y)
+        lgbm_pred = lgbm_model.predict(last_row_df)[0]
+        out_preds.append(lgbm_pred)
+        out_names.append("lgbm_pred")
+
     if "forest" in ml_models or "rf" in ml_models or "randomforest" in ml_models:
         rf_model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
         rf_model.fit(X, y)
@@ -989,184 +1137,64 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
         out_preds.append(rf_pred)
         out_names.append("rf_pred")
 
-    # ========== Transformer REGRESSION (PyTorch) ========== #
     if "transformer" in ml_models and use_transformer:
         try:
-            # --- Scale input features --- (required for deep NNs)
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(X.values)
             y_scale_mean = y.mean()
             y_scale_std = y.std() if y.std() > 1e-5 else 1.0
-
             Xtr_np = X_scaled
             ytr_np = ((y.values - y_scale_mean) / y_scale_std)
-
             if np.isnan(Xtr_np).any() or np.isnan(ytr_np).any():
-                logging.error("NaN in scaled Transformer input or target, skipping Transformer!")
                 use_this_transformer = False
             else:
                 use_this_transformer = True
-
             if use_this_transformer:
                 Xtr_win, ytr_win = series_to_supervised(Xtr_np, ytr_np, seq_len)
                 Xtr_win_torch = torch.tensor(Xtr_win, dtype=torch.float32)
                 ytr_win_torch = torch.tensor(ytr_win, dtype=torch.float32)
-
                 TransformerReg = get_single_model("transformer", num_features=Xtr_np.shape[1])
                 tr_reg_model = TransformerReg(num_features=Xtr_np.shape[1], seq_len=seq_len)
-                opt = torch.optim.Adam(tr_reg_model.parameters(), lr=0.0005)  # smaller learning rate
+                opt = torch.optim.Adam(tr_reg_model.parameters(), lr=0.0005)
                 loss_fn = torch.nn.L1Loss()
                 tr_reg_model.train()
-
                 for epoch in range(50):
                     opt.zero_grad()
                     y_pred = tr_reg_model(Xtr_win_torch).squeeze()
                     if torch.isnan(y_pred).any():
-                        logging.error("NaN in TransformerReg model output! Skipping transformer this fit.")
                         break
                     loss = loss_fn(y_pred, ytr_win_torch)
                     if torch.isnan(loss):
-                        logging.error("NaN loss in TransformerReg training loop, skipping this Transformer fit!")
                         break
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(tr_reg_model.parameters(), max_norm=2.0)
                     opt.step()
-                    if epoch % 10 == 0:
-                        logging.info(f"TransformerReg (epoch {epoch}): train loss = {loss.item():.5f}")
                 tr_reg_model.eval()
-                # Predict last seq using scaling
                 last_x_seq = X_scaled[-seq_len:,:].reshape(1,seq_len,-1)
                 last_seq_torch = torch.tensor(last_x_seq, dtype=torch.float32)
                 with torch.no_grad():
                     y_pred_scaled = tr_reg_model(last_seq_torch).cpu().numpy()[0,0]
-                tr_reg_pred = (y_pred_scaled * y_scale_std) + y_scale_mean  # invert scaling
+                tr_reg_pred = (y_pred_scaled * y_scale_std) + y_scale_mean
                 if not np.isnan(tr_reg_pred) and not np.isinf(tr_reg_pred):
                     out_preds.append(tr_reg_pred)
                     out_names.append("tr_reg_pred")
         except Exception as e:
             logging.error(f"TransformerReg failed to train: {e}")
 
-    # ========== Transformer CLASSIFIER (PyTorch, scaled) ========== #
-    if "transformer_cls" in ml_models and use_transformer:
-        try:
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X.values)
-            Xtr_np = X_scaled
-            ytr_np = y.values
-            Xtr_win, ytr_win = series_to_supervised(Xtr_np, ytr_np, seq_len)
-            ytr_cls = (ytr_win > Xtr_win[:,-1,-1])
-            ytr_cls = ytr_cls.astype(np.long)
-            Xtr_win_torch = torch.tensor(Xtr_win, dtype=torch.float32)
-            ytr_win_torch = torch.tensor(ytr_cls, dtype=torch.long)
-
-            TransformerCls = get_single_model("transformer_cls", num_features=Xtr_np.shape[1])
-            tr_cls_model = TransformerCls(num_features=Xtr_np.shape[1], seq_len=seq_len)
-            opt = torch.optim.Adam(tr_cls_model.parameters(), lr=0.0005)
-            loss_fn = torch.nn.CrossEntropyLoss()
-            tr_cls_model.train()
-
-            for epoch in range(30):
-                opt.zero_grad()
-                out_logits = tr_cls_model(Xtr_win_torch)
-                if torch.isnan(out_logits).any():
-                    logging.error("NaN outputs in TransformerCls! Skipping.")
-                    break
-                loss = loss_fn(out_logits, ytr_win_torch)
-                if torch.isnan(loss):
-                    logging.error("NaN loss in TransformerCls! Skipping fit.")
-                    break
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(tr_cls_model.parameters(), max_norm=2.0)
-                opt.step()
-                if epoch % 8 == 0:
-                    logging.info(f"TransformerCls (epoch {epoch}): train loss = {loss.item():.5f}")
-            tr_cls_model.eval()
-            last_x_seq = X_scaled[-seq_len:,:].reshape(1,seq_len,-1)
-            last_seq_torch = torch.tensor(last_x_seq, dtype=torch.float32)
-            with torch.no_grad():
-                logits = tr_cls_model(last_seq_torch)[0]
-                softmax_scores = torch.softmax(logits,dim=0).cpu().numpy()
-                cls_dir_pred = softmax_scores[1]-softmax_scores[0]
-            if not np.isnan(cls_dir_pred) and not np.isinf(cls_dir_pred):
-                out_preds.append(cls_dir_pred)
-                out_names.append("tr_cls_pred")
-        except Exception as e:
-            logging.error(f"TransformerCls failed to train: {e}")
-
-    # Final output - meta model?
+    # Output
     if len(out_preds)==1:
         if return_model_stack:
             return out_preds[0], {out_names[0]:out_preds[0]}
         else:
             return out_preds[0]
-
-    # Otherwise, meta-stack
-    meta_X_list = []
-    meta_y_list = []
-    valid_idx_start = 69   # skip period lost by sequence windows
-    for i in range(valid_idx_start, len(df)-1):  # for stacking meta-train
-        features_i = df.iloc[i][available_cols].values
-        meta_features = []
-        for m_idx, mname in enumerate(out_names):
-            val = None
-            if mname == "lstm_pred":
-                seq = np.array(df.iloc[i-seq_len+1:i+1][available_cols])
-                if seq.shape[0]==seq_len:
-                    seq = seq.reshape(1,seq_len,-1)
-                    lstm_pred_meta = lstm_model.predict(seq,verbose=0)[0][0]
-                    meta_features.append(lstm_pred_meta)
-                else:
-                    meta_features.append(np.nan)
-            elif mname == "xgb_pred":
-                meta_features.append(xgb_model.predict(features_i.reshape(1,-1))[0])
-            elif mname == "rf_pred":
-                meta_features.append(rf_model.predict(features_i.reshape(1,-1))[0])
-            elif mname == "tr_reg_pred":
-                seq = np.array(df.iloc[i-seq_len+1:i+1][available_cols])
-                if seq.shape[0]==seq_len and use_transformer:
-                    seq_scaled = scaler.transform(seq)
-                    seq_t = torch.tensor(seq_scaled.reshape(1,seq_len,-1),dtype=torch.float32)
-                    with torch.no_grad():
-                        y_pred_scaled = tr_reg_model(seq_t).cpu().numpy()[0,0]
-                    y_pred_rescaled = (y_pred_scaled * y_scale_std) + y_scale_mean
-                    meta_features.append(y_pred_rescaled)
-                else:
-                    meta_features.append(np.nan)
-            elif mname == "tr_cls_pred":
-                seq = np.array(df.iloc[i-seq_len+1:i+1][available_cols])
-                if seq.shape[0]==seq_len and use_transformer:
-                    seq_scaled = scaler.transform(seq)
-                    seq_t = torch.tensor(seq_scaled.reshape(1,seq_len,-1),dtype=torch.float32)
-                    with torch.no_grad():
-                        logits = tr_cls_model(seq_t)[0]
-                        softmax_scores = torch.softmax(logits,dim=0).cpu().numpy()
-                        cls_dir_pred = softmax_scores[1]-softmax_scores[0]
-                        meta_features.append(cls_dir_pred)
-                else:
-                    meta_features.append(np.nan)
-            else:
-                meta_features.append(np.nan)
-        if not any(np.isnan(meta_features)):
-            meta_X_list.append(meta_features)
-            meta_y_list.append(df.iloc[i+1]['close'])
-    if len(meta_X_list)<3:
-        logging.warning(f"Meta-model: Not enough meta training data, falling back to mean of predictions.")
-        pred = np.mean([p for p in out_preds])
+    elif len(out_preds) > 1:
+        pred = np.mean(out_preds)
         if return_model_stack:
             return pred, dict(zip(out_names,out_preds))
         else:
             return pred
-
-    meta_X = np.array(meta_X_list)
-    meta_y = np.array(meta_y_list)
-    meta_model = RidgeCV().fit(meta_X, meta_y)
-    pred_stack = np.array(out_preds).reshape(1,-1)
-    final_pred = float(meta_model.predict(pred_stack)[0])
-    if return_model_stack:
-        pred_details = dict(zip(out_names, out_preds))
-        return final_pred, pred_details
     else:
-        return final_pred
+        return None
 
 def fetch_new_ai_tickers(num_needed, exclude_tickers):
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -1713,7 +1741,6 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
 
             if NEWS_MODE == "on":
                 df = merge_sentiment_from_csv(df, ticker)
-                df = drop_disabled_features(df)
                 df.to_csv(csv_filename, index=False)
                 logging.info(f"[{ticker}] Updated candle CSV with merged sentiment & features, minus disabled.")
             else:
@@ -1854,7 +1881,7 @@ def update_env_variable(key: str, value: str):
 # 13. Additional Commands & Console
 # -------------------------------
 def console_listener():
-    global SHUTDOWN, TICKERS, BAR_TIMEFRAME, N_BARS, NEWS_MODE, DISABLED_FEATURES, DISABLED_FEATURES_SET, TRADE_LOGIC, AI_TICKER_COUNT, AI_TICKERS
+    global SHUTDOWN, TICKERS, BAR_TIMEFRAME, N_BARS, NEWS_MODE, TRADE_LOGIC, AI_TICKER_COUNT, AI_TICKERS
     while not SHUTDOWN:
         cmd_line = sys.stdin.readline().strip()
         if not cmd_line:
@@ -2312,7 +2339,6 @@ def console_listener():
 
                 df = add_features(df)
                 df = compute_custom_features(df)
-                df = drop_disabled_features(df)
 
                 # ─── DEFINE TARGET AS NEXT-DAY RETURN ───────────────────────────────────
                 df['target'] = df['close'].pct_change().shift(-1)
@@ -2433,118 +2459,6 @@ def console_listener():
             update_env_variable("TRADE_LOGIC", new_logic)
             TRADE_LOGIC = new_logic
             logging.info(f"Updated TRADE_LOGIC in memory to {TRADE_LOGIC}")
-
-        elif cmd == "disable-feature":
-            if len(parts) < 2:
-                logging.warning("Usage: disable-feature <comma-separated features OR 'main'/'base'>")
-                continue
-            new_disabled = parts[1]
-            update_env_variable("DISABLED_FEATURES", new_disabled)
-            DISABLED_FEATURES = new_disabled
-            if new_disabled in ["main", "base"]:
-                DISABLED_FEATURES_SET = set()
-            else:
-                if new_disabled.strip():
-                    new_set = set([f.strip() for f in new_disabled.split(",") if f.strip()])
-                else:
-                    new_set = set()
-                new_set.discard("sentiment")
-                DISABLED_FEATURES_SET = new_set
-            logging.info(f"Updated DISABLED_FEATURES in memory to {DISABLED_FEATURES}")
-            logging.info(f"Updated DISABLED_FEATURES_SET to {DISABLED_FEATURES_SET}")
-
-        elif cmd == "auto-feature":
-            low_import_set = set()
-
-            if skip_data:
-                logging.info("auto-feature -r: Will use existing CSV data for each ticker.")
-            else:
-                logging.info("auto-feature: Will fetch fresh data for each ticker, then compute importance & disable low ones.")
-
-            for ticker in TICKERS:
-                tf_code = timeframe_to_code(BAR_TIMEFRAME)
-                csv_filename = f"{ticker}_{tf_code}.csv"
-
-                if not skip_data:
-                    df = fetch_candles_plus_features_and_predclose(
-                        ticker,
-                        bars=N_BARS,
-                        timeframe=BAR_TIMEFRAME,
-                        rewrite_mode=REWRITE
-                    )
-                    df.to_csv(csv_filename, index=False)
-                    logging.info(f"[{ticker}] Fetched data & saved CSV for auto-feature.")
-                else:
-                    if not os.path.exists(csv_filename):
-                        logging.error(f"[{ticker}] CSV file {csv_filename} not found, skipping.")
-                        continue
-                    df = pd.read_csv(csv_filename)
-                    if df.empty:
-                        logging.error(f"[{ticker}] CSV is empty, skipping.")
-                        continue
-
-                if 'sentiment' in df.columns and df["sentiment"].dtype == object:
-                    try:
-                        df["sentiment"] = df["sentiment"].astype(float)
-                    except Exception as e:
-                        logging.error(f"[{ticker}] Could not convert sentiment to float: {e}")
-                        continue
-
-                df = add_features(df)
-                df = compute_custom_features(df)
-                df = drop_disabled_features(df)
-
-                if 'close' not in df.columns:
-                    logging.error(f"[{ticker}] No 'close' column after processing. Cannot compute auto-feature.")
-                    continue
-                df['target'] = df['close'].shift(-1)
-                df.dropna(inplace=True)
-                if len(df) < 10:
-                    logging.error(f"[{ticker}] Not enough rows for training. Skipping.")
-                    continue
-
-                available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
-                X = df[available_cols]
-                y = df['target']
-
-                model_rf = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                model_rf.fit(X, y)
-
-                importances = model_rf.feature_importances_
-                feats_importances = sorted(zip(available_cols, importances), key=lambda x: x[1], reverse=True)
-
-                # Check which are < 0.05
-                below_threshold = [feat for feat, imp in feats_importances if imp < 0.050]
-                if below_threshold:
-                    logging.info(f"[{ticker}] The following features are < 0.050 importance: {below_threshold}")
-                    for ft in below_threshold:
-                        low_import_set.add(ft)
-                else:
-                    logging.info(f"[{ticker}] No features with < 0.050 importance found.")
-
-            if low_import_set:
-                logging.info(f"Combining newly found low-importance features: {low_import_set}")
-
-                current_disabled = DISABLED_FEATURES if DISABLED_FEATURES else ""
-                if current_disabled in ["main", "base"]:
-                    logging.warning(f"DISABLED_FEATURES is set to '{current_disabled}', ignoring auto-feature changes.")
-                else:
-                    disabled_features_set_local = set()
-                    if current_disabled.strip():
-                        disabled_features_set_local = set([f.strip() for f in current_disabled.split(",") if f.strip()])
-                    final_disabled = disabled_features_set_local.union(low_import_set)
-
-                    new_disabled_str = ",".join(sorted(final_disabled))
-
-                    update_env_variable("DISABLED_FEATURES", new_disabled_str)
-                    DISABLED_FEATURES = new_disabled_str
-                    new_set_for_memory = set([f.strip() for f in new_disabled_str.split(",") if f.strip()])
-                    new_set_for_memory.discard("sentiment")
-                    DISABLED_FEATURES_SET = new_set_for_memory
-
-                    logging.info(f"auto-feature updated DISABLED_FEATURES to: {DISABLED_FEATURES}")
-            else:
-                logging.info("No features fell below 0.050 threshold across all tickers. No .env changes made.")
             
         elif cmd == "set-ntickers":
             if len(parts) < 2:

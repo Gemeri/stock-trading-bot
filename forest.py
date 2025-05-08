@@ -39,6 +39,9 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
 
 from transformers import BertModel, BertConfig
 import torch
@@ -95,7 +98,7 @@ POSSIBLE_FEATURE_COLS = [
     'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx',
     'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
     'lagged_close_5', 'lagged_close_10',
-    'candle_body_ratio'
+    'candle_body_ratio',
     'wick_dominance',
     'gap_vs_prev',
     'volume_zscore',
@@ -107,6 +110,61 @@ POSSIBLE_FEATURE_COLS = [
     'day_of_week',
     'days_since_high',
     'days_since_low',
+]
+
+
+SUBMODELS_CONFIG = [
+    {   # Model 1: Momentum Classifier
+        "name": "momentum_classifier",
+        "features": [
+            'rsi', 'momentum', 'roc', 'macd_histogram', 'macd_line',
+            'macd_signal', 'rsi_zscore', 'macd_cross', 'macd_hist_flip'
+        ],
+        "type": "classifier",
+        "sk_model": lambda: xgb.XGBClassifier(random_state=RANDOM_SEED, use_label_encoder=False, eval_metric='logloss')
+    },
+    {   # Model 2: Trend Continuation Predictor
+        "name": "trend_continuation",
+        "features": [
+            'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx', 'adx_trend',
+            'obv', 'close', 'rsi', 'macd_line'
+        ],
+        "type": "classifier",
+        "sk_model": lambda: lgb.LGBMClassifier(random_state=RANDOM_SEED, verbose=-1)
+    },
+    {   # Model 3: Mean Reversion Signal
+        "name": "mean_reversion",
+        "features": [
+            'bollinger_upper', 'bollinger_lower', 'atr', 'atr_zscore',
+            'candle_body_ratio', 'wick_dominance', 'rsi_zscore',
+            'macd_histogram', 'macd_hist_flip'
+        ],
+        "type": "classifier",
+        "sk_model": lambda: RandomForestClassifier(n_estimators=72, random_state=RANDOM_SEED)
+    },
+    {   # Model 4: Lagged Regression/Return Model
+        "name": "lagged_return",
+        "features": [
+            'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
+            'lagged_close_5', 'lagged_close_10', 'close'
+        ],
+        "type": "regressor",
+        "sk_model": lambda: xgb.XGBRegressor(n_estimators=70, random_state=RANDOM_SEED)
+    },
+    {   # Model 5: Sentiment-Volume Anomaly
+        "name": "sentivol_anomaly",
+        "features": [
+            'sentiment', 'volume', 'volume_zscore',
+            'obv', 'gap_vs_prev', 'wick_dominance'
+        ],
+        "type": "classifier",
+        "sk_model": lambda: xgb.XGBClassifier(
+            n_estimators=70,
+            random_state=RANDOM_SEED,
+            use_label_encoder=False,
+            eval_metric='logloss'
+        )
+    },
 ]
 
 
@@ -130,13 +188,15 @@ if DISCORD_MODE == "on":
 def parse_ml_models():
     models = [m.strip().lower() for m in ML_MODEL.split(",") if m.strip()]
     if "all" in models:
-        # Meta model: now includes forest/xgboost/lightgbm/lstm/transformer
         models = ["forest", "xgboost", "lightgbm", "lstm", "transformer"]
-    # Accept lgbm or lightgbm as synonyms for LightGBM
     canonical = []
     for m in models:
         if m in ["lgbm", "lightgbm"]:
             canonical.append("lightgbm")
+        elif m in ["sub-vote", "sub_vote"]:
+            canonical.append("sub-vote")
+        elif m in ["sub-meta", "sub_meta"]:
+            canonical.append("sub-meta")
         else:
             canonical.append(m)
     return canonical
@@ -277,10 +337,64 @@ def predict_sentiment(text):
 # -------------------------------
 # 4b. Dictionary to map TRADE_LOGIC to actual module filenames
 # -------------------------------
-json_file_path = os.path.join("logic", "logic_scripts.json")
+CLASSIFIER_MODELS = {"classifier", "sub-vote", "sub_vote", "sub-meta", "sub_meta"}
 
-with open(json_file_path, "r") as file:
-    LOGIC_MODULE_MAP = json.load(file)
+def get_logic_dir_and_json():
+    # Detect which logic directory/set based on ML_MODEL
+    ml_models = parse_ml_models()
+    ml_model_set = set(ml_models)
+    if ("all" in ml_models) or not ml_model_set.isdisjoint({"xgboost", "forest", "rf", "lstm", "transformer", "lightgbm", "lgbm"}):
+        logic_dir = "logic_reg"
+        json_path = os.path.join(logic_dir, "logic_scripts.json")
+    elif not ml_model_set.isdisjoint(CLASSIFIER_MODELS):
+        logic_dir = "logic_cls"
+        json_path = os.path.join(logic_dir, "logic_scripts.json")
+    else:
+        # Default to regressor logic
+        logic_dir = "logic_reg"
+        json_path = os.path.join(logic_dir, "logic_scripts.json")
+    return logic_dir, json_path
+
+def _update_logic_json():
+    logic_dir, json_path = get_logic_dir_and_json()
+    if not os.path.isdir(logic_dir):
+        os.makedirs(logic_dir)
+    pattern = re.compile(r"^logic_(\d+)_(\w+)\.py$")
+    scripts_map = {}
+    for fname in os.listdir(logic_dir):
+        match = pattern.match(fname)
+        if match:
+            num_str = match.group(1)
+            script_base = fname[:-3]
+            try:
+                num_int = int(num_str)
+                scripts_map[num_int] = script_base
+            except ValueError:
+                pass
+    # Save an empty dict if nothing
+    if not scripts_map:
+        with open(json_path, "w") as f:
+            json.dump({}, f, indent=2)
+        return
+    sorted_nums = sorted(scripts_map.keys())
+    final_dict = {}
+    for i in sorted_nums:
+        final_dict[str(i)] = scripts_map[i]
+    with open(json_path, "w") as f:
+        json.dump(final_dict, f, indent=2)
+
+def _get_logic_script_name(logic_id: str) -> str:
+    logic_dir, json_path = get_logic_dir_and_json()
+    if not os.path.isfile(json_path):
+        _update_logic_json()
+    if not os.path.isfile(json_path):
+        return "logic_15_forecast_driven"
+    with open(json_path, "r") as f:
+        data = json.load(f)
+        if logic_id in data:
+            return data[logic_id]
+        else:
+            return "logic_15_forecast_driven"
 
 _CANONICAL_TF = {
     "15min":  "15Min",
@@ -438,7 +552,6 @@ def fetch_candles_plus_features_and_predclose(
 
     # Only generate predicted_close if a regression ML_MODEL is present
     if has_regressor:
-        # i+1 rolling prediction as before!
         if not df_existing.empty and rewrite_mode == "off":
             base = df_existing.copy().reset_index(drop=True)
             n_start = len(base)
@@ -698,10 +811,6 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute advanced technical features and requested custom ones.
-    """
-
     # --- MACD (12,26,9) & classic indicators ---
     if 'close' in df.columns:
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
@@ -866,6 +975,205 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def submodels_predict(df: pd.DataFrame, mode="vote", meta_backtest=False, backtest_indices=None):
+    """
+    Runs the 5 submodels as described, returns either:
+    - "vote" (sub-vote): returns 0/0.5/1 as per voting scheme
+    - "meta" (sub-meta): returns probability from meta-model
+    If meta_backtest=True, returns (meta_pred, dict_per_model, meta_accuracy)
+    """
+    votes = []
+    pred_values = []
+    dict_per_model = {}
+    missing_feats_warned = set()
+    scaler = StandardScaler()
+    final_out = None
+
+    # For meta_backtest, keep lists of predictions/labels
+    meta_features_history = []
+    meta_labels_history = []   # For .fit()
+
+    # choose which rows to run (single, or a walkforward range)
+    if meta_backtest:
+        # For walkforward, e.g. on range of indices given by backtest_indices
+        if backtest_indices is None:
+            raise ValueError("meta_backtest requires backtest_indices")
+        # For meta: use 80% for training, rest for rolling test
+        ix0 = backtest_indices[0]
+        ixN = backtest_indices[-1]
+        total = ixN - ix0 + 1
+        n_train = int(total * 0.8)
+        pred_cols = []
+        label_cols = []
+        # The submodels outputs (5 columns), label (target)
+        pred_mat = []
+        y_mat = []
+        for walk_idx in range(ix0+n_train, ixN+1):
+            # train range: ix0 .. walk_idx-1
+            df_train = df.iloc[ix0:walk_idx]
+            df_test  = df.iloc[[walk_idx]]
+            per_model_preds = []
+            # Compute true label ["did close go up?"]
+            close_prev = df.loc[walk_idx-1, "close"] if walk_idx > 0 else None
+            close_now  = df.loc[walk_idx, "close"]
+            label = 1 if (close_now > close_prev) else 0
+
+            for m, model_cfg in enumerate(SUBMODELS_CONFIG):
+                Xfeats = [c for c in model_cfg['features'] if c in df.columns]
+                # Fill missing features as needed
+                if len(Xfeats) < len(model_cfg['features']):
+                    missing = [f for f in model_cfg['features'] if f not in df.columns]
+                    warn_key = model_cfg['name']
+                    if warn_key not in missing_feats_warned:
+                        logging.warning(f"Features missing for {model_cfg['name']}: {missing}")
+                        missing_feats_warned.add(warn_key)
+                X_train = df_train[Xfeats].fillna(0)
+                X_test  = df_test[Xfeats].fillna(0)
+                y_train = None
+
+                if model_cfg['type'] == "classifier":
+                    # Target: next-close-up (1) or down (0)
+                    y_train = (df_train['close'].shift(-1) > df_train['close']).astype(int).fillna(0)
+                    model = model_cfg['sk_model']()
+                    try:
+                        model.fit(X_train[:-1], y_train[:-1])
+                        prob = float(model.predict_proba(X_test)[0][1])
+                        per_model_preds.append(prob)
+                    except Exception as e:
+                        per_model_preds.append(0.5)
+                elif model_cfg['type'] == "regressor":
+                    y_train = df_train['close'].pct_change().shift(-1)  # next-bar return
+                    model = model_cfg['sk_model']()
+                    try:
+                        model.fit(X_train[:-1], y_train[:-1])
+                        pred_return = float(model.predict(X_test)[0])
+                        per_model_preds.append(pred_return)
+                    except Exception as e:
+                        per_model_preds.append(0.0)
+            pred_mat.append(per_model_preds)
+            y_mat.append(label)
+        pred_mat = np.array(pred_mat)   # shape [n_points, 5]
+        y_mat = np.array(y_mat)
+        # METAMODEL: logistic regression (good for probability, interpretability)
+        try:
+            meta_model = LogisticRegression()
+            meta_model.fit(pred_mat[:-1], y_mat[:-1])
+            pred_proba = meta_model.predict_proba(pred_mat[-1:])[0,1]
+            # Optionally compute accuracy on holdout for debug
+            acc = (meta_model.predict(pred_mat[:-1]) == y_mat[:-1]).mean()
+        except Exception as e:
+            logging.error(f"Meta-model fitting failed: {e}")
+            pred_proba = 0.5
+            acc = None
+        return pred_proba, dict(zip([m['name'] for m in SUBMODELS_CONFIG], pred_mat[-1])), acc
+    # --- Not in meta backtest ----
+    else:
+        # Take last row as prediction point
+        for model_cfg in SUBMODELS_CONFIG:
+            Xfeats = [c for c in model_cfg['features'] if c in df.columns]
+            if len(Xfeats) < len(model_cfg['features']):
+                missing = [f for f in model_cfg['features'] if f not in df.columns]
+                warn_key = model_cfg['name']
+                if warn_key not in missing_feats_warned:
+                    logging.warning(f"Features missing for {model_cfg['name']}: {missing}")
+                    missing_feats_warned.add(warn_key)
+            train_df = df.iloc[:-1]
+            test_df  = df.iloc[[-1]]
+            y_train = None
+            if model_cfg['type'] == "classifier":
+                y_train = (train_df['close'].shift(-1) > train_df['close']).astype(int).fillna(0)
+                model = model_cfg['sk_model']()
+                try:
+                    model.fit(train_df[Xfeats].fillna(0), y_train[:-1])
+                    prob = float(model.predict_proba(test_df[Xfeats].fillna(0))[0][1])
+                    pred_values.append(prob)
+                    # Voting: classifier -> to vote!
+                    if prob > 0.6:
+                        votes.append("BUY")
+                    elif prob < 0.4:
+                        votes.append("SELL")
+                    else:
+                        votes.append("NONE")
+                except Exception as e:
+                    pred_values.append(0.5)
+                    votes.append("NONE")
+            elif model_cfg['type'] == "regressor":
+                y_train = train_df['close'].pct_change().shift(-1)
+                model = model_cfg['sk_model']()
+                try:
+                    model.fit(train_df[Xfeats].fillna(0), y_train[:-1])
+                    pred_return = float(model.predict(test_df[Xfeats].fillna(0))[0])
+                    pred_values.append(pred_return)
+                    # Regression to vote
+                    if pred_return > 0.003:
+                        votes.append("BUY")
+                    elif pred_return < -0.003:
+                        votes.append("SELL")
+                    else:
+                        votes.append("NONE")
+                except Exception as e:
+                    pred_values.append(0.0)
+                    votes.append("NONE")
+        # Final "vote"
+        if mode == "vote":
+            buy_count = votes.count("BUY")
+            sell_count = votes.count("SELL")
+            if buy_count >= 3:
+                final_out = 1
+            elif sell_count >= 3:
+                final_out = 0
+            else:
+                final_out = 0.5
+        elif mode == "meta":
+            # "meta" means: use the numerical outputs of the 5 as features, and use a very simple heuristic/logit
+            try:
+                # Here we just do logistic regression on last 80% of sample (not needed for live, but shown for clarity)
+                final_out = np.nan
+                if len(df) >= 500:   # don't attempt underfitting
+                    # Build Y: (did close go up at t+1)
+                    y = (df['close'].shift(-1) > df['close']).astype(int).values[:-1]
+                    # Build X: stack numerical outputs of the 5 models for prior rows
+                    X_meta = []
+                    for idx in range(len(df)-1):
+                        X_row = []
+                        sub_df = df.iloc[:idx+1]
+                        # For each submodel
+                        sub_preds = []
+                        for model_cfg in SUBMODELS_CONFIG:
+                            Xfeats = [c for c in model_cfg['features'] if c in df.columns]
+                            train_sub_df = sub_df.iloc[:-1]
+                            test_sub_df = sub_df.iloc[[-1]]
+                            if model_cfg['type'] == "classifier":
+                                ytr = (train_sub_df['close'].shift(-1) > train_sub_df['close']).astype(int).fillna(0)
+                                model = model_cfg['sk_model']()
+                                try:
+                                    model.fit(train_sub_df[Xfeats].fillna(0), ytr[:-1])
+                                    prob = float(model.predict_proba(test_sub_df[Xfeats].fillna(0))[0][1])
+                                    sub_preds.append(prob)
+                                except Exception:
+                                    sub_preds.append(0.5)
+                            else:
+                                ytr = train_sub_df['close'].pct_change().shift(-1)
+                                model = model_cfg['sk_model']()
+                                try:
+                                    model.fit(train_sub_df[Xfeats].fillna(0), ytr[:-1])
+                                    pred_return = float(model.predict(test_sub_df[Xfeats].fillna(0))[0])
+                                    sub_preds.append(pred_return)
+                                except Exception:
+                                    sub_preds.append(0.0)
+                        X_meta.append(sub_preds)
+                    X_meta = np.array(X_meta)
+                    meta_model = LogisticRegression()
+                    meta_model.fit(X_meta[10:-1], y[10:-1])
+                    inrow = np.array(pred_values).reshape(1, -1)
+                    final_out = meta_model.predict_proba(inrow)[0,1]
+                else:
+                    final_out = 0.5
+            except Exception as e:
+                logging.error(f"Simple meta-mode error: {e}")
+                final_out = 0.5
+        return final_out, dict(zip([m['name'] for m in SUBMODELS_CONFIG], pred_values))
+
 # -------------------------------
 # 8. Enhanced Train & Predict Pipeline
 # -------------------------------
@@ -908,6 +1216,20 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     last_X_np = np.array(last_row_df)
 
     ml_models = parse_ml_models()
+    if "sub-vote" in ml_models:
+        result, per_model = submodels_predict(df, mode="vote")
+        logging.info(f"Sub-Vote voting output: {result}   [per-model: {per_model}]")
+        if return_model_stack:
+            return result, per_model
+        return result
+
+    if "sub-meta" in ml_models:
+        result, per_model = submodels_predict(df, mode="meta")
+        logging.info(f"Sub-Meta meta-model output: {result}   [per-model: {per_model}]")
+        if return_model_stack:
+            return result, per_model
+        return result
+    
     out_preds = []
     out_names = []
 
@@ -986,7 +1308,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
         y_true = []
         logging.info(f"Meta model expanding-window walk-forward: {start_idx} ... {N-2}")
         for i in range(start_idx, N-1):
-            train_idx = range(i)  # up-to-but-not-including i (predict i)
+            train_idx = range(i)
             local_X = X.iloc[train_idx]
             local_y = y.iloc[train_idx]
             X_pred_row = X.iloc[[i]]
@@ -1592,68 +1914,15 @@ def log_trade(action, ticker, qty, current_price, predicted_price, profit_loss):
         df.to_csv(TRADE_LOG_FILENAME, index=False, mode='a', header=False)
 
 
-def _update_logic_json():
-    logic_dir = "logic"
-    if not os.path.isdir(logic_dir):
-        os.makedirs(logic_dir)
-
-    pattern = re.compile(r"^logic_(\d+)_(\w+)\.py$")
-
-    scripts_map = {}
-    for fname in os.listdir(logic_dir):
-        match = pattern.match(fname)
-        if match:
-            num_str = match.group(1)
-            script_base = fname[:-3]
-            try:
-                num_int = int(num_str)
-                scripts_map[num_int] = script_base
-            except ValueError:
-                pass
-
-    if not scripts_map:
-        with open(os.path.join(logic_dir, "logic_scripts.json"), "w") as f:
-            json.dump({}, f, indent=2)
-        return
-
-    sorted_nums = sorted(scripts_map.keys())
-    final_dict = {}
-    for i in sorted_nums:
-        final_dict[str(i)] = scripts_map[i]
-
-    with open(os.path.join(logic_dir, "logic_scripts.json"), "w") as f:
-        json.dump(final_dict, f, indent=2)
-
-
-def _get_logic_script_name(logic_id: str) -> str:
-    logic_dir = "logic"
-    json_path = os.path.join(logic_dir, "logic_scripts.json")
-    if not os.path.isfile(json_path):
-        _update_logic_json()
-
-    if not os.path.isfile(json_path):
-        return "logic_15_forecast_driven"
-
-    with open(json_path, "r") as f:
-        data = json.load(f)
-        if logic_id in data:
-            return data[logic_id]
-        else:
-            return "logic_15_forecast_driven"
-
 def get_current_price() -> float:
-    """
-    Fetches the latest quote for TSLA and returns its estimated current price
-    (midpoint of bid and ask) as a float.
-    Expects ALPACA_API_KEY and ALPACA_API_SECRET in the environment.
-    """
-    key    = os.getenv("ALPACA_API_KEY", "")
-    secret = os.getenv("ALPACA_API_SECRET", "")
+    key    = API_KEY
+    secret = API_SECRET
+    link   = API_BASE_URL
     if not key or not secret:
         print("Error: set ALPACA_API_KEY and ALPACA_API_SECRET in your environment.", file=sys.stderr)
         sys.exit(1)
 
-    api = REST(key, secret, "https://paper-api.alpaca.markets", api_version="v2")
+    api = REST(key, secret, link, api_version="v2")
 
     try:
         quote: QuoteV2 = api.get_latest_quote("TSLA")
@@ -1669,9 +1938,9 @@ def get_current_price() -> float:
 # -------------------------------
 def trade_logic(current_price: float, predicted_price: float, ticker: str):
     try:
-        import importlib
         logic_module_name = _get_logic_script_name(TRADE_LOGIC)
-        module_path = f"logic.{logic_module_name}"
+        logic_dir, _ = get_logic_dir_and_json()
+        module_path = f"{logic_dir}.{logic_module_name}"
         logic_module = importlib.import_module(module_path)
         logging.info(f"This is a test with {logic_module}")
         real_current = get_current_price()
@@ -1772,14 +2041,6 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
 
 
 def setup_schedule_for_timeframe(timeframe: str) -> None:
-    """
-    Build the daily schedule for the requested bar length.
-
-    • Skips all scheduling when RUN_SCHEDULE == "off"
-    • Uses SENTIMENT_OFFSET_MINUTES from .env for the news‑model lead‑in
-    • Relies on TIMEFRAME_SCHEDULE imported from timeframe.py
-    """
-    import schedule
 
     # --- honour master switch --------------------------------------------------------------
     if RUN_SCHEDULE == "off":
@@ -1988,317 +2249,385 @@ def console_listener():
             logging.info("Force-run job finished.")
 
         elif cmd == "backtest":
-            if len(parts) < 2:
-                logging.warning("Usage: backtest <N> [simple|complex] [timeframe?] [-r?]")
-                continue
-
-            test_size_str = parts[1]
-            approach = "simple"
-            timeframe_for_backtest = BAR_TIMEFRAME
-            possible_approaches = ["simple", "complex"]
-            skip_data = ('-r' in parts)
-            idx = 2
-
-            while idx < len(parts):
-                val = parts[idx]
-                if val in possible_approaches:
-                    approach = val
-                elif val != '-r':
-                    timeframe_for_backtest = val
-                idx += 1
-
-            try:
-                test_size = int(test_size_str)
-            except ValueError:
-                logging.error("Invalid test_size for 'backtest' command.")
-                continue
-
-            logic_module_name = LOGIC_MODULE_MAP.get(TRADE_LOGIC, "logic_15_forecast_driven")
-            logging.info("Trading logic: " + logic_module_name)
-            try:
-                logic_module = importlib.import_module(f"logic.{logic_module_name}")
-            except Exception as e:
-                logging.error(f"Unable to import logic module {logic_module_name}: {e}")
-                continue
-
-            for ticker in TICKERS:
-                tf_code = timeframe_to_code(timeframe_for_backtest)
-                csv_filename = f"{ticker}_{tf_code}.csv"
-                if skip_data:
-                    logging.info(f"[{ticker}] backtest -r: using existing CSV {csv_filename}")
-                    if not os.path.exists(csv_filename):
-                        logging.error(f"[{ticker}] CSV file {csv_filename} does not exist, skipping.")
+                    if len(parts) < 2:
+                        logging.warning("Usage: backtest <N> [simple|complex] [timeframe?] [-r?]")
                         continue
-                    df = pd.read_csv(csv_filename)
-                    if df.empty:
-                        logging.error(f"[{ticker}] CSV is empty, skipping.")
+
+                    test_size_str = parts[1]
+                    approach = "simple"
+                    timeframe_for_backtest = BAR_TIMEFRAME
+                    possible_approaches = ["simple", "complex"]
+                    skip_data = ('-r' in parts)
+                    idx = 2
+
+                    while idx < len(parts):
+                        val = parts[idx]
+                        if val in possible_approaches:
+                            approach = val
+                        elif val != '-r':
+                            timeframe_for_backtest = val
+                        idx += 1
+
+                    try:
+                        test_size = int(test_size_str)
+                    except ValueError:
+                        logging.error("Invalid test_size for 'backtest' command.")
                         continue
-                else:
-                    df = fetch_candles_plus_features_and_predclose(
-                        ticker,
-                        bars=N_BARS,
-                        timeframe=BAR_TIMEFRAME,
-                        rewrite_mode=REWRITE
-                    )
-                    df.to_csv(csv_filename, index=False)
-                    logging.info(f"[{ticker}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
 
-                if 'close' not in df.columns:
-                    logging.error(f"[{ticker}] No 'close' column after feature processing. Cannot backtest.")
-                    continue
-                df['target'] = df['close'].shift(-1)
-                df.dropna(inplace=True)
-                if len(df) <= test_size + 1:
-                    logging.error(f"[{ticker}] Not enough rows for backtest split. Need more data than test_size.")
-                    continue
-
-                total_len = len(df)
-                train_end = total_len - test_size
-                if train_end < 1:
-                    logging.error(f"[{ticker}] train_end < 1. Not enough data for that test_size.")
-                    continue
-
-                available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
-
-                predictions = []
-                actuals = []
-                timestamps = []
-                trade_records = []
-                portfolio_records = []
-                start_balance = 10000.0
-                cash = start_balance
-                position_qty = 0
-                avg_entry_price = 0.0
-
-                def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
-                    trade_records.append({
-                        "timestamp": tstamp,
-                        "action": action,
-                        "shares": shares,
-                        "current_price": curr_price,
-                        "predicted_price": pred_price,
-                        "profit_loss": pl
-                    })
-
-                def get_portfolio_value(pos_qty, csh, c_price, avg_price):
-                    if pos_qty > 0:
-                        return csh + (c_price - avg_price) * pos_qty
-                    elif pos_qty < 0:
-                        return csh + (avg_price - c_price) * abs(pos_qty)
+                    # Get the correct logic directory/map and logic module for this ML_MODEL
+                    logic_dir, json_path = get_logic_dir_and_json()
+                    if not os.path.isfile(json_path):
+                        _update_logic_json()
+                    if not os.path.isfile(json_path):
+                        LOGIC_MODULE_MAP = {}
                     else:
-                        return csh
+                        with open(json_path, "r") as f:
+                            LOGIC_MODULE_MAP = json.load(f)
 
-                backtest_candles = df.iloc[train_end:].copy()
-
-                if approach == "simple":
-                    train_df = df.iloc[:train_end]
-                    test_df  = df.iloc[train_end:]
-                    if len(train_df) < 70:
-                        logging.error(f"[{ticker}] Not enough training rows for simple approach.")
+                    logic_module_name = LOGIC_MODULE_MAP.get(TRADE_LOGIC, "logic_15_forecast_driven")
+                    logging.info("Trading logic: " + logic_module_name)
+                    try:
+                        logic_module = importlib.import_module(f"{logic_dir}.{logic_module_name}")
+                    except Exception as e:
+                        logging.error(f"Unable to import logic module {logic_module_name}: {e}")
                         continue
 
-                    # Fit models, but only on train
-                    pred_stack = []
-                    for i_ in range(len(test_df)):
-                        sub_df = pd.concat([train_df, test_df.iloc[:i_+1]], axis=0, ignore_index=True)
-                        pred_close = train_and_predict(sub_df)
-                        row_idx = test_df.index[i_]
-                        row_data = df.loc[row_idx]
-                        real_close = row_data['close']
-                        timestamps.append(row_data['timestamp'])
-                        predictions.append(pred_close)
-                        actuals.append(real_close)
+                    # Determine script number for the results subfolder
+                    match_script = re.match(r"^logic_(\d+)_", logic_module_name)
+                    logic_num_str = match_script.group(1) if match_script else "unknown"
 
-                        action = logic_module.run_backtest(
-                            current_price=real_close,
-                            predicted_price=pred_close,
-                            position_qty=position_qty,
-                            current_timestamp=row_data['timestamp'],
-                            candles=test_df
-                        )
+                    # Results directory based on model type
+                    ml_models = parse_ml_models()
+                    ml_model_set = set(ml_models)
+                    if ("all" in ml_models) or not ml_model_set.isdisjoint({"xgboost", "forest", "rf", "lstm", "transformer", "lightgbm", "lgbm"}):
+                        results_dir = "results_reg"
+                    elif not ml_model_set.isdisjoint(CLASSIFIER_MODELS):
+                        results_dir = "results_cls"
+                    else:
+                        results_dir = "results_reg"
+                    if not os.path.exists(results_dir):
+                        os.makedirs(results_dir)
+                    # Subdir for this logic script number
+                    logic_subdir = os.path.join(results_dir, logic_num_str)
+                    if not os.path.exists(logic_subdir):
+                        os.makedirs(logic_subdir)
 
-                        if action == "BUY":
-                            if position_qty < 0:
-                                pl = (avg_entry_price - real_close) * abs(position_qty)
-                                cash += pl
-                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
-                                position_qty = 0
-                                avg_entry_price = 0.0
-                            shares_to_buy = int(cash // real_close)
-                            if shares_to_buy > 0:
-                                position_qty = shares_to_buy
-                                avg_entry_price = real_close
-                                record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_close, None)
-                        elif action == "SELL":
-                            if position_qty > 0:
-                                pl = (real_close - avg_entry_price) * position_qty
-                                cash += pl
-                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
-                                position_qty = 0
-                                avg_entry_price = 0.0
-                        elif action == "SHORT":
-                            if position_qty > 0:
-                                pl = (real_close - avg_entry_price) * position_qty
-                                cash += pl
-                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
-                                position_qty = 0
-                                avg_entry_price = 0.0
-                            shares_to_short = int(cash // real_close)
-                            if shares_to_short > 0:
-                                position_qty = -shares_to_short
-                                avg_entry_price = real_close
-                                record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_close, None)
-                        elif action == "COVER":
-                            if position_qty < 0:
-                                pl = (avg_entry_price - real_close) * abs(position_qty)
-                                cash += pl
-                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
-                                position_qty = 0
-                                avg_entry_price = 0.0
+                    for ticker in TICKERS:
+                        tf_code = timeframe_to_code(timeframe_for_backtest)
+                        csv_filename = f"{ticker}_{tf_code}.csv"
+                        if skip_data:
+                            logging.info(f"[{ticker}] backtest -r: using existing CSV {csv_filename}")
+                            if not os.path.exists(csv_filename):
+                                logging.error(f"[{ticker}] CSV file {csv_filename} does not exist, skipping.")
+                                continue
+                            df = pd.read_csv(csv_filename)
+                            if df.empty:
+                                logging.error(f"[{ticker}] CSV is empty, skipping.")
+                                continue
+                        else:
+                            df = fetch_candles_plus_features_and_predclose(
+                                ticker,
+                                bars=N_BARS,
+                                timeframe=BAR_TIMEFRAME,
+                                rewrite_mode=REWRITE
+                            )
+                            df.to_csv(csv_filename, index=False)
+                            logging.info(f"[{ticker}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
 
-                        val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
-                        portfolio_records.append({
-                            "timestamp": row_data['timestamp'],
-                            "portfolio_value": val
-                        })
-
-                elif approach == "complex":
-                    count = total_len - train_end
-                    logging.info(f"[{ticker}] Starting COMPLEX backtest. Steps to process = {count}")
-                    bar_length = 20
-
-                    for step_index, i_ in enumerate(range(train_end, total_len), start=1):
-                        progress = int(bar_length * step_index / count)
-                        bar_str = "#"*progress + "-"*(bar_length - progress)
-                        logging.info(f"[{ticker}] complex backtest progress: Step {step_index}/{count} [{bar_str}]")
-                        sub_train = df.iloc[:i_]
-                        if len(sub_train) < 70:
-                            logging.warning(f"[{ticker}] Not enough data to train at iteration {i_}. Skipping.")
+                        if 'close' not in df.columns:
+                            logging.error(f"[{ticker}] No 'close' column after feature processing. Cannot backtest.")
+                            continue
+                        df['target'] = df['close'].shift(-1)
+                        df.dropna(inplace=True)
+                        if len(df) <= test_size + 1:
+                            logging.error(f"[{ticker}] Not enough rows for backtest split. Need more data than test_size.")
                             continue
 
-                        pred_close = train_and_predict(sub_train)
-                        row_data = df.iloc[i_]
-                        real_close = row_data['close']
-                        timestamps.append(row_data['timestamp'])
-                        predictions.append(pred_close)
-                        actuals.append(real_close)
+                        total_len = len(df)
+                        train_end = total_len - test_size
+                        if train_end < 1:
+                            logging.error(f"[{ticker}] train_end < 1. Not enough data for that test_size.")
+                            continue
 
-                        action = logic_module.run_backtest(
-                            current_price=real_close,
-                            predicted_price=pred_close,
-                            position_qty=position_qty,
-                            current_timestamp=row_data['timestamp'],
-                            candles=backtest_candles
-                        )
+                        available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
 
-                        if action == "BUY":
-                            if position_qty < 0:
-                                pl = (avg_entry_price - real_close) * abs(position_qty)
-                                cash += pl
-                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
-                                position_qty = 0
-                                avg_entry_price = 0.0
-                            shares_to_buy = int(cash // real_close)
-                            if shares_to_buy > 0:
-                                position_qty = shares_to_buy
-                                avg_entry_price = real_close
-                                record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_close, None)
-                        elif action == "SELL":
-                            if position_qty > 0:
-                                pl = (real_close - avg_entry_price) * position_qty
-                                cash += pl
-                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
-                                position_qty = 0
-                                avg_entry_price = 0.0
-                        elif action == "SHORT":
-                            if position_qty > 0:
-                                pl = (real_close - avg_entry_price) * position_qty
-                                cash += pl
-                                record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
-                                position_qty = 0
-                                avg_entry_price = 0.0
-                            shares_to_short = int(cash // real_close)
-                            if shares_to_short > 0:
-                                position_qty = -shares_to_short
-                                avg_entry_price = real_close
-                                record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_close, None)
-                        elif action == "COVER":
-                            if position_qty < 0:
-                                pl = (avg_entry_price - real_close) * abs(position_qty)
-                                cash += pl
-                                record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
-                                position_qty = 0
-                                avg_entry_price = 0.0
+                        predictions = []
+                        actuals = []
+                        timestamps = []
+                        trade_records = []
+                        portfolio_records = []
+                        start_balance = 10000.0
+                        cash = start_balance
+                        position_qty = 0
+                        avg_entry_price = 0.0
 
-                        val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
-                        portfolio_records.append({
-                            "timestamp": row_data['timestamp'],
-                            "portfolio_value": val
+                        def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
+                            trade_records.append({
+                                "timestamp": tstamp,
+                                "action": action,
+                                "shares": shares,
+                                "current_price": curr_price,
+                                "predicted_price": pred_price,
+                                "profit_loss": pl
+                            })
+
+                        def get_portfolio_value(pos_qty, csh, c_price, avg_price):
+                            if pos_qty > 0:
+                                return csh + (c_price - avg_price) * pos_qty
+                            elif pos_qty < 0:
+                                return csh + (avg_price - c_price) * abs(pos_qty)
+                            else:
+                                return csh
+
+                        backtest_candles = df.iloc[train_end:].copy()
+                        is_submeta = "sub-meta" in ml_models
+
+                        if approach in ["simple", "complex"]:
+                            if approach == "simple":
+                                train_df = df.iloc[:train_end]
+                                test_df  = df.iloc[train_end:]
+                                idx_list = list(test_df.index)
+                            else: # complex
+                                idx_list = list(range(train_end, total_len))
+                                test_df = df.iloc[idx_list]
+
+                            if len(df.iloc[:train_end]) < 70:
+                                logging.error(f"[{ticker}] Not enough training rows for {approach} approach.")
+                                continue
+
+                            # ----------- PROPER WALK-FORWARD FOR SUB-META -----------
+                            if is_submeta:
+                                logging.info(f"[{ticker}] Walk-forward meta-backtest for sub-meta ({approach}). Test points: {len(idx_list)}")
+                                meta_accs = []
+                                per_model_hist = {name: [] for name in [m['name'] for m in SUBMODELS_CONFIG]}
+                                for i_, row_idx in enumerate(idx_list):
+                                    walk_indices = list(df.index[:row_idx+1])
+                                    pred, per_model_dict, meta_acc = submodels_predict(df, mode="meta", meta_backtest=True, backtest_indices=walk_indices)
+                                    row_data = df.loc[row_idx]
+                                    real_close = row_data['close']
+                                    actuals.append(real_close)
+                                    predictions.append(pred)
+                                    timestamps.append(row_data['timestamp'])
+                                    meta_accs.append(meta_acc)
+                                    for k, v in per_model_dict.items():
+                                        per_model_hist[k].append(v)
+
+                                    action = logic_module.run_backtest(
+                                        current_price=real_close,
+                                        predicted_price=pred,
+                                        position_qty=position_qty,
+                                        current_timestamp=row_data['timestamp'],
+                                        candles=test_df if approach == "simple" else df.iloc[idx_list]
+                                    )
+
+                                    # --- Prevent duplicate trades ---
+                                    if action == "BUY":
+                                        if position_qty > 0:
+                                            action = "NONE"
+                                    elif action == "SHORT":
+                                        if position_qty < 0:
+                                            action = "NONE"
+                                    elif action == "SELL":
+                                        if position_qty <= 0:
+                                            action = "NONE"
+                                    elif action == "COVER":
+                                        if position_qty >= 0:
+                                            action = "NONE"
+
+                                    if action == "BUY":
+                                        if position_qty < 0:
+                                            pl = (avg_entry_price - real_close) * abs(position_qty)
+                                            cash += pl
+                                            record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred, pl)
+                                            position_qty = 0
+                                            avg_entry_price = 0.0
+                                        shares_to_buy = int(cash // real_close)
+                                        if shares_to_buy > 0:
+                                            position_qty = shares_to_buy
+                                            avg_entry_price = real_close
+                                            record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred, None)
+                                    elif action == "SELL":
+                                        if position_qty > 0:
+                                            pl = (real_close - avg_entry_price) * position_qty
+                                            cash += pl
+                                            record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred, pl)
+                                            position_qty = 0
+                                            avg_entry_price = 0.0
+                                    elif action == "SHORT":
+                                        if position_qty > 0:
+                                            pl = (real_close - avg_entry_price) * position_qty
+                                            cash += pl
+                                            record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred, pl)
+                                            position_qty = 0
+                                            avg_entry_price = 0.0
+                                        shares_to_short = int(cash // real_close)
+                                        if shares_to_short > 0:
+                                            position_qty = -shares_to_short
+                                            avg_entry_price = real_close
+                                            record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred, None)
+                                    elif action == "COVER":
+                                        if position_qty < 0:
+                                            pl = (avg_entry_price - real_close) * abs(position_qty)
+                                            cash += pl
+                                            record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred, pl)
+                                            position_qty = 0
+                                            avg_entry_price = 0.0
+
+                                    val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
+                                    portfolio_records.append({
+                                        "timestamp": row_data['timestamp'],
+                                        "portfolio_value": val
+                                    })
+
+                                acc_values = [a for a in meta_accs if a is not None]
+                                logging.info(f"[{ticker}] Meta-model average accuracy over test steps: {np.nanmean(acc_values) if acc_values else float('nan'):.4f}")
+
+                            # ----------- ALL OTHER ML MODES -----------
+                            else:
+                                pred_stack = []
+                                for i_, row_idx in enumerate(idx_list):
+                                    if approach == "simple":
+                                        sub_df = pd.concat([train_df, test_df.iloc[:i_+1]], axis=0, ignore_index=True)
+                                    else: # complex
+                                        sub_df = df.iloc[:row_idx+1]
+                                    pred_close = train_and_predict(sub_df)
+                                    row_data = df.loc[row_idx]
+                                    real_close = row_data['close']
+                                    timestamps.append(row_data['timestamp'])
+                                    predictions.append(pred_close)
+                                    actuals.append(real_close)
+
+                                    action = logic_module.run_backtest(
+                                        current_price=real_close,
+                                        predicted_price=pred_close,
+                                        position_qty=position_qty,
+                                        current_timestamp=row_data['timestamp'],
+                                        candles=test_df if approach == "simple" else df.iloc[idx_list]
+                                    )
+
+                                    # --- Prevent duplicate trades ---
+                                    if action == "BUY":
+                                        if position_qty > 0:
+                                            action = "NONE"
+                                    elif action == "SHORT":
+                                        if position_qty < 0:
+                                            action = "NONE"
+                                    elif action == "SELL":
+                                        if position_qty <= 0:
+                                            action = "NONE"
+                                    elif action == "COVER":
+                                        if position_qty >= 0:
+                                            action = "NONE"
+
+                                    if action == "BUY":
+                                        if position_qty < 0:
+                                            pl = (avg_entry_price - real_close) * abs(position_qty)
+                                            cash += pl
+                                            record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
+                                            position_qty = 0
+                                            avg_entry_price = 0.0
+                                        shares_to_buy = int(cash // real_close)
+                                        if shares_to_buy > 0:
+                                            position_qty = shares_to_buy
+                                            avg_entry_price = real_close
+                                            record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_close, None)
+                                    elif action == "SELL":
+                                        if position_qty > 0:
+                                            pl = (real_close - avg_entry_price) * position_qty
+                                            cash += pl
+                                            record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
+                                            position_qty = 0
+                                            avg_entry_price = 0.0
+                                    elif action == "SHORT":
+                                        if position_qty > 0:
+                                            pl = (real_close - avg_entry_price) * position_qty
+                                            cash += pl
+                                            record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
+                                            position_qty = 0
+                                            avg_entry_price = 0.0
+                                        shares_to_short = int(cash // real_close)
+                                        if shares_to_short > 0:
+                                            position_qty = -shares_to_short
+                                            avg_entry_price = real_close
+                                            record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_close, None)
+                                    elif action == "COVER":
+                                        if position_qty < 0:
+                                            pl = (avg_entry_price - real_close) * abs(position_qty)
+                                            cash += pl
+                                            record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
+                                            position_qty = 0
+                                            avg_entry_price = 0.0
+
+                                    val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
+                                    portfolio_records.append({
+                                        "timestamp": row_data['timestamp'],
+                                        "portfolio_value": val
+                                    })
+                        else:
+                            logging.warning(f"[{ticker}] Unknown approach={approach}. Skipping backtest.")
+                            continue
+
+                        y_pred = np.array(predictions)
+                        y_test = np.array(actuals)
+                        rmse = math.sqrt(mean_squared_error(y_test, y_pred))
+                        mae = mean_absolute_error(y_test, y_pred)
+                        avg_close = y_test.mean() if len(y_test) > 0 else 1e-6
+                        accuracy = 100 - (mae / avg_close * 100)
+                        logging.info(f"[{ticker}] Backtest ({approach}): test_size={test_size}, RMSE={rmse:.4f}, MAE={mae:.4f}, Accuracy={accuracy:.2f}%")
+
+                        out_csv      = os.path.join(logic_subdir, f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.csv")
+                        out_img      = os.path.join(logic_subdir, f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.png")
+                        trade_log_csv= os.path.join(logic_subdir, f"backtest_trades_{ticker}_{test_size}_{tf_code}_{approach}.csv")
+                        port_csv     = os.path.join(logic_subdir, f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.csv")
+                        out_port_img = os.path.join(logic_subdir, f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.png")
+
+                        out_df = pd.DataFrame({
+                            'timestamp': timestamps,
+                            'actual_close': actuals,
+                            'predicted_close': predictions
                         })
-                else:
-                    logging.warning(f"[{ticker}] Unknown approach={approach}. Skipping backtest.")
-                    continue
-                
-                y_pred = np.array(predictions)
-                y_test = np.array(actuals)
-                rmse = math.sqrt(mean_squared_error(y_test, y_pred))
-                mae = mean_absolute_error(y_test, y_pred)
-                avg_close = y_test.mean() if len(y_test) > 0 else 1e-6
-                accuracy = 100 - (mae / avg_close * 100)
-                logging.info(f"[{ticker}] Backtest ({approach}): test_size={test_size}, RMSE={rmse:.4f}, MAE={mae:.4f}, Accuracy={accuracy:.2f}%")
+                        out_df.to_csv(out_csv, index=False)
+                        logging.info(f"[{ticker}] Saved backtest predictions to {out_csv}.")
 
-                out_df = pd.DataFrame({
-                    'timestamp': timestamps,
-                    'actual_close': actuals,
-                    'predicted_close': predictions
-                })
-                out_csv = f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.csv"
-                out_df.to_csv(out_csv, index=False)
-                logging.info(f"[{ticker}] Saved backtest predictions to {out_csv}.")
+                        plt.figure(figsize=(10, 6))
+                        plt.plot(out_df['timestamp'], out_df['actual_close'], label='Actual')
+                        plt.plot(out_df['timestamp'], out_df['predicted_close'], label='Predicted')
+                        plt.title(f"{ticker} Backtest ({approach} - Last {test_size} rows) - {timeframe_for_backtest}")
+                        plt.xlabel("Timestamp")
+                        plt.ylabel("Close Price")
+                        plt.legend()
+                        plt.grid(True)
+                        if test_size > 30:
+                            plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        plt.savefig(out_img)
+                        plt.close()
+                        logging.info(f"[{ticker}] Saved backtest predictions plot to {out_img}.")
 
-                plt.figure(figsize=(10, 6))
-                plt.plot(out_df['timestamp'], out_df['actual_close'], label='Actual')
-                plt.plot(out_df['timestamp'], out_df['predicted_close'], label='Predicted')
-                plt.title(f"{ticker} Backtest ({approach} - Last {test_size} rows) - {timeframe_for_backtest}")
-                plt.xlabel("Timestamp")
-                plt.ylabel("Close Price")
-                plt.legend()
-                plt.grid(True)
-                if test_size > 30:
-                    plt.xticks(rotation=45)
-                plt.tight_layout()
-                out_img = f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.png"
-                plt.savefig(out_img)
-                plt.close()
-                logging.info(f"[{ticker}] Saved backtest predictions plot to {out_img}.")
+                        trade_log_df = pd.DataFrame(trade_records)
+                        if not trade_log_df.empty:
+                            trade_log_df.to_csv(trade_log_csv, index=False)
+                        logging.info(f"[{ticker}] Saved backtest trade log to {trade_log_csv}.")
 
-                trade_log_df = pd.DataFrame(trade_records)
-                trade_log_csv = f"backtest_trades_{ticker}_{test_size}_{tf_code}_{approach}.csv"
-                if not trade_log_df.empty:
-                    trade_log_df.to_csv(trade_log_csv, index=False)
-                logging.info(f"[{ticker}] Saved backtest trade log to {trade_log_csv}.")
+                        port_df = pd.DataFrame(portfolio_records)
+                        if not port_df.empty:
+                            port_df.to_csv(port_csv, index=False)
+                        logging.info(f"[{ticker}] Saved backtest portfolio records to {port_csv}.")
 
-                port_df = pd.DataFrame(portfolio_records)
-                port_csv = f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.csv"
-                if not port_df.empty:
-                    port_df.to_csv(port_csv, index=False)
-                logging.info(f"[{ticker}] Saved backtest portfolio records to {port_csv}.")
-
-                if not port_df.empty:
-                    plt.figure(figsize=(10, 6))
-                    plt.plot(port_df['timestamp'], port_df['portfolio_value'], label='Portfolio Value')
-                    plt.title(f"{ticker} Portfolio Value Backtest ({approach})")
-                    plt.xlabel("Timestamp")
-                    plt.ylabel("Portfolio Value (USD)")
-                    plt.legend()
-                    plt.grid(True)
-                    if test_size > 30:
-                        plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    out_port_img = f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.png"
-                    plt.savefig(out_port_img)
-                    plt.close()
-                    logging.info(f"[{ticker}] Saved backtest portfolio plot to {out_port_img}.")
+                        if not port_df.empty:
+                            plt.figure(figsize=(10, 6))
+                            plt.plot(port_df['timestamp'], port_df['portfolio_value'], label='Portfolio Value')
+                            plt.title(f"{ticker} Portfolio Value Backtest ({approach})")
+                            plt.xlabel("Timestamp")
+                            plt.ylabel("Portfolio Value (USD)")
+                            plt.legend()
+                            plt.grid(True)
+                            if test_size > 30:
+                                plt.xticks(rotation=45)
+                            plt.tight_layout()
+                            plt.savefig(out_port_img)
+                            plt.close()
+                            logging.info(f"[{ticker}] Saved backtest portfolio plot to {out_port_img}.")
 
         elif cmd == "feature-importance":
             if skip_data:
@@ -2493,13 +2822,12 @@ def console_listener():
                 continue
 
             user_provided_name = parts[1]
-            import re
             pattern_name = re.compile(r'^[a-z0-9_]+$')
             if not pattern_name.match(user_provided_name):
                 logging.error("Invalid script name. Use only lowercase letters, digits, or underscores.")
                 continue
 
-            logic_dir = "logic"
+            logic_dir, _ = get_logic_dir_and_json()
             if not os.path.isdir(logic_dir):
                 os.makedirs(logic_dir)
 

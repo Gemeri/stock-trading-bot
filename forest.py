@@ -109,7 +109,7 @@ POSSIBLE_FEATURE_COLS = [
     'macd_hist_flip',
     'day_of_week',
     'days_since_high',
-    'days_since_low',
+    'days_since_low'
 ]
 
 
@@ -801,6 +801,7 @@ def merge_sentiment_from_csv(df, ticker):
 # 7. Additional Feature Engineering
 # -------------------------------
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     logging.info("Adding features (price_change, high_low_range, log_volume)...")
     if 'close' in df.columns and 'open' in df.columns:
         df['price_change'] = df['close'] - df['open']
@@ -811,6 +812,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().reset_index(drop=True)
     # --- MACD (12,26,9) & classic indicators ---
     if 'close' in df.columns:
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
@@ -2489,7 +2491,7 @@ def console_listener():
                                     if approach == "simple":
                                         sub_df = pd.concat([train_df, test_df.iloc[:i_+1]], axis=0, ignore_index=True)
                                     else: # complex
-                                        sub_df = df.iloc[:row_idx+1]
+                                        sub_df = df.iloc[:row_idx]
                                     pred_close = train_and_predict(sub_df)
                                     row_data = df.loc[row_idx]
                                     real_close = row_data['close']

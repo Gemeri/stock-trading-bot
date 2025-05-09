@@ -858,9 +858,9 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
     # --- ADX (14) ---
     if all(c in df.columns for c in ['high', 'low', 'close']):
         period = 14
-        high  = df['high']
-        low   = df['low']
-        close = df['close']
+        high   = df['high']
+        low    = df['low']
+        close  = df['close']
 
         tr1 = high - low
         tr2 = (high - close.shift(1)).abs()
@@ -872,15 +872,16 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
         plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
         minus_dm  = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
 
-        tr_smooth       = tr.rolling(window=period).sum()
-        plus_dm_smooth  = plus_dm.rolling(window=period).sum()
-        minus_dm_smooth = minus_dm.rolling(window=period).sum()
+        # allow partial windows so we don't drop 26 bars
+        tr_smooth       = tr.rolling(window=period, min_periods=1).sum()
+        plus_dm_smooth  = plus_dm.rolling(window=period, min_periods=1).sum()
+        minus_dm_smooth = minus_dm.rolling(window=period, min_periods=1).sum()
 
         plus_di  = 100 * plus_dm_smooth  / tr_smooth
         minus_di = 100 * minus_dm_smooth / tr_smooth
         dx       = (plus_di.subtract(minus_di).abs() / (plus_di + minus_di)) * 100
 
-        df['adx'] = dx.rolling(window=period).mean()
+        df['adx'] = dx.rolling(window=period, min_periods=1).mean()
 
     # --- ON-BALANCE VOLUME ---
     if all(c in df.columns for c in ['close', 'volume']):
@@ -896,8 +897,8 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- BOLLINGER BANDS (20,2) ---
     if 'close' in df.columns:
-        ma20 = df['close'].rolling(window=20).mean()
-        std20= df['close'].rolling(window=20).std()
+        ma20  = df['close'].rolling(window=20, min_periods=1).mean()
+        std20 = df['close'].rolling(window=20, min_periods=1).std()
         df['bollinger_upper'] = ma20 + 2 * std20
         df['bollinger_lower'] = ma20 - 2 * std20
 
@@ -1198,7 +1199,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
 
     df = df.copy()
     df['target'] = df['close'].shift(-1)
-    df.dropna(inplace=True)
+    df.dropna(subset=['target'], inplace=True)
     if len(df) < 70:
         logging.error("Not enough rows after shift to train. Need more candles.")
         return None
@@ -1207,8 +1208,17 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     y = df['target']
 
     # NaN/Inf check
-    if np.isnan(X.values).any() or np.isnan(y.values).any() or np.isinf(X.values).any() or np.isinf(y.values).any():
-        logging.error("NaN or Inf detected in features or targets! Will skip any deep models (LSTM/Transformer) for this call.")
+    nan_counts = X.isna().sum()
+    inf_counts = X.applymap(np.isinf).sum()
+    target_nan = y.isna().sum()
+    target_inf = np.isinf(y).sum()
+    logging.info(f"Features NaN per column:\n{nan_counts[nan_counts>0].to_dict()}")
+    logging.info(f"Features Inf per column:\n{inf_counts[inf_counts>0].to_dict()}")
+    logging.info(f"Target NaNs: {target_nan}, Target INFs: {target_inf}")
+
+    # NaN/Inf check
+    if nan_counts.any() or inf_counts.any() or target_nan > 0 or target_inf > 0:
+        logging.error("→ Skipping LSTM/Transformer due to NaN/Inf above.")
         use_transformer = False
     else:
         use_transformer = True
@@ -2026,6 +2036,9 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
                 logging.error(f"[{ticker}] Existing CSV is empty. Skipping.")
                 continue
 
+        allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+        df = df.loc[:, [c for c in df.columns if c in allowed]]
+
         # --- NEW: Check the latest candle condition based on the scheduled NY time ---
         if scheduled_time_ny is not None:
             if not check_latest_candle_condition(df, BAR_TIMEFRAME, scheduled_time_ny):
@@ -2208,6 +2221,9 @@ def console_listener():
                     df.to_csv(csv_filename, index=False)
                     logging.info(f"[{ticker}] Fetched new data + advanced features (minus disabled), saved to {csv_filename}")
 
+                allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+                df = df.loc[:, [c for c in df.columns if c in allowed]]
+
                 pred_close = train_and_predict(df)
                 if pred_close is None:
                     logging.error(f"[{ticker}] No prediction generated.")
@@ -2336,11 +2352,14 @@ def console_listener():
                             df.to_csv(csv_filename, index=False)
                             logging.info(f"[{ticker}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
 
+                        allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+                        df = df.loc[:, [col for col in df.columns if col in allowed]]
+
                         if 'close' not in df.columns:
                             logging.error(f"[{ticker}] No 'close' column after feature processing. Cannot backtest.")
                             continue
                         df['target'] = df['close'].shift(-1)
-                        df.dropna(inplace=True)
+                        df.dropna(subset=['target'], inplace=True)
                         if len(df) <= test_size + 1:
                             logging.error(f"[{ticker}] Not enough rows for backtest split. Need more data than test_size.")
                             continue
@@ -2350,8 +2369,6 @@ def console_listener():
                         if train_end < 1:
                             logging.error(f"[{ticker}] train_end < 1. Not enough data for that test_size.")
                             continue
-
-                        available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
 
                         predictions = []
                         actuals = []
@@ -2588,6 +2605,7 @@ def console_listener():
                             'actual_close': actuals,
                             'predicted_close': predictions
                         })
+                        out_df['timestamp'] = pd.to_datetime(out_df['timestamp'])
                         out_df.to_csv(out_csv, index=False)
                         logging.info(f"[{ticker}] Saved backtest predictions to {out_csv}.")
 

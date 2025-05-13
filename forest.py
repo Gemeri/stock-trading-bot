@@ -113,9 +113,8 @@ def call_sub_main(mode, df, execution):
     sub_main = importlib.util.module_from_spec(spec)
     sys.modules["sub_main"] = sub_main
     spec.loader.exec_module(sub_main)
-    # Patch mode/execution if needed
-    sub_main.MODE = mode
-    sub_main.EXECUTION = execution
+    sub_main.MODE       = mode
+    sub_main.EXECUTION  = execution
     # For live, set df as CSV, then call run_live
     if execution == "live":
         # Write temp CSV
@@ -305,7 +304,7 @@ def predict_sentiment(text):
 CLASSIFIER_MODELS = {"classifier", "sub-vote", "sub_vote", "sub-meta", "sub_meta"}
 
 def get_logic_dir_and_json():
-    logic_dir = "logic_reg"
+    logic_dir = "logic"
     json_path = os.path.join(logic_dir, "logic_scripts.json")
     return logic_dir, json_path
 
@@ -1807,15 +1806,24 @@ def get_current_price() -> float:
 # -------------------------------
 def trade_logic(current_price: float, predicted_price: float, ticker: str):
     try:
-        logic_module_name = _get_logic_script_name(TRADE_LOGIC)
+        ml_models = parse_ml_models()
+        classifier_stack = {"classifier", "sub-vote", "sub_meta", "sub-meta", "sub_vote"}
         logic_dir, _ = get_logic_dir_and_json()
-        module_path = f"{logic_dir}.{logic_module_name}"
-        logic_module = importlib.import_module(module_path)
-        logging.info(f"This is a test with {logic_module}")
-        real_current = get_current_price()
-        logic_module.run_logic(current_price, predicted_price, ticker)
+
+        # ─── choose module ───────────────────────────────────────────────────
+        if classifier_stack & set(ml_models):
+            logic_module_name = "classifier"          # logic/classifier.py
+        else:
+            logic_module_name = _get_logic_script_name(TRADE_LOGIC)
+
+        module_path   = f"{logic_dir}.{logic_module_name}"
+        logic_module  = importlib.import_module(module_path)
+
+        real_current  = get_current_price()
+        logic_module.run_logic(real_current, predicted_price, ticker)
+
     except Exception as e:
-        logging.error(f"Error dispatching to trade logic '{TRADE_LOGIC}': {e}")
+        logging.error(f"Error dispatching to trade logic '{logic_module_name}': {e}")
 
 # -------------------------------
 # 10. Trading Job
@@ -2149,17 +2157,19 @@ def console_listener():
                         logging.error("Invalid test_size for 'backtest' command.")
                         continue
 
-                    # Get the correct logic directory/map and logic module for this ML_MODEL
                     logic_dir, json_path = get_logic_dir_and_json()
                     if not os.path.isfile(json_path):
                         _update_logic_json()
-                    if not os.path.isfile(json_path):
-                        LOGIC_MODULE_MAP = {}
-                    else:
-                        with open(json_path, "r") as f:
-                            LOGIC_MODULE_MAP = json.load(f)
 
-                    logic_module_name = LOGIC_MODULE_MAP.get(TRADE_LOGIC, "logic_15_forecast_driven")
+                    with open(json_path, "r") as f:
+                        LOGIC_MODULE_MAP = json.load(f) if os.path.getsize(json_path) else {}
+
+                    ml_models = parse_ml_models()
+                    if {"classifier", "sub-vote", "sub_meta", "sub-meta", "sub_vote"} & set(ml_models):
+                        logic_module_name = "classifier"               # always use classifier.py
+                    else:
+                        logic_module_name = LOGIC_MODULE_MAP.get(TRADE_LOGIC, "logic_15_forecast_driven")
+
                     logging.info("Trading logic: " + logic_module_name)
                     try:
                         logic_module = importlib.import_module(f"{logic_dir}.{logic_module_name}")

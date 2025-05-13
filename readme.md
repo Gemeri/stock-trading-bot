@@ -1,4 +1,4 @@
-# 🌳 Quantitative Trading Framework (forest.py)
+# Stock Trading Bot
 
 > **Note:**  
 > You must **rename the file `env.env` to `.env`** before running anything.  

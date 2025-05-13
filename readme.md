@@ -70,16 +70,16 @@ This is a **modular, multi-strategy algorithmic trading and research platform** 
 #### Installation
 
 ```bash
-git clone https://github.com/yourusername/forest-quant-trading.git
-cd forest-quant-trading
+git clone https://github.com/Gemeri/stock-trading-bot
+cd stock-trading-bot
+
+python3 -m venv venv
+source venv/bin/activate
 
 # Install Python deps
 pip install -r requirements.txt
-# (See below for requirements)
 
-# Copy/modify .env template
-cp .env.example .env
-vim .env  # Fill in API keys and settings!
+cp env.env .env
 ```
 
 #### Run the bot

@@ -21,3 +21,6 @@ chromadb
 sentence-transformers
 deap
 tf-keras
+gplearn
+scikit-optimize
+pysr

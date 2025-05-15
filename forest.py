@@ -936,14 +936,13 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
         plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
         minus_dm  = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
 
-        # allow partial windows so we don't drop 26 bars
         tr_smooth       = tr.rolling(window=period, min_periods=1).sum()
         plus_dm_smooth  = plus_dm.rolling(window=period, min_periods=1).sum()
         minus_dm_smooth = minus_dm.rolling(window=period, min_periods=1).sum()
 
-        plus_di  = 100 * plus_dm_smooth  / tr_smooth
-        minus_di = 100 * minus_dm_smooth / tr_smooth
-        dx       = (plus_di.subtract(minus_di).abs() / (plus_di + minus_di)) * 100
+        plus_di  = 100 * plus_dm_smooth  / tr_smooth.replace(0, np.nan)
+        minus_di = 100 * minus_dm_smooth / tr_smooth.replace(0, np.nan)
+        dx       = (plus_di.subtract(minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
 
         df['adx'] = dx.rolling(window=period, min_periods=1).mean()
 
@@ -963,8 +962,8 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
     if 'close' in df.columns:
         ma20  = df['close'].rolling(window=20, min_periods=1).mean()
         std20 = df['close'].rolling(window=20, min_periods=1).std()
-        df['bollinger_upper'] = ma20 + 2 * std20
-        df['bollinger_lower'] = ma20 - 2 * std20
+        df['bollinger_upper'] = (ma20 + 2 * std20).fillna(0.0)
+        df['bollinger_lower'] = (ma20 - 2 * std20).fillna(0.0)
 
     # --- LAGGED CLOSES ---
     if 'close' in df.columns:
@@ -1001,7 +1000,7 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
             df[z_feat] = ((df[feat] - mean) / std).fillna(0)
 
     # 5. ADX Regime flag: 1 if ADX>30 (trending), else 0
-    df['adx_trend'] = ((df['adx'] > 30).astype(int)) if 'adx' in df.columns else 0
+    df['adx_trend'] = (df.get('adx', 0) > 30).astype(int)
 
     # 6A. MACD crossing (signal): 1 if crossing up (MACD crosses above signal), -1 if crossing below, 0 otherwise
     if 'macd_line' in df.columns and 'macd_signal' in df.columns:
@@ -1072,6 +1071,9 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     X = df[available_cols]
     y = df['target']
 
+    X = X.replace([np.inf, -np.inf], 0.0)
+    X = X.fillna(0.0)
+    
     # NaN/Inf check
     nan_counts = X.isna().sum()
     inf_counts = X.applymap(np.isinf).sum()
@@ -1511,6 +1513,7 @@ def send_discord_order_message(action, ticker, price, predicted_price, extra_inf
         logging.info("Discord mode is off or DISCORD_USER_ID not set.")
 
 def buy_shares(ticker, qty, buy_price, predicted_price):
+    logging.info("BUY: ", ticker)
     if qty <= 0:
         return
     try:
@@ -1583,6 +1586,7 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
         logging.error(f"[{ticker}] Buy order failed: {e}")
 
 def sell_shares(ticker, qty, sell_price, predicted_price):
+    logging.info("SELL: ", ticker)
     if qty <= 0:
         return
     try:
@@ -1637,6 +1641,7 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
         logging.error(f"[{ticker}] Sell order failed: {e}")
 
 def short_shares(ticker, qty, short_price, predicted_price):
+    logging.info("SHORT: ", ticker)
     if qty <= 0:
         return
     try:
@@ -1711,6 +1716,7 @@ def short_shares(ticker, qty, short_price, predicted_price):
         logging.error(f"[{ticker}] Short order failed: {e}")
 
 def close_short(ticker, qty, cover_price):
+    logging.info("COVER: ", ticker)
     if qty <= 0:
         return
     try:
@@ -2592,8 +2598,6 @@ def console_listener():
             logging.info("  set-nbars (Number of candles)")
             logging.info("  set-news (on/off)")
             logging.info("  trade-logic <logic>")
-            logging.info("  disable-feature <comma-separated features or main/base>")
-            logging.info("  auto-feature [-r]")
             logging.info("  set-ntickers (Number)")
             logging.info("  ai-tickers")
             logging.info("  create-script (name)")
@@ -2733,7 +2737,7 @@ def main():
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], feature-importance [-r], commands, set-tickers, set-timeframe, set-nbars, set-news, trade-logic <1..15>, disable-feature <list or main/base>, auto-feature [-r], set-ntickers (Number), ai-tickers, create-script (name)")
+    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], feature-importance [-r], commands, set-tickers, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name)")
 
     while not SHUTDOWN:
         try:

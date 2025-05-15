@@ -36,8 +36,8 @@ MODE = "sub-vote"
 EXECUTION = "live"
 
 # Voting thresholds
-CLS_UP   = 0.6
-CLS_DOWN = 0.4
+CLS_UP   = 0.55
+CLS_DOWN = 0.45
 REG_UP   = 0.003
 REG_DOWN = -0.003
 

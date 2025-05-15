@@ -51,7 +51,7 @@ EXECUTION = globals().get("EXECUTION", "backtest")
 
 # Voting thresholds
 CLS_UP   = 0.55
-CLS_DOWN = 0.35
+CLS_DOWN = 0.45
 REG_UP   = 0.003
 REG_DOWN = -0.003
 

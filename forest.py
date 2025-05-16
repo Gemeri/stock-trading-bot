@@ -115,9 +115,7 @@ def call_sub_main(mode, df, execution):
     spec.loader.exec_module(sub_main)
     sub_main.MODE       = mode
     sub_main.EXECUTION  = execution
-    # For live, set df as CSV, then call run_live
     if execution == "live":
-        # Write temp CSV
         csv_path = "_sub_tmp_live.csv"
         df.to_csv(csv_path, index=False)
         sub_main.CSV_PATH = csv_path
@@ -218,7 +216,6 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
                 return self.out(out)
         return LargeTransformerRegressor
     elif model_name == "classifier":
-        # If you want the classifier model (not used in meta stack)
         class LargeTransformerClassifier(nn.Module):
             def __init__(self, num_features, seq_len=60):
                 super().__init__()
@@ -286,11 +283,6 @@ tokenizer = AutoTokenizer.from_pretrained("mrm8488/distilroberta-finetuned-finan
 model = AutoModelForSequenceClassification.from_pretrained("mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
 
 def predict_sentiment(text):
-    """
-    Returns predicted sentiment details.
-    Mapping: {0: 'Negative', 1: 'Neutral', 2: 'Positive'}.
-    We calculate sentiment_score as (positive confidence – negative confidence).
-    """
     inputs = tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
     outputs = model(**inputs)
     sentiment_class = outputs.logits.argmax(dim=1).item()
@@ -324,7 +316,6 @@ def _update_logic_json():
                 scripts_map[num_int] = script_base
             except ValueError:
                 pass
-    # Save an empty dict if nothing
     if not scripts_map:
         with open(json_path, "w") as f:
             json.dump({}, f, indent=2)
@@ -359,11 +350,6 @@ _CANONICAL_TF = {
 }
 
 def canonical_timeframe(tf: str) -> str:
-    """
-    Return the canonical camel-cased timeframe (e.g. '4Hour')
-    regardless of the capitalisation or abbreviation the user typed.
-    Unknown strings are returned unchanged.
-    """
     if not tf:
         return tf
     tf_clean = tf.strip().lower()
@@ -411,26 +397,6 @@ def fetch_candles(
     timeframe: str | None = None,
     last_timestamp: pd.Timestamp | None = None
 ) -> pd.DataFrame:
-    """
-    Fetch OHLCV bars from Alpaca.
-
-    Parameters
-    ----------
-    ticker : str
-    bars   : int
-        *upper* limit on rows returned; the actual number can be smaller.
-    timeframe : str
-        Canonical camel-cased timeframe (e.g. “4Hour”).  If None we fall back
-        to the global BAR_TIMEFRAME.
-    last_timestamp : pd.Timestamp, optional
-        If supplied we only request bars **after** this UTC timestamp.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns = ['timestamp','open','high','low','close','volume','vwap',
-                   'transactions']
-    """
     if not timeframe:
         timeframe = BAR_TIMEFRAME
     end_dt = datetime.now(tz=pytz.utc)
@@ -568,7 +534,7 @@ def fetch_candles_plus_features_and_predclose(
 
     # ───── 4. attach *incremental* sentiment to the new slice ──────────────
     if last_ts is not None:
-        news_days = 1              # value ignored because we pass start_dt
+        news_days = 1
         start_dt  = last_ts
     else:
         news_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650)
@@ -709,12 +675,6 @@ def fetch_news_sentiments(
     articles_per_day: int,
     start_dt: datetime | None = None
 ):
-    """
-    Pull articles from Alpaca news and score with the RoBERTa sentiment model.
-
-    If *start_dt* is provided we ignore *num_days* and instead back-fill from
-    that moment forward (inclusive).
-    """
     news_list = []
 
     # ----------------------------------------------------------------------
@@ -1121,7 +1081,6 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
 
     # -- Separate classifier logic --
     if "classifier" in ml_models:
-        # Only run classifier, not meta/stacking
         try:
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(X.values)
@@ -1172,7 +1131,6 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     if use_meta_model:
         model_names_for_meta = ["forest", "xgboost", "lightgbm", "lstm", "transformer"]
         N = len(df)
-        # Start walk-forward after first seq_len+1 points for LSTM/transformer
         start_idx = max(seq_len+1, 70)
         preds_dict = {name:[] for name in model_names_for_meta}
         y_true = []
@@ -1259,7 +1217,6 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
             preds_dict["transformer"].append(tr_pred)
             # Save true y
             y_true.append(y.iloc[i])
-        # -- Stack predictions and fit meta-model
         preds_arr = np.vstack([preds_dict["forest"],
                                preds_dict["xgboost"],
                                preds_dict["lightgbm"],
@@ -1546,7 +1503,7 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
                 )
                 logging.info(f"[{ticker}] Auto-COVER {int(abs_short_qty)} at {buy_price:.2f} before BUY")
                 log_trade("COVER", ticker, abs_short_qty, buy_price, None, None)
-            pos_qty = 0.0   # Now flat
+            pos_qty = 0.0
 
         # Step 2: If already long, avoid duplicate buy
         if already_long:
@@ -1677,7 +1634,7 @@ def short_shares(ticker, qty, short_price, predicted_price):
                 pl = (short_price - avg_entry) * abs_long_qty
                 logging.info(f"[{ticker}] Auto-SELL {int(abs_long_qty)} at {short_price:.2f} before SHORT")
                 log_trade("SELL", ticker, abs_long_qty, short_price, predicted_price, pl)
-            pos_qty = 0.0  # Flat
+            pos_qty = 0.0
 
         # Step 2: If already short, avoid duplicate short
         if already_short:
@@ -1917,10 +1874,17 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
                 continue
         # ---------------------------------------------------------------------------
 
-        pred_close = train_and_predict(df)
-        if pred_close is None:
+        raw_pred = train_and_predict(df)
+        if raw_pred is None:
             logging.error(f"[{ticker}] Model training or prediction failed. Skipping trade logic.")
             continue
+        
+        try:
+            pred_close = float(raw_pred)
+        except (TypeError, ValueError) as e:
+            logging.error(f"[{ticker}] Cannot convert prediction to float: {raw_pred!r} ({e}). Skipping.")
+            continue
+        
         current_price = float(df.iloc[-1]['close'])
         logging.info(f"[{ticker}] Current Price = {current_price:.2f}, Predicted Next Close = {pred_close:.2f}")
         trade_logic(current_price, pred_close, ticker)
@@ -1952,7 +1916,7 @@ def setup_schedule_for_timeframe(timeframe: str) -> None:
         if NEWS_MODE == "on":
             try:
                 base_time      = datetime.strptime(t, "%H:%M")
-                offset_minutes = SENTIMENT_OFFSET_MINUTES          # ← env‑controlled
+                offset_minutes = SENTIMENT_OFFSET_MINUTES
                 sentiment_time = (base_time - timedelta(minutes=offset_minutes)).strftime("%H:%M")
                 schedule.every().day.at(sentiment_time).do(run_sentiment_job)
                 logging.info(f"Scheduled sentiment update {sentiment_time} NY & trade {t} NY.")
@@ -2105,7 +2069,6 @@ def console_listener():
         elif cmd == "run-sentiment":
             logging.info("Running sentiment update job...")
             run_sentiment_job(skip_data=skip_data)
-            # After run_sentiment_job, merge the sentiment data into the full candle CSV
             for ticker in TICKERS:
                 tf_code = timeframe_to_code(BAR_TIMEFRAME)
                 candle_csv = f"{ticker}_{tf_code}.csv"
@@ -2183,7 +2146,6 @@ def console_listener():
                         logging.error(f"Unable to import logic module {logic_module_name}: {e}")
                         continue
 
-                    # Determine script number for the results subfolder
                     match_script = re.match(r"^logic_(\d+)_", logic_module_name)
                     logic_num_str = match_script.group(1) if match_script else "unknown"
                     results_dir = "results"
@@ -2277,13 +2239,10 @@ def console_listener():
                                 continue
                             if "sub-vote" in ml_models or "sub-meta" in ml_models:
                                 mode = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-                                # Call sub/main.py
                                 signal_df = call_sub_main(mode, df, execution="backtest")
-                                # signal_df should have ["timestamp", "action"] where action in BUY/SELL/NONE
 
-                                # Only keep rows where action is not NONE (SELL/BUY only!)
                                 trade_actions = signal_df[signal_df["action"].isin(["BUY", "SELL"])].reset_index(drop=True)
-                                predictions = []  # Not used, submodel doesn't return price pred
+                                predictions = []
                                 actuals = []
                                 timestamps = []
                                 trade_records = []
@@ -2293,13 +2252,10 @@ def console_listener():
                                 position_qty = 0
                                 avg_entry_price = 0.0
 
-                                # Merge trade_actions["timestamp"] with df to get price at timestamp
-                                # If the action timestamps don't exactly line up, merge asof
                                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                                 trade_actions['timestamp'] = pd.to_datetime(trade_actions['timestamp'])
                                 df_sorted = df.sort_values('timestamp').reset_index(drop=True)
                                 trade_actions_sorted = trade_actions.sort_values('timestamp').reset_index(drop=True)
-                                # Merge for price lookup
                                 merged_actions = pd.merge_asof(
                                     trade_actions_sorted, df_sorted, on='timestamp', direction="backward"
                                 )
@@ -2313,13 +2269,11 @@ def console_listener():
                                         "profit_loss": pl
                                     })
 
-                                # Main backtest loop using trade_actions
                                 for idx, row in merged_actions.iterrows():
                                     action = row["action"]
                                     ts = row["timestamp"]
                                     price = row["close"]
                                     
-                                    # Only one trade at a time: flatten before new position, etc.
                                     if action == "BUY":
                                         if position_qty < 0:
                                             pl = (avg_entry_price - price) * abs(position_qty)
@@ -2339,12 +2293,9 @@ def console_listener():
                                             record_trade("SELL", ts, position_qty, price, pl)
                                             position_qty = 0
                                             avg_entry_price = 0.0
-                                    # (else if action == "NONE": skip)
                                     val = cash + (position_qty * (price - avg_entry_price) if position_qty > 0 else 0)
                                     portfolio_records.append({"timestamp": ts, "portfolio_value": val})
 
-                                # Continue plotting code etc, use these records as before.
-                                # And save into sub/sub-results as instructed
                                 results_dir = os.path.join("sub", "sub-results")
                                 if not os.path.exists(results_dir):
                                     os.makedirs(results_dir)
@@ -2355,7 +2306,7 @@ def console_listener():
                                 for i_, row_idx in enumerate(idx_list):
                                     if approach == "simple":
                                         sub_df = pd.concat([train_df, test_df.iloc[:i_+1]], axis=0, ignore_index=True)
-                                    else: # complex
+                                    else:
                                         sub_df = df.iloc[:row_idx]
                                     pred_close = train_and_predict(sub_df)
                                     row_data = df.loc[row_idx]
@@ -2550,7 +2501,7 @@ def console_listener():
                 y_all   = df['target']
 
                 # ─── EXPANDING-WINDOW ROLLING FORECAST & IMPORTANCE ACCUMULATION ────────
-                train_size = int(len(df) * 0.8)           # e.g. 2394 of 2992
+                train_size = int(len(df) * 0.8)
                 imp_accum  = np.zeros(len(features))
                 n_models   = 0
 
@@ -2560,7 +2511,6 @@ def console_listener():
                     X_test  = X_all.iloc[i:i+1]
                     y_test  = y_all.iloc[i]
 
-                    # train on [0:i), predict i, then include i in next train
                     model = RandomForestRegressor(
                         n_estimators=N_ESTIMATORS,
                         random_state=RANDOM_SEED,
@@ -2568,7 +2518,6 @@ def console_listener():
                     )
                     model.fit(X_train, y_train)
 
-                    # optional: capture rolling predictions
                     y_pred = model.predict(X_test)[0]
                     # (you could store y_pred vs y_test here for metrics)
 

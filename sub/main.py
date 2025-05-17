@@ -142,7 +142,7 @@ def run_live(return_result=False):
     """
     # Load price+features and parse timestamps
     df = pd.read_csv(CSV_PATH)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     n = len(df)
 
     if MODE == 'sub-vote':
@@ -177,7 +177,7 @@ def run_live(return_result=False):
         # load or initialize cache
         if os.path.exists(cache_fn):
             rec = pd.read_csv(cache_fn)
-            rec['timestamp'] = pd.to_datetime(rec['timestamp'])
+            rec['timestamp'] = pd.to_datetime(rec['timestamp'], utc=True)
         else:
             # initial realistic backtest on final 20%
             rec = backtest_submodels(df, initial_frac=0.8)

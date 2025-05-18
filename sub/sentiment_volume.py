@@ -43,7 +43,7 @@ LGBM_PARAMS = {
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
-def compute_labels(df: pd.DataFrame, min_return: float = None, breakout_pct: float = 0.15) -> pd.DataFrame:
+def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
     Label a breakout (1) if next-bar open→open return is in the top X% of abs returns.
     By default, top 15% abs returns are breakouts.
@@ -54,9 +54,8 @@ def compute_labels(df: pd.DataFrame, min_return: float = None, breakout_pct: flo
     absrets = df['raw_ret'].abs()
 
     # Use percentile-based threshold if min_return not provided
-    if min_return is None:
-        min_return = absrets.quantile(1 - breakout_pct)
-        print(f"[LABEL] Using percentile-based min_return: {min_return:.5f} for top {breakout_pct*100:.1f}% breakouts")
+    min_return = absrets.quantile(1 - 0.15)
+    print(f"[LABEL] Using percentile-based min_return: {min_return:.5f} for top {0.15*100:.1f}% breakouts")
 
     df['label'] = (absrets > min_return).astype(int)
 

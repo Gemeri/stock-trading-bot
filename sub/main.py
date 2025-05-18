@@ -335,27 +335,27 @@ def run_backtest(return_df=False):
             p1 = mod1.predict(
                 mod1.fit(d1.iloc[:-1][mod1.FEATURES].values,
                         d1.iloc[:-1]['label'].values),
-                d1.loc[[t], d1.FEATURES]
+                d1.loc[[t], mod1.FEATURES]
             )[0]
             d2 = mod2.compute_labels(window_df)
             p2 = mod2.predict(
-                mod2.fit(d2.iloc[:-1][d2.FEATURES], d2.iloc[:-1]['label']),
-                d2.loc[[t], d2.FEATURES]
+                mod2.fit(d2.iloc[:-1][mod2.FEATURES], d2.iloc[:-1]['label']),
+                d2.loc[[t], mod2.FEATURES]
             )[0]
             d3 = mod3.compute_labels(window_df)
             p3 = mod3.predict(
-                mod3.fit(d3.iloc[:-1][d3.FEATURES].values, d3.iloc[:-1]['label'].values),
-                d3.loc[[t], d3.FEATURES]
+                mod3.fit(d3.iloc[:-1][mod3.FEATURES], d3.iloc[:-1]['label']),
+                d3.loc[[t], mod3.FEATURES]
             )[0]
             d4 = mod4.compute_target(window_df)
             p4 = mod4.predict(
-                mod4.fit(d4.iloc[:-1][d4.FEATURES], d4.iloc[:-1]['target']),
-                d4.loc[[t], d4.FEATURES]
+                mod4.fit(d4.iloc[:-1][mod4.FEATURES], d4.iloc[:-1]['target']),
+                d4.loc[[t], mod4.FEATURES]
             )[0]
             d5 = mod5.compute_labels(window_df, min_return=0.002)
             p5 = mod5.predict(
-                mod5.fit(d5.iloc[:-1][d5.FEATURES], d5.iloc[:-1]['label']),
-                d5.loc[[t], d5.FEATURES]
+                mod5.fit(d5.iloc[:-1][mod5.FEATURES], d5.iloc[:-1]['label']),
+                d5.loc[[t], mod5.FEATURES]
             )[0]
 
             # GET SUBMODEL LABELS FOR THIS WINDOW

@@ -1005,6 +1005,7 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
 # 8. Enhanced Train & Predict Pipeline
 # -------------------------------
 def train_and_predict(df: pd.DataFrame, return_model_stack=False):
+    # 1. Convert sentiment column if needed
     if 'sentiment' in df.columns and df["sentiment"].dtype == object:
         try:
             df["sentiment"] = df["sentiment"].astype(float)
@@ -1012,52 +1013,61 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
             logging.error(f"Cannot convert sentiment column to float: {e}")
             return None
 
-    df = add_features(df)
-    df = compute_custom_features(df)
+    # 2. Feature engineering on raw data
+    df_feat = add_features(df)
+    df_feat = compute_custom_features(df_feat)
 
-    available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
+    # 3. Determine which columns to use as features
+    available_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df_feat.columns]
 
-    if 'close' not in df.columns:
+    # 4. Ensure we have price data
+    if 'close' not in df_feat.columns:
         logging.error("No 'close' in DataFrame, cannot create target.")
         return None
 
-    df = df.copy()
-    df['target'] = df['close'].shift(-1)
-    df.dropna(subset=['target'], inplace=True)
-    if len(df) < 70:
+    # 5. Build df_full (including the newest row with NaN target)
+    df_full = df_feat.copy()
+    df_full['target'] = df_full['close'].shift(-1)
+
+    # 6. Build df_train by dropping the row(s) without a valid target
+    df_train = df_full.dropna(subset=['target']).copy()
+    if len(df_train) < 70:
         logging.error("Not enough rows after shift to train. Need more candles.")
         return None
 
-    X = df[available_cols]
-    y = df['target']
+    # 7. Prepare training feature matrix and target vector
+    X = df_train[available_cols]
+    y = df_train['target']
+    X = X.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    X = X.replace([np.inf, -np.inf], 0.0)
-    X = X.fillna(0.0)
-    
-    # NaN/Inf check
-    nan_counts = X.isna().sum()
-    inf_counts = X.applymap(np.isinf).sum()
-    target_nan = y.isna().sum()
-    target_inf = np.isinf(y).sum()
+    # 8. NaN/Inf diagnostics for downstream model choice
+    nan_counts    = X.isna().sum()
+    inf_counts    = X.applymap(np.isinf).sum()
+    target_nan    = y.isna().sum()
+    target_inf    = np.isinf(y).sum()
     logging.info(f"Features NaN per column:\n{nan_counts[nan_counts>0].to_dict()}")
     logging.info(f"Features Inf per column:\n{inf_counts[inf_counts>0].to_dict()}")
     logging.info(f"Target NaNs: {target_nan}, Target INFs: {target_inf}")
 
-    # NaN/Inf check
     if nan_counts.any() or inf_counts.any() or target_nan > 0 or target_inf > 0:
         logging.error("→ Skipping LSTM/Transformer due to NaN/Inf above.")
         use_transformer = False
     else:
         use_transformer = True
 
-    last_row_features = df.iloc[-1][available_cols]
-    last_row_df = pd.DataFrame([last_row_features], columns=available_cols)
-    last_X_np = np.array(last_row_df)
+    # 9. Extract the very last candle's features for any “last-row” prediction
+    last_row_features = df_full.iloc[-1][available_cols]
+    last_row_df       = pd.DataFrame([last_row_features], columns=available_cols)
+    last_X_np         = np.array(last_row_df)
 
+    # 10. Decide which models to run
     ml_models = parse_ml_models()
+
+    print(df_full)
+    # 11. If using sub-logic, hand off the FULL df_full (with newest row) to sub/main.py
     if "sub-vote" in ml_models or "sub-meta" in ml_models:
-        mode = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-        action = call_sub_main(mode, df, execution="live")
+        mode   = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
+        action = call_sub_main(mode, df_full, execution="live")
         logging.info(f"Sub-{mode} run_live action: {action}")
         return action  # "BUY", "SELL", or "NONE"
     out_preds = []
@@ -1873,7 +1883,6 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
                 logging.info(f"[{ticker}] Latest candle condition not met for timeframe {BAR_TIMEFRAME} at scheduled time {scheduled_time_ny}. Skipping trade.")
                 continue
         # ---------------------------------------------------------------------------
-
         raw_pred = train_and_predict(df)
         if raw_pred is None:
             logging.error(f"[{ticker}] Model training or prediction failed. Skipping trade logic.")

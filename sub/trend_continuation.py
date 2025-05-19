@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from typing import Union
 
 from lightgbm import LGBMClassifier
 from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
@@ -82,46 +83,60 @@ def max_drawdown(equity):
 
 # ─── Fit & Predict API ─────────────────────────────────────────────────────────
 
-def fit(X_train: pd.DataFrame, y_train: pd.Series) -> LGBMClassifier:
+ArrayLike = Union[np.ndarray, pd.DataFrame, pd.Series]
+
+def _to_numpy(x: ArrayLike) -> np.ndarray:
+    """Utility: convert Series/DataFrame/array-like to a 2-D (features) or 1-D (labels) NumPy array."""
+    if isinstance(x, (pd.DataFrame, pd.Series)):
+        return x.values
+    return np.asarray(x)
+
+def fit(X_train: ArrayLike, y_train: ArrayLike) -> LGBMClassifier:
     """
     Manual grid-search CV over PARAM_GRID with tqdm.
-    Returns the best-fitted LGBMClassifier (retrained on full X_train, y_train).
-    Compatible with older LightGBM versions (no early stopping).
+    Accepts *either* a pandas DataFrame/Series *or* NumPy array for X_train / y_train.
+    Returns the best-fitted LGBMClassifier (retrained on full data).
     """
     logging.info("Running FIT on trend_continuation")
+
+    # --- ensure NumPy (TimeSeriesSplit only needs index positions) -------------
+    X_all = _to_numpy(X_train)
+    y_all = _to_numpy(y_train).ravel()        # flatten in case it’s a column vector
+
     tscv = TimeSeriesSplit(n_splits=5)
-    best_score = -np.inf
+    best_score  = -np.inf
     best_params = None
 
-    grid = list(ParameterGrid(PARAM_GRID))
-    for params in tqdm(grid, desc="Hyperparameter grid", unit="combo"):
+    for params in tqdm(ParameterGrid(PARAM_GRID), desc="Hyperparameter grid", unit="combo"):
         scores = []
-        for train_idx, val_idx in tscv.split(X_train):
-            X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-            y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
-            model = LGBMClassifier(random_state=42, verbosity=-1, **params)
-            model.fit(X_tr, y_tr)  # <-- NO early_stopping_rounds
-            probs = model.predict_proba(X_val)[:, 1]
+        for tr_idx, val_idx in tscv.split(X_all):
+            X_tr, X_val = X_all[tr_idx], X_all[val_idx]
+            y_tr, y_val = y_all[tr_idx], y_all[val_idx]
+
+            mdl = LGBMClassifier(random_state=42, verbosity=-1, **params)
+            mdl.fit(X_tr, y_tr)                       # ⚠️  NO early stopping here
+            probs = mdl.predict_proba(X_val)[:, 1]
             scores.append(roc_auc_score(y_val, probs))
+
         mean_score = np.mean(scores)
         if mean_score > best_score:
-            best_score = mean_score
-            best_params = params
+            best_score, best_params = mean_score, params
 
     logging.info(f"Best params: {best_params} | CV ROC-AUC: {best_score:.4f}")
 
-    # retrain on full training set with best params
     best_model = LGBMClassifier(random_state=42, verbosity=-1, **best_params)
-    best_model.fit(X_train, y_train)
+    best_model.fit(X_all, y_all)
     return best_model
 
-def predict(model: LGBMClassifier, X: pd.DataFrame) -> np.ndarray:
+
+def predict(model: LGBMClassifier, X: ArrayLike) -> np.ndarray:
     """
-    Given a fitted LGBMClassifier and DataFrame X (n_samples×n_features),
-    return the probability of continuation (class=1) for each row.
+    Return continuation probabilities for rows in X.
+    Handles DataFrame, Series or NumPy array seamlessly.
     """
     logging.info("Running PREDICT on trend_continuation")
-    return model.predict_proba(X)[:, 1]
+    X_np = _to_numpy(X)
+    return model.predict_proba(X_np)[:, 1]
 
 # ─── Main backtest (unchanged logic, but new label/threshold options) ─────────
 

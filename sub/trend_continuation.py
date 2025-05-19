@@ -3,14 +3,12 @@
 trend_continuation.py
 
 A full i+1 walk-forward backtest of a LightGBM trend-continuation strategy,
-refactored to expose fit() and predict() for external orchestration.
+with improved label and model tuning. Refactored for external orchestration.
 
 Exports:
     FEATURES     : list of feature column names
     fit(X, y)    : returns a fitted LGBMClassifier with tuned hyperparameters
     predict(model, X) : returns array of continuation probabilities for X
-
-Original backtest logic remains intact in main().
 """
 
 import os
@@ -23,8 +21,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from lightgbm import LGBMClassifier
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 
 # ─── Silence LightGBM warnings ─────────────────────────────────────────────────
 logging.getLogger('lightgbm').setLevel(logging.ERROR)
@@ -37,27 +35,36 @@ FEATURES = [
     'rsi', 'macd_line'
 ]
 
+# Tweaked PARAM_GRID for deeper trees & lower min_child_samples
 PARAM_GRID = {
     'n_estimators':      [250],
-    'num_leaves':        [31],
-    'learning_rate':     [0.1],
+    'num_leaves':        [100, 150, 200],
+    'learning_rate':     [0.05],
     'subsample':         [0.7],
     'colsample_bytree':  [0.9],
-    'min_child_samples': [20]
+    'min_child_samples': [5, 10]
 }
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
-def compute_labels(df):
+def compute_labels(df, mode='momentum', n_ahead=2, thresh=0.002, quantile=0.4):
     """
-    Label = 1 if the direction of the next bar (open→open)
-    matches the direction of the current bar; else 0.
+    Enhanced label computation.
+    mode = 'momentum':  label = 1 if fwd ret over n_ahead bars > thresh
+    mode = 'quantile':  label = 1 if top quantile, 0 if bottom quantile, else NaN
     """
     df = df.copy()
-    df['open_t1']      = df['open'].shift(-1)
-    df['direction_t0'] = np.sign(df['open'] - df['open'].shift(1))
-    df['direction_t1'] = np.sign(df['open_t1'] - df['open'])
-    df['label']        = (df['direction_t1'] == df['direction_t0']).astype(int)
+    df['fwd_ret'] = (df['close'].shift(-n_ahead) - df['open']) / df['open']
+    if mode == 'momentum':
+        df['label'] = (df['fwd_ret'] > thresh).astype(int)
+    elif mode == 'quantile':
+        # Assign top quantile=1, bottom quantile=0, ignore middle
+        q_hi = df['fwd_ret'].quantile(1 - quantile)
+        q_lo = df['fwd_ret'].quantile(quantile)
+        df['label'] = np.where(df['fwd_ret'] >= q_hi, 1,
+                        np.where(df['fwd_ret'] <= q_lo, 0, np.nan))
+    else:
+        raise ValueError("Unknown mode for label: choose 'momentum' or 'quantile'")
     return df
 
 def sharpe(returns):
@@ -73,58 +80,68 @@ def max_drawdown(equity):
     dd = (equity - roll_max) / roll_max
     return dd.min()
 
-
 # ─── Fit & Predict API ─────────────────────────────────────────────────────────
 
 def fit(X_train: pd.DataFrame, y_train: pd.Series) -> LGBMClassifier:
     """
-    Grid-search CV on (X_train, y_train) to tune hyperparameters,
-    then return the best-fitted LGBMClassifier (best_estimator_).
+    Manual grid-search CV over PARAM_GRID with tqdm.
+    Returns the best-fitted LGBMClassifier (retrained on full X_train, y_train).
+    Compatible with older LightGBM versions (no early stopping).
     """
-    logging.info("Ruinning FIT on trend_continuation")
-    tscv = TimeSeriesSplit(n_splits=3)
-    base = LGBMClassifier(random_state=42, verbosity=-1)
-    grid = GridSearchCV(
-        estimator=base,
-        param_grid=PARAM_GRID,
-        cv=tscv,
-        scoring='roc_auc',
-        n_jobs=-1,
-        verbose=1
-    )
-    grid.fit(X_train, y_train)
-    return grid.best_estimator_
+    logging.info("Running FIT on trend_continuation")
+    tscv = TimeSeriesSplit(n_splits=5)
+    best_score = -np.inf
+    best_params = None
+
+    grid = list(ParameterGrid(PARAM_GRID))
+    for params in tqdm(grid, desc="Hyperparameter grid", unit="combo"):
+        scores = []
+        for train_idx, val_idx in tscv.split(X_train):
+            X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+            model = LGBMClassifier(random_state=42, verbosity=-1, **params)
+            model.fit(X_tr, y_tr)  # <-- NO early_stopping_rounds
+            probs = model.predict_proba(X_val)[:, 1]
+            scores.append(roc_auc_score(y_val, probs))
+        mean_score = np.mean(scores)
+        if mean_score > best_score:
+            best_score = mean_score
+            best_params = params
+
+    logging.info(f"Best params: {best_params} | CV ROC-AUC: {best_score:.4f}")
+
+    # retrain on full training set with best params
+    best_model = LGBMClassifier(random_state=42, verbosity=-1, **best_params)
+    best_model.fit(X_train, y_train)
+    return best_model
 
 def predict(model: LGBMClassifier, X: pd.DataFrame) -> np.ndarray:
     """
     Given a fitted LGBMClassifier and DataFrame X (n_samples×n_features),
     return the probability of continuation (class=1) for each row.
     """
-    logging.info("Ruinning PREDICT on trend_continuation")
+    logging.info("Running PREDICT on trend_continuation")
     return model.predict_proba(X)[:, 1]
 
-
-# ─── Main backtest (unchanged logic, now uses fit()/predict()) ────────────────
+# ─── Main backtest (unchanged logic, but new label/threshold options) ─────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_csv",
-                        help="CSV with columns 'open','close' + FEATURES")
-    parser.add_argument("--output_dir",   default=".",    help="Where to save results")
-    parser.add_argument("--n_back",       type=int, default=500,
-                        help="Bars in final walk-forward backtest")
-    parser.add_argument("--window",       type=int, default=500,
-                        help="Rolling-window size for training each step")
-    parser.add_argument("--holdout_frac", type=float, default=0.2,
-                        help="Fraction of backtest slice for threshold tuning")
-    parser.add_argument("--commission",   type=float, default=0.0005,
-                        help="Round-trip commission per trade (pct)")
-    parser.add_argument("--slippage",     type=float, default=0.0001,
-                        help="Round-trip slippage per trade (pct)")
-    parser.add_argument("--stop_loss",    type=float, default=0.02,
-                        help="Stop-loss pct (absolute on raw return)")
-    parser.add_argument("--take_profit",  type=float, default=0.05,
-                        help="Take-profit pct (absolute on raw return)")
+    parser.add_argument("input_csv", help="CSV with columns 'open','close' + FEATURES")
+    parser.add_argument("--output_dir", default="sub_result_trend", help="Where to save results")
+    parser.add_argument("--n_back", type=int, default=500, help="Bars in final walk-forward backtest")
+    parser.add_argument("--window", type=int, default=500, help="Rolling-window size for training each step")
+    parser.add_argument("--holdout_frac", type=float, default=0.2, help="Fraction of backtest slice for threshold tuning")
+    parser.add_argument("--commission", type=float, default=0.0005, help="Round-trip commission per trade (pct)")
+    parser.add_argument("--slippage", type=float, default=0.0001, help="Round-trip slippage per trade (pct)")
+    parser.add_argument("--stop_loss", type=float, default=0.02, help="Stop-loss pct (absolute on raw return)")
+    parser.add_argument("--take_profit", type=float, default=0.05, help="Take-profit pct (absolute on raw return)")
+    # New label & threshold args
+    parser.add_argument("--label_mode", choices=["momentum", "quantile"], default="momentum", help="Label type")
+    parser.add_argument("--label_n_ahead", type=int, default=2, help="Bars ahead for forward return in label")
+    parser.add_argument("--label_thresh", type=float, default=0.002, help="Return threshold for momentum label")
+    parser.add_argument("--label_quantile", type=float, default=0.4, help="Quantile for quantile label")
+    parser.add_argument("--thresh_metric", choices=["sharpe", "f1", "roc_auc", "accuracy"], default="sharpe", help="Metric for threshold selection")
     args = parser.parse_args()
 
     # 1) Load & label
@@ -133,13 +150,20 @@ def main():
     missing = required - set(df.columns)
     if missing:
         raise KeyError(f"Missing columns: {missing}")
-    df = compute_labels(df).dropna(subset=FEATURES + ['label']).reset_index(drop=True)
+
+    df = compute_labels(
+        df,
+        mode=args.label_mode,
+        n_ahead=args.label_n_ahead,
+        thresh=args.label_thresh,
+        quantile=args.label_quantile
+    )
+    df = df.dropna(subset=FEATURES + ['label']).reset_index(drop=True)
 
     # 2) Hyperparameter tuning on data *before* the last n_back bars
     hyper = df.iloc[:-args.n_back]
     X_h, y_h = hyper[FEATURES], hyper['label']
 
-    # use our refactored fit()
     best_model = fit(X_h, y_h)
     best_params = best_model.get_params()
     print("Best hyperparameters:", {k: best_params[k] for k in PARAM_GRID})
@@ -150,36 +174,28 @@ def main():
     end   = n - 2                 # last t such that t+2 exists
 
     records = []
-    for t in tqdm(range(start, end),
-                  desc="WF backtest", unit="bar"):
+    for t in tqdm(range(start, end), desc="WF backtest", unit="bar"):
         tr0 = max(0, t - args.window)
         tr1 = t - 1
         train = df.iloc[tr0:tr1+1]
         X_tr, y_tr = train[FEATURES], train['label']
 
-        # fit with best params, quiet verbosity
         model = LGBMClassifier(**{k: best_params[k] for k in PARAM_GRID},
                                random_state=42,
                                verbosity=-1)
         model.fit(X_tr, y_tr)
 
-        # predict prob of continuation on bar t
         X_t = df.loc[[t], FEATURES]
         p_t = predict(model, X_t)[0]
 
-        # trade direction = direction_t0
-        sign = int(df.at[t, 'direction_t0'])
+        # trade direction: sign of expected move, or use forward return direction
+        sign = 1  # Always buy (can add shorting logic if label is symmetrical)
 
-        # simulate PnL: entry at t+1 open, exit at t+2 open
         op1 = df.at[t+1, 'open']
         op2 = df.at[t+2, 'open']
         raw_ret = sign * (op2 - op1) / op1
 
-        # stop-loss / take-profit clipping
-        clipped = np.clip(raw_ret,
-                          -args.stop_loss,
-                          +args.take_profit)
-
+        clipped = np.clip(raw_ret, -args.stop_loss, +args.take_profit)
         net_ret = clipped - (args.commission + args.slippage)
 
         records.append({
@@ -197,28 +213,37 @@ def main():
     n_val = int(len(back) * args.holdout_frac)
     val, test = back.iloc[:n_val], back.iloc[n_val:]
 
-    best = {'thresh': None, 'sharpe': -np.inf}
+    best = {'thresh': None, 'score': -np.inf}
+    metric = args.thresh_metric
     for thr in np.linspace(0.50, 0.90, 41):
         sel = val[val['prob'] > thr]
         if sel.empty:
             continue
-        sh = sharpe(sel['net_ret'])
-        if sh > best['sharpe']:
-            best = {'thresh': thr, 'sharpe': sh}
+        if metric == "sharpe":
+            score = sharpe(sel['net_ret'])
+        elif metric == "f1":
+            score = f1_score(val['label'], (val['prob'] > thr).astype(int))
+        elif metric == "roc_auc":
+            score = roc_auc_score(val['label'], val['prob'])
+        elif metric == "accuracy":
+            score = accuracy_score(val['label'], (val['prob'] > thr).astype(int))
+        else:
+            raise ValueError("Invalid thresh_metric")
+        if score > best['score']:
+            best = {'thresh': thr, 'score': score}
     p_star = best['thresh']
-    print(f"Optimized p* = {p_star:.3f}  (val Sharpe={best['sharpe']:.2f})")
+    print(f"Optimized p* = {p_star:.3f}  (val {metric}={best['score']:.3f})")
 
     # 5) Evaluate on the remaining test slice
     sel_test = test[test['prob'] > p_star]
     rets     = sel_test['net_ret']
     equity   = (1 + rets).cumprod()
 
-    total_ret = equity.iloc[-1] - 1
+    total_ret = equity.iloc[-1] - 1 if not equity.empty else 0
     sharpe_t  = sharpe(rets)
-    max_dd    = max_drawdown(equity)
-    acc       = accuracy_score(test['label'],
-                               (test['prob'] > p_star).astype(int))
-    auc       = roc_auc_score(test['label'], test['prob'])
+    max_dd    = max_drawdown(equity) if not equity.empty else 0
+    acc       = accuracy_score(test['label'], (test['prob'] > p_star).astype(int))
+    auc       = roc_auc_score(test['label'], test['prob']) if len(test['label'].unique()) > 1 else float('nan')
 
     # 6) Save outputs
     os.makedirs(args.output_dir, exist_ok=True)

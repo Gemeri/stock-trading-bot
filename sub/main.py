@@ -71,11 +71,11 @@ def actual_direction(df: pd.DataFrame, t: int) -> int:
     """
     return int(df['close'].iat[t+1] > df['close'].iat[t])
 
-def update_submeta_history(CSV_PATH, HISTORY_PATH, submods, verbose=True):
+def update_submeta_history(CSV_PATH, HISTORY_PATH, submods, window=50, verbose=True):
     """
-    Ensures submeta_history_H4.csv is up to date with all bars in the raw CSV.
-    Appends any missing submodel predictions + their proper label (for each submodel) + meta label.
-    Returns updated history as a DataFrame.
+    Updates meta history (submeta_history_X.csv) to match underlying CSV.
+    Stores only submodel predictions (m1..m5), rolling accs (acc1..acc5), and meta_label (close-to-close dir).
+    Never saves label1-5.
     """
     df = pd.read_csv(CSV_PATH)
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
@@ -88,48 +88,61 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH, submods, verbose=True):
             if verbose: print("[HISTORY] Already up-to-date.")
             return hist
     else:
-        # Now columns: timestamp, m1..m5, label_m1..label_m5, meta_label
-        cols = ['timestamp'] + [f"m{i+1}" for i in range(5)] + [f"label_m{i+1}" for i in range(5)] + ['meta_label']
+        cols = ['timestamp'] + [f"m{i+1}" for i in range(5)] + [f"acc{i+1}" for i in range(5)] + ['meta_label']
         hist = pd.DataFrame(columns=cols)
         start_idx = int(len(df) * 0.8)
 
     recs = []
-    for i in range(start_idx, len(df)-1):  # -1 so meta_label is defined (next close)
+    preds_history = [list(hist[f"m{i+1}"]) if not hist.empty else [] for i in range(5)]
+    labels_history = [[] for _ in range(5)]
+
+    for i in range(start_idx, len(df) - 1):
         slice_df = df.iloc[:i+1].reset_index(drop=True)
-        # Get predictions and labels for each submodel
         preds = []
         labels = []
         for idx, mod in enumerate(submods):
             if hasattr(mod, 'compute_labels'):
                 d = mod.compute_labels(slice_df)
                 tr = d.iloc[:-1].dropna(subset=mod.FEATURES + ['label'])
-                pred = mod.predict(mod.fit(tr[mod.FEATURES].values, tr['label'].values), d.loc[[len(slice_df)-1], mod.FEATURES])[0]
-                # Label for the submodel (on the most recent bar)
+                pred = mod.predict(mod.fit(tr[mod.FEATURES].values, tr['label'].values),
+                                   d.loc[[len(slice_df)-1], mod.FEATURES])[0]
                 label = d['label'].iloc[-1]
             elif hasattr(mod, 'compute_target'):
                 d = mod.compute_target(slice_df)
                 tr = d.iloc[:-1].dropna(subset=mod.FEATURES + ['target'])
-                pred = mod.predict(mod.fit(tr[mod.FEATURES], tr['target']), d.loc[[len(slice_df)-1], mod.FEATURES])[0]
-                # Target for regression as label
-                label = d['target'].iloc[-1]
+                pred = mod.predict(mod.fit(tr[mod.FEATURES], tr['target']),
+                                   d.loc[[len(slice_df)-1], mod.FEATURES])[0]
+                label = int(d['target'].iloc[-1] > 0)
             preds.append(pred)
             labels.append(label)
-        # Meta label: will next close go up?
+        # Rolling accuracy over *previous* 50
+        for idx in range(5):
+            preds_history[idx].append(preds[idx])
+            labels_history[idx].append(labels[idx])
+        accs = []
+        for idx in range(5):
+            preds_arr = np.array(preds_history[idx][-window-1:-1])
+            labels_arr = np.array(labels_history[idx][-window-1:-1])
+            if len(preds_arr) > 0 and len(labels_arr) > 0:
+                acc = np.mean(np.round(preds_arr) == labels_arr)
+            else:
+                acc = 0.5
+            accs.append(acc)
         meta_label = int(slice_df['close'].iat[-1] > slice_df['close'].iat[-2])
         rec = {'timestamp': slice_df['timestamp'].iat[-1]}
         rec.update({f"m{i+1}": preds[i] for i in range(5)})
-        rec.update({f"label_m{i+1}": labels[i] for i in range(5)})
+        rec.update({f"acc{i+1}": accs[i] for i in range(5)})
         rec['meta_label'] = meta_label
         recs.append(rec)
-        if verbose and (i-start_idx)%10==0:
+        if verbose and (i - start_idx) % 10 == 0:
             print(f"[HISTORY] Appended new bar at idx={i} ({slice_df['timestamp'].iat[-1]})")
+
     if recs:
         new_df = pd.DataFrame(recs)
         hist = pd.concat([hist, new_df], ignore_index=True)
         hist.to_csv(HISTORY_PATH, index=False)
         if verbose: print(f"[HISTORY] Updated. Now {len(hist)} total rows.")
     return hist
-
 
 
 def optimize_asymmetric_thresholds(
@@ -181,98 +194,83 @@ def train_and_save_meta(
     model_pkl: str,
     threshold_pkl: str,
     metric: str = "accuracy"
-) -> Tuple[LogisticRegression, float, float]:
+):
     """
-    Train meta-model using submodel history.
-    Adds rolling accuracy for each submodel as features.
+    Train meta-model using submodel history (preds + rolling accs only).
     """
     hist = pd.read_csv(cache_csv)
-    # Calculate rolling accuracy for each submodel (up to t-1)
-    for i in range(5):
-        preds = hist[f"m{i+1}"]
-        labels = hist[f"label_m{i+1}"]
-        acc = (preds.shift(1).rolling(50, min_periods=1)
-               .apply(lambda x: (x == labels.shift(1).loc[x.index]).mean(), raw=False))
-        hist[f"acc{i+1}"] = acc
-
-    # Features: p1-p5 + acc1-acc5
     X = hist[[f"m{i+1}" for i in range(5)] + [f"acc{i+1}" for i in range(5)]].values
     y = hist['meta_label'].values
-
     split = int(len(y) * 0.8)
     X_train, y_train = X[:split], y[:split]
     X_val, y_val     = X[split:], y[split:]
-
     meta = LogisticRegression().fit(X_train, y_train)
     probs_val = meta.predict_proba(X_val)[:,1]
     up, down = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
-
     with open(model_pkl, 'wb') as f:
         pickle.dump(meta, f)
     with open(threshold_pkl, 'wb') as f:
         pickle.dump({'up': up, 'down': down}, f)
-
     return meta, up, down
 
 
-
-def backtest_submodels(df: pd.DataFrame, initial_frac=0.8) -> pd.DataFrame:
+def backtest_submodels(df: pd.DataFrame, initial_frac=0.8, window=50) -> pd.DataFrame:
     """
-    Walk-forward backtest of submodels.
-    For each bar, saves: [predictions..., labels..., main close-to-close label]
+    Walk-forward backtest of submodels. Outputs only predictions, rolling accuracies, and meta-label.
     """
-    n   = len(df)
+    n = len(df)
     cut = int(n * initial_frac)
     rec = []
+
+    # Rolling histories for accuracy computation
+    preds_history = [[] for _ in range(5)]
+    labels_history = [[] for _ in range(5)]
+
     for t in tqdm(range(cut, n-1), desc="Submodel BT"):
         slice_df = df.iloc[:t+1].reset_index(drop=True)
-        # --- Model 1 (Momentum)
-        d1  = mod1.compute_labels(slice_df)
-        tr1 = d1.iloc[:-1].dropna(subset=mod1.FEATURES + ['label'])
-        p1  = mod1.predict(mod1.fit(tr1[mod1.FEATURES].values, tr1['label'].values),
-                           d1.loc[[t], mod1.FEATURES])[0]
-        label1 = d1['label'].iloc[-1]
-
-        # --- Model 2 (Trend Continuation)
-        d2  = mod2.compute_labels(slice_df)
-        tr2 = d2.iloc[:-1].dropna(subset=mod2.FEATURES + ['label'])
-        p2  = mod2.predict(mod2.fit(tr2[mod2.FEATURES], tr2['label']),
-                           d2.loc[[t], mod2.FEATURES])[0]
-        label2 = d2['label'].iloc[-1]
-
-        # --- Model 3 (Mean Reversion)
-        d3  = mod3.compute_labels(slice_df)
-        tr3 = d3.iloc[:-1].dropna(subset=mod3.FEATURES + ['label'])
-        p3  = mod3.predict(mod3.fit(tr3[mod3.FEATURES].values, tr3['label'].values),
-                           d3.loc[[t], mod3.FEATURES])[0]
-        label3 = d3['label'].iloc[-1]
-
-        # --- Model 4 (Lagged Return)
-        d4  = mod4.compute_target(slice_df)
-        tr4 = d4.iloc[:-1].dropna(subset=mod4.FEATURES + ['target'])
-        p4  = mod4.predict(mod4.fit(tr4[mod4.FEATURES], tr4['target']),
-                           d4.loc[[t], mod4.FEATURES])[0]
-        # Here, decide if you want a direction label (e.g., up/down) or regression value.
-        # For classification-style meta, convert regression to direction label:
-        label4 = int(d4['target'].iloc[-1] > 0)
-
-        # --- Model 5 (Sentiment/Volume)
-        d5  = mod5.compute_labels(slice_df)
-        tr5 = d5.iloc[:-1].dropna(subset=mod5.FEATURES + ['label'])
-        p5  = mod5.predict(mod5.fit(tr5[mod5.FEATURES], tr5['label']),
-                           d5.loc[[t], mod5.FEATURES])[0]
-        label5 = d5['label'].iloc[-1]
-
-        # Main close-to-close label (for overall direction)
-        label = int(slice_df['close'].iat[-1] > slice_df['close'].iat[-2])
-
+        preds = []
+        labels = []
+        # Submodel predictions and true (not stored) labels
+        for idx, mod in enumerate([mod1, mod2, mod3, mod4, mod5]):
+            if hasattr(mod, 'compute_labels'):
+                d = mod.compute_labels(slice_df)
+                tr = d.iloc[:-1].dropna(subset=mod.FEATURES + ['label'])
+                pred = mod.predict(mod.fit(tr[mod.FEATURES].values, tr['label'].values), d.loc[[t], mod.FEATURES])[0]
+                label = d['label'].iloc[-1]
+            elif hasattr(mod, 'compute_target'):
+                d = mod.compute_target(slice_df)
+                tr = d.iloc[:-1].dropna(subset=mod.FEATURES + ['target'])
+                pred = mod.predict(mod.fit(tr[mod.FEATURES], tr['target']), d.loc[[t], mod.FEATURES])[0]
+                label = int(d['target'].iloc[-1] > 0)
+            preds.append(pred)
+            labels.append(label)
+        # Update rolling histories
+        for idx in range(5):
+            preds_history[idx].append(preds[idx])
+            labels_history[idx].append(labels[idx])
+        # Rolling accuracy up to t-1
+        accs = []
+        for idx in range(5):
+            ph = np.array(preds_history[idx][-window-1:-1])
+            lh = np.array(labels_history[idx][-window-1:-1])
+            if len(ph) > 0 and len(lh) > 0:
+                acc = (np.round(ph) == lh).mean()
+            else:
+                acc = 0.5
+            accs.append(acc)
+        # Meta-label: did close go up at t+1?
+        if t+1 < n:
+            meta_label = int(df['close'].iat[t+1] > df['close'].iat[t])
+        else:
+            meta_label = np.nan
         rec.append({
-            't':t, 'm1':p1, 'm2':p2, 'm3':p3, 'm4':p4, 'm5':p5,
-            'label1': label1, 'label2': label2, 'label3': label3, 'label4': label4, 'label5': label5,
-            'label': label
+            't': t,
+            'm1': preds[0], 'm2': preds[1], 'm3': preds[2], 'm4': preds[3], 'm5': preds[4],
+            'acc1': accs[0], 'acc2': accs[1], 'acc3': accs[2], 'acc4': accs[3], 'acc5': accs[4],
+            'meta_label': meta_label
         })
-
     return pd.DataFrame(rec).set_index('t')
+
 
 
 def run_backtest(return_df=False):
@@ -306,16 +304,10 @@ def run_backtest(return_df=False):
         meta_pkl  = os.path.join(RESULTS_DIR, "meta_model.pkl")
         thresh_pkl = os.path.join(RESULTS_DIR, "meta_thresholds.pkl")
 
-        # Build or load cache
-        if os.path.exists(cache_csv):
-            rec = pd.read_csv(cache_csv)
-            rec['timestamp'] = pd.to_datetime(rec['timestamp'], utc=True)
-        else:
-            rec = backtest_submodels(df_orig, initial_frac=0.8).reset_index().rename(columns={'index':'t'})
-            rec['timestamp'] = pd.to_datetime(df_orig['timestamp'].iloc[rec['t'] + 1])
-            rec = rec[['timestamp','m1','m2','m3','m4','m5','label1','label2','label3','label4','label5','label']]
-            rec.to_csv(cache_csv, index=False)
-
+        submods = [mod1, mod2, mod3, mod4, mod5]
+        # Always rebuild or update meta-history cache properly
+        hist = update_submeta_history(CSV_PATH, cache_csv, submods, verbose=True)
+        
         # Train or load meta-model and thresholds
         if os.path.exists(meta_pkl) and os.path.exists(thresh_pkl):
             with open(meta_pkl, 'rb') as f:
@@ -327,105 +319,43 @@ def run_backtest(return_df=False):
         else:
             meta, up, down = train_and_save_meta(cache_csv, meta_pkl, thresh_pkl)
 
-        # Walk-forward meta backtest (500-bar lookback)
+        # Backtest using only the cached predictions and rolling accuracies
+        hist = pd.read_csv(cache_csv)
+        X = hist[[f"m{i+1}" for i in range(5)] + [f"acc{i+1}" for i in range(5)]].values
+        y = hist['meta_label'].values
+
         records = []
-        meta_hist = pd.DataFrame(columns=[f"m{i+1}" for i in range(5)] + [f"label_m{i+1}" for i in range(5)])
-        n = len(df_orig)
-        window_size = 500
-        start = n - window_size
-        end   = n - 1
-
-        for i in tqdm(range(start, end), desc="Meta Backtest", total=end - start):
-            window_df = df_orig.iloc[i - window_size : i + 1].reset_index(drop=True)
-            t = len(window_df) - 1
-
-            d1 = mod1.compute_labels(window_df)
-            p1 = mod1.predict(
-                mod1.fit(d1.iloc[:-1][mod1.FEATURES].values,
-                        d1.iloc[:-1]['label'].values),
-                d1.loc[[t], mod1.FEATURES]
-            )[0]
-            d2 = mod2.compute_labels(window_df)
-            p2 = mod2.predict(
-                mod2.fit(d2.iloc[:-1][mod2.FEATURES], d2.iloc[:-1]['label']),
-                d2.loc[[t], mod2.FEATURES]
-            )[0]
-            d3 = mod3.compute_labels(window_df)
-            p3 = mod3.predict(
-                mod3.fit(d3.iloc[:-1][mod3.FEATURES], d3.iloc[:-1]['label']),
-                d3.loc[[t], mod3.FEATURES]
-            )[0]
-            d4 = mod4.compute_target(window_df)
-            p4 = mod4.predict(
-                mod4.fit(d4.iloc[:-1][mod4.FEATURES], d4.iloc[:-1]['target']),
-                d4.loc[[t], mod4.FEATURES]
-            )[0]
-            d5 = mod5.compute_labels(window_df)
-            p5 = mod5.predict(
-                mod5.fit(d5.iloc[:-1][mod5.FEATURES], d5.iloc[:-1]['label']),
-                d5.loc[[t], mod5.FEATURES]
-            )[0]
-
-            # GET SUBMODEL LABELS FOR THIS WINDOW
-            label1 = d1['label'].iloc[-1]
-            label2 = d2['label'].iloc[-1]
-            label3 = d3['label'].iloc[-1]
-            label4 = int(d4['target'].iloc[-1] > 0)
-            label5 = d5['label'].iloc[-1]
-
-            # Save current predictions and labels to meta_hist (excluding future info)
-            cur_row = {f"m{i+1}": p for i, p in enumerate([p1, p2, p3, p4, p5])}
-            cur_row.update({f"label_m{i+1}": l for i, l in enumerate([label1, label2, label3, label4, label5])})
-            meta_hist = pd.concat([meta_hist, pd.DataFrame([cur_row])], ignore_index=True)
-
-            # Calculate rolling accs using meta_hist, up to previous bar
-            accs = []
-            for i in range(5):
-                recent_preds = meta_hist[f"m{i+1}"].iloc[-51:-1] if len(meta_hist) > 1 else []
-                recent_labels = meta_hist[f"label_m{i+1}"].iloc[-51:-1] if len(meta_hist) > 1 else []
-                if len(recent_preds) > 0 and len(recent_labels) > 0:
-                    acc = (recent_preds.round() == recent_labels).mean()
-                else:
-                    acc = 0.5
-                accs.append(acc)
-            meta_input = np.array([p1, p2, p3, p4, p5] + accs).reshape(1, -1)
-
-
+        for i in tqdm(range(len(hist)), desc="Meta Backtest"):
+            meta_input = X[i].reshape(1, -1)
             prob = float(meta.predict_proba(meta_input)[0,1])
-
             if prob > up:
                 action = "BUY"
             elif prob < down:
                 action = "SELL"
             else:
                 action = "HOLD"
-            ts = pd.to_datetime(df_orig['timestamp'].iat[i + 1])
-
             records.append({
-                "timestamp": ts,
-                "m1":        p1,
-                "m2":        p2,
-                "m3":        p3,
-                "m4":        p4,
-                "m5":        p5,
-                "label1":    label1,
-                "label2":    label2,
-                "label3":    label3,
-                "label4":    label4,
-                "label5":    label5,
+                "timestamp": hist['timestamp'].iloc[i],
+                "m1": hist['m1'].iloc[i],
+                "m2": hist['m2'].iloc[i],
+                "m3": hist['m3'].iloc[i],
+                "m4": hist['m4'].iloc[i],
+                "m5": hist['m5'].iloc[i],
+                "acc1": hist['acc1'].iloc[i],
+                "acc2": hist['acc2'].iloc[i],
+                "acc3": hist['acc3'].iloc[i],
+                "acc4": hist['acc4'].iloc[i],
+                "acc5": hist['acc5'].iloc[i],
                 "meta_prob": prob,
-                "action":    action
+                "action": action
             })
 
-            back = pd.DataFrame(records)
-            df_out = back[['timestamp','m1','m2','m3','m4','m5','action']]
-
-    out_fn = os.path.join(RESULTS_DIR, f"meta_results_{MODE}.csv")
-    df_out.to_csv(out_fn, index=False, float_format="%.8f")
-    print(f"[RESULT] Results saved to {out_fn}")
-
-    if return_df:
-        return df_out
+        df_out = pd.DataFrame(records)
+        out_fn = os.path.join(RESULTS_DIR, f"meta_results_{MODE}.csv")
+        df_out.to_csv(out_fn, index=False, float_format="%.8f")
+        print(f"[RESULT] Results saved to {out_fn}")
+        if return_df:
+            return df_out
 
 def run_live(return_result=False, verbose=True):
     """
@@ -477,47 +407,38 @@ def run_live(return_result=False, verbose=True):
     # --------- SUB-META MODE ---------
     # 1. Update meta-history with any new bars
     hist = update_submeta_history(CSV_PATH, HISTORY_PATH, submods, verbose=verbose)
-
-    # 2. Retrain meta-model and optimize thresholds
-    X = hist[['m1', 'm2', 'm3', 'm4', 'm5', 'label1', 'label2', 'label3', 'label4', 'label5']].values
-    y = hist['label'].values
-    if len(y) < 20:  # Need at least 20 samples
+    X = hist[[f"m{i+1}" for i in range(5)] + [f"acc{i+1}" for i in range(5)]].values
+    y = hist['meta_label'].values
+    if len(y) < 20:
         raise RuntimeError("Not enough meta-history for training!")
     split = int(len(y) * 0.8)
     X_train, y_train = X[:split], y[:split]
     X_val, y_val     = X[split:], y[split:]
     meta = LogisticRegression().fit(X_train, y_train)
     probs_val = meta.predict_proba(X_val)[:,1]
-
-    # Use your existing optimize_asymmetric_thresholds here
     up, down = optimize_asymmetric_thresholds(probs_val, y_val, metric="accuracy")
     if verbose:
         print(f"[THRESH] (Live) Optimized: BUY > {up:.4f}, SELL < {down:.4f}")
 
-    # 3. Run the *current* submodels on the newest bar
+    # Current submodel preds
     p = []
-    labels = []
     for idx, mod in enumerate(submods):
         if hasattr(mod, 'compute_labels'):
             d = mod.compute_labels(df)
             tr = d.iloc[:-1].dropna(subset=mod.FEATURES + ['label'])
             pi = mod.predict(mod.fit(tr[mod.FEATURES].values, tr['label'].values), d.loc[[t], mod.FEATURES])[0]
-            label_i = d['label'].iloc[-1]
         elif hasattr(mod, 'compute_target'):
             d = mod.compute_target(df)
             tr = d.iloc[:-1].dropna(subset=mod.FEATURES + ['target'])
             pi = mod.predict(mod.fit(tr[mod.FEATURES], tr['target']), d.loc[[t], mod.FEATURES])[0]
-            label_i = d['target'].iloc[-1]
         p.append(pi)
-        labels.append(label_i)
-    # Combine for meta input:
-    # After updating hist as in train_and_save_meta
-    accs = []   
+    # Rolling accuracy (using last 50 points in history)
+    accs = []
     for i in range(5):
-        recent_preds = hist[f"m{i+1}"].iloc[-50:-1] if len(hist) > 1 else []
-        recent_labels = hist[f"label_m{i+1}"].iloc[-50:-1] if len(hist) > 1 else []
-        if len(recent_preds) > 0 and len(recent_labels) > 0:
-            acc = (recent_preds.round() == recent_labels).mean()
+        preds = hist[f"m{i+1}"].values[-50:] if len(hist) > 1 else []
+        labels = hist['meta_label'].values[-50:] if len(hist) > 1 else []
+        if len(preds) > 0 and len(labels) > 0:
+            acc = (np.round(preds) == labels).mean()
         else:
             acc = 0.5
         accs.append(acc)

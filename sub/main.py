@@ -250,7 +250,7 @@ def backtest_submodels(df: pd.DataFrame, initial_frac=0.8) -> pd.DataFrame:
         label4 = int(d4['target'].iloc[-1] > 0)
 
         # --- Model 5 (Sentiment/Volume)
-        d5  = mod5.compute_labels(slice_df, min_return=0.002)
+        d5  = mod5.compute_labels(slice_df)
         tr5 = d5.iloc[:-1].dropna(subset=mod5.FEATURES + ['label'])
         p5  = mod5.predict(mod5.fit(tr5[mod5.FEATURES], tr5['label']),
                            d5.loc[[t], mod5.FEATURES])[0]
@@ -352,7 +352,7 @@ def run_backtest(return_df=False):
                 mod4.fit(d4.iloc[:-1][mod4.FEATURES], d4.iloc[:-1]['target']),
                 d4.loc[[t], mod4.FEATURES]
             )[0]
-            d5 = mod5.compute_labels(window_df, min_return=0.002)
+            d5 = mod5.compute_labels(window_df)
             p5 = mod5.predict(
                 mod5.fit(d5.iloc[:-1][mod5.FEATURES], d5.iloc[:-1]['label']),
                 d5.loc[[t], mod5.FEATURES]
@@ -431,7 +431,7 @@ def run_live(return_result=False, verbose=True):
         d4 = mod4.compute_target(df)
         tr4 = d4.iloc[:-1].dropna(subset=mod4.FEATURES+['target'])
         p4 = mod4.predict(mod4.fit(tr4[mod4.FEATURES], tr4['target']), d4.loc[[t], mod4.FEATURES])[0]
-        d5 = mod5.compute_labels(df, min_return=0.002)
+        d5 = mod5.compute_labels(df)
         tr5 = d5.iloc[:-1].dropna(subset=mod5.FEATURES+['label'])
         p5 = mod5.predict(mod5.fit(tr5[mod5.FEATURES], tr5['label']), d5.loc[[t], mod5.FEATURES])[0]
         votes = [

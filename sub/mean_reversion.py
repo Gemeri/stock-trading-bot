@@ -20,7 +20,10 @@ Also exposes two functions for meta‐modeling:
 import os
 import numpy as np
 import pandas as pd
+import logging
+import argparse
 
+import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 
@@ -74,74 +77,49 @@ def max_drawdown(equity):
 
 # ─── Fit & Predict for Meta‐Model ───────────────────────────────────────────────
 
-def fit(df, n_back=500, window=500, holdout_frac=0.2):
+def fit(X_train: np.ndarray, y_train: np.ndarray) -> RandomForestClassifier:
     """
-    1) compute_labels on entire df
-    2) tune RF on df[:-n_back]
-    3) simulate walk‐forward on last n_back bars to get probabilities
-    4) pick 90th percentile of val‐slice as threshold
-
-    Returns a `state` dict with:
-      • state['best_params']
-      • state['p_star']
+    Grid-search CV on (X_train, y_train) to tune hyperparameters,
+    then return the best-fitted RandomForestClassifier.
     """
-    df2 = compute_labels(df).reset_index(drop=True)
-
-    # 2) hyperparam tuning
-    hyper = df2.iloc[:-n_back]
-    Xh, yh = hyper[FEATURES].values, hyper['label'].values
+    logging.info("Running FIT on mean_reversion")
+    # time-series CV splitter
     tscv = TimeSeriesSplit(n_splits=5)
-    rf   = RandomForestClassifier(
-        class_weight='balanced', random_state=42, n_jobs=-1
+
+    # base classifier
+    base = RandomForestClassifier(
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1
     )
-    grid = GridSearchCV(rf, PARAM_GRID, cv=tscv,
-                        scoring='roc_auc', n_jobs=-1, verbose=1)
-    grid.fit(Xh, yh)
-    best = grid.best_params_
 
-    # 3) walk‐forward to collect probs
-    records = []
-    start = len(df2) - n_back - 2
-    end   = len(df2) - 2
-    for t in range(start, end):
-        tr0 = max(0, t - window)
-        tr1 = t - 1
-        train = df2.iloc[tr0:tr1+1]
-        model = RandomForestClassifier(
-            **best, class_weight='balanced', random_state=42, n_jobs=-1
-        )
-        model.fit(train[FEATURES], train['label'])
-        pt = model.predict_proba(df2.loc[[t], FEATURES])[:,1][0]
-        records.append(pt)
-    back = pd.DataFrame({'prob': records})
-    
-    # 4) 90th‐percentile threshold on first val slice
-    nv = int(len(back) * holdout_frac)
-    p_star = back['prob'].iloc[:nv].quantile(0.90)
-
-    return {'best_params': best, 'p_star': float(p_star)}
-
-def predict(df, t, state, window=500):
-    """
-    For bar index t, retrain on the preceding `window` bars
-    and return the probability of snap‐back.
-    """
-    df2 = compute_labels(df).reset_index(drop=True)
-    best = state['best_params']
-    tr0  = max(0, t - window)
-    tr1  = t - 1
-    train = df2.iloc[tr0:tr1+1]
-    model = RandomForestClassifier(
-        **best, class_weight='balanced', random_state=42, n_jobs=-1
+    # grid-search
+    grid = GridSearchCV(
+        estimator=base,
+        param_grid=PARAM_GRID,
+        cv=tscv,
+        scoring='roc_auc',
+        n_jobs=-1,
+        verbose=1
     )
-    model.fit(train[FEATURES], train['label'])
-    return model.predict_proba(df2.loc[[t], FEATURES])[:,1][0]
+    grid.fit(X_train, y_train)
+
+    # return the best estimator (already fitted)
+    return grid.best_estimator_
+
+
+def predict(model: RandomForestClassifier, X: np.ndarray) -> np.ndarray:
+    """
+    Given a fitted RandomForestClassifier and feature matrix X
+    (n_samples × n_features), return the probability of the 'snap-back'
+    class for each row.
+    """
+    logging.info("Running PREDICT on mean_reversion")
+    return model.predict_proba(X)[:, 1]
 
 # ─── Stand‐Alone Backtest Entrypoint ───────────────────────────────────────────
 
 if __name__=="__main__":
-    import argparse
-    import matplotlib.pyplot as plt
     from tqdm import tqdm
     from sklearn.metrics import accuracy_score, roc_auc_score
 
@@ -161,48 +139,83 @@ if __name__=="__main__":
     p.add_argument("--stop_loss",    type=float, default=0.02,
                    help="Stop‐loss pct (absolute on raw return)")
     p.add_argument("--take_profit",  type=float, default=0.05,
-                   help="Take-profit pct (absolute on raw return)")
+                   help="Take‐profit pct (absolute on raw return)")
     args = p.parse_args()
 
-    # full backtest, exactly as before
+    # 1) Load & label
     df = pd.read_csv(args.input_csv).reset_index(drop=True)
     df = compute_labels(df).reset_index(drop=True)
 
-    state = fit(df,
-                n_back=args.n_back,
-                window=args.window,
-                holdout_frac=args.holdout_frac)
+    # 2) Hyperparameter tuning on all but the last n_back bars
+    df2 = df.copy()
+    hyper = df2.iloc[:-args.n_back]
+    X_h, y_h = hyper[FEATURES].values, hyper['label'].values
 
+    # fit returns a fitted RandomForestClassifier
+    model = fit(X_h, y_h)
+    best_params = model.get_params()
+    print("Best hyperparameters:", {k: best_params[k] for k in PARAM_GRID})
+
+    # 3) True i+1 walk‐forward on last n_back bars
     records = []
     start = len(df) - args.n_back - 2
     end   = len(df) - 2
-    for t in tqdm(range(start, end),
-                  desc="WF backtest", unit="bar"):
-        pt = predict(df, t, state, window=args.window)
+
+    for t in tqdm(range(start, end), desc="WF backtest", unit="bar"):
+        # rolling‐window train slice
+        tr0, tr1 = max(0, t - args.window), t - 1
+        train = df.iloc[tr0:tr1+1]
+        X_tr, y_tr = train[FEATURES].values, train['label'].values
+
+        # retrain fresh model with best_params
+        m = RandomForestClassifier(
+            **{k: best_params[k] for k in PARAM_GRID},
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=-1
+        )
+        m.fit(X_tr, y_tr)
+
+        # predict snap‐back prob on bar t
+        x_t = df.loc[[t], FEATURES].values
+        p_t = predict(m, x_t)[0]
+
+        # simulate PnL: entry at open t+1, exit at open t+2
         op1 = df.at[t+1, 'open']
         op2 = df.at[t+2, 'open']
-        sign = +1 if df.at[t, 'close'] < df.at[t, 'mean_band'] else -1
-        raw = sign * (op2 - op1) / op1
+        raw   = ((op2 - op1) / op1)
         clipped = np.clip(raw, -args.stop_loss, args.take_profit)
-        net = clipped - (args.commission + args.slippage)
-        records.append({'t':t, 'prob':pt, 'label':df.at[t,'label'], 'net_ret':net})
+        net_ret = clipped - (args.commission + args.slippage)
+
+        records.append({'t':t, 'prob':p_t, 'label':df.at[t,'label'], 'net_ret':net_ret})
 
     back = pd.DataFrame(records).set_index('t')
-    # apply threshold
-    nv   = int(len(back)*args.holdout_frac)
-    val  = back.iloc[:nv]
+
+    # 4) Threshold tuning on validation slice
+    nv  = int(len(back) * args.holdout_frac)
+    val = back.iloc[:nv]
+    best = {'sharpe': -np.inf, 'thresh': None}
+    for thr in np.linspace(0.50, 0.90, 41):
+        sel = val[val['prob'] > thr]
+        if sel.empty: continue
+        sh = sharpe(sel['net_ret'])
+        if sh > best['sharpe']:
+            best = {'sharpe': sh, 'thresh': thr}
+    p_star = best['thresh']
+    print(f"Optimized p* = {p_star:.3f}  (val Sharpe={best['sharpe']:.2f})")
+
+    # 5) Evaluate on test slice
     test = back.iloc[nv:]
-    p_star = state['p_star']
-    sel = test[test['prob'] > p_star]
+    sel  = test[test['prob'] > p_star]
     rets = sel['net_ret']
-    eq   = (1+rets).cumprod()
+    eq   = (1 + rets).cumprod()
 
     # metrics
-    total   = eq.iloc[-1] - 1
-    sr      = sharpe(rets)
-    mdd     = max_drawdown(eq)
-    acc     = accuracy_score(test['label'], (test['prob']>p_star).astype(int))
-    auc     = roc_auc_score(test['label'], test['prob'])
+    total = eq.iloc[-1] - 1
+    sr    = sharpe(rets)
+    mdd   = max_drawdown(eq)
+    acc   = accuracy_score(test['label'], (test['prob']>p_star).astype(int))
+    auc   = roc_auc_score(test['label'], test['prob'])
 
     # save
     os.makedirs(args.output_dir, exist_ok=True)
@@ -213,11 +226,12 @@ if __name__=="__main__":
     plt.tight_layout()
     plt.savefig(os.path.join(args.output_dir, "equity_curve.png"))
 
+    # summary
     print("\n=== Test‐Slice Performance ===")
     print(f"Trades taken       = {len(rets)}")
     print(f"Total return       = {total*100: .2f}%")
     print(f"Sharpe (ann.)      = {sr:.2f}")
-    print(f"Max drawdown       = {mdd*100: .2f}%")
+    print(f"Max drawdown       = {mdd*100:.2f}%")
     print(f"Accuracy @ p*      = {acc:.3f}")
     print(f"ROC-AUC            = {auc:.3f}")
     print(f"Results saved to   = {args.output_dir}")

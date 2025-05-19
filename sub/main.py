@@ -184,13 +184,19 @@ def train_and_save_meta(
 ) -> Tuple[LogisticRegression, float, float]:
     """
     Train meta-model using submodel history.
-    Use last 20% for threshold optimization.
-    Save model and thresholds separately.
-    Now meta uses m1..m5 and label_m1..label_m5 as features!
+    Adds rolling accuracy for each submodel as features.
     """
     hist = pd.read_csv(cache_csv)
-    # Use predictions AND their proper submodel labels as features!
-    X = hist[[f"m{i+1}" for i in range(5)] + [f"label_m{i+1}" for i in range(5)]].values
+    # Calculate rolling accuracy for each submodel (up to t-1)
+    for i in range(5):
+        preds = hist[f"m{i+1}"]
+        labels = hist[f"label_m{i+1}"]
+        acc = (preds.shift(1).rolling(50, min_periods=1)
+               .apply(lambda x: (x == labels.shift(1).loc[x.index]).mean(), raw=False))
+        hist[f"acc{i+1}"] = acc
+
+    # Features: p1-p5 + acc1-acc5
+    X = hist[[f"m{i+1}" for i in range(5)] + [f"acc{i+1}" for i in range(5)]].values
     y = hist['meta_label'].values
 
     split = int(len(y) * 0.8)
@@ -207,6 +213,7 @@ def train_and_save_meta(
         pickle.dump({'up': up, 'down': down}, f)
 
     return meta, up, down
+
 
 
 def backtest_submodels(df: pd.DataFrame, initial_frac=0.8) -> pd.DataFrame:
@@ -322,6 +329,7 @@ def run_backtest(return_df=False):
 
         # Walk-forward meta backtest (500-bar lookback)
         records = []
+        meta_hist = pd.DataFrame(columns=[f"m{i+1}" for i in range(5)] + [f"label_m{i+1}" for i in range(5)])
         n = len(df_orig)
         window_size = 500
         start = n - window_size
@@ -365,7 +373,24 @@ def run_backtest(return_df=False):
             label4 = int(d4['target'].iloc[-1] > 0)
             label5 = d5['label'].iloc[-1]
 
-            meta_input = np.array([p1, p2, p3, p4, p5, label1, label2, label3, label4, label5]).reshape(1, -1)
+            # Save current predictions and labels to meta_hist (excluding future info)
+            cur_row = {f"m{i+1}": p for i, p in enumerate([p1, p2, p3, p4, p5])}
+            cur_row.update({f"label_m{i+1}": l for i, l in enumerate([label1, label2, label3, label4, label5])})
+            meta_hist = pd.concat([meta_hist, pd.DataFrame([cur_row])], ignore_index=True)
+
+            # Calculate rolling accs using meta_hist, up to previous bar
+            accs = []
+            for i in range(5):
+                recent_preds = meta_hist[f"m{i+1}"].iloc[-51:-1] if len(meta_hist) > 1 else []
+                recent_labels = meta_hist[f"label_m{i+1}"].iloc[-51:-1] if len(meta_hist) > 1 else []
+                if len(recent_preds) > 0 and len(recent_labels) > 0:
+                    acc = (recent_preds.round() == recent_labels).mean()
+                else:
+                    acc = 0.5
+                accs.append(acc)
+            meta_input = np.array([p1, p2, p3, p4, p5] + accs).reshape(1, -1)
+
+
             prob = float(meta.predict_proba(meta_input)[0,1])
 
             if prob > up:
@@ -486,7 +511,18 @@ def run_live(return_result=False, verbose=True):
         p.append(pi)
         labels.append(label_i)
     # Combine for meta input:
-    meta_input = np.array(p + labels).reshape(1, -1)
+    # After updating hist as in train_and_save_meta
+    accs = []   
+    for i in range(5):
+        recent_preds = hist[f"m{i+1}"].iloc[-50:-1] if len(hist) > 1 else []
+        recent_labels = hist[f"label_m{i+1}"].iloc[-50:-1] if len(hist) > 1 else []
+        if len(recent_preds) > 0 and len(recent_labels) > 0:
+            acc = (recent_preds.round() == recent_labels).mean()
+        else:
+            acc = 0.5
+        accs.append(acc)
+    meta_input = np.array(p + accs).reshape(1, -1)
+
     prob = float(meta.predict_proba(meta_input)[0,1])
     if prob > up:
         action = "BUY"

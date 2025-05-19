@@ -75,11 +75,13 @@ def max_drawdown(equity: pd.Series) -> float:
     return ((equity - roll_max) / roll_max).min()
 
 def fit(X_train: pd.DataFrame, y_train: pd.Series) -> LGBMClassifier:
+    logging.info("Running FIT on sentiment_volume")
     model = LGBMClassifier(**LGBM_PARAMS)
     model.fit(X_train, y_train)
     return model
 
 def predict(model: LGBMClassifier, X: pd.DataFrame) -> np.ndarray:
+    logging.info("Running PREDICT on sentiment_volume")
     return model.predict_proba(X)[:, 1]
 
 # ─── Main backtest ─────────────────────────────────────────────────────────────

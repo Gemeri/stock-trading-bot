@@ -128,7 +128,7 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH, submods, window=50, verbose=T
             else:
                 acc = 0.5
             accs.append(acc)
-        meta_label = int(slice_df['close'].iat[-1] > slice_df['close'].iat[-2])
+        meta_label = int(df['close'].iat[i+1] > df['close'].iat[i])
         rec = {'timestamp': slice_df['timestamp'].iat[-1]}
         rec.update({f"m{i+1}": preds[i] for i in range(5)})
         rec.update({f"acc{i+1}": accs[i] for i in range(5)})
@@ -297,7 +297,7 @@ def run_backtest(return_df=False):
         )
         back = back.reset_index().rename(columns={'index':'t'})
         back['timestamp'] = pd.to_datetime(df_orig['timestamp'].iloc[back['t'] + 1])
-        df_out = back[['timestamp','m1','m2','m3','m4','m5','meta_prob','action']]
+        df_out = back[['timestamp','m1','m2','m3','m4','m5','action']]
 
     else:  # sub-meta mode
         cache_csv = os.path.join(RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv")
@@ -359,9 +359,10 @@ def run_backtest(return_df=False):
 
 def run_live(return_result=False, verbose=True):
     """
-    Live mode: 
+    Live mode:
     - For sub-vote: outputs final vote (classic).
     - For sub-meta: updates meta-history, retrains meta-model, optimizes thresholds, outputs live action.
+    Rolling accuracy per submodel is computed against each submodel's OWN label/target, not meta-label.
     """
     # --- Setup paths and submodels ---
     submods = [mod1, mod2, mod3, mod4, mod5]
@@ -420,29 +421,47 @@ def run_live(return_result=False, verbose=True):
     if verbose:
         print(f"[THRESH] (Live) Optimized: BUY > {up:.4f}, SELL < {down:.4f}")
 
-    # Current submodel preds
+    # 2. Compute current submodel predictions on the newest bar
     p = []
+    rolling_accs = []
+    window = 50  # Rolling window for accuracy
     for idx, mod in enumerate(submods):
+        # Compute predictions and rolling accuracy per submodel
         if hasattr(mod, 'compute_labels'):
             d = mod.compute_labels(df)
             tr = d.iloc[:-1].dropna(subset=mod.FEATURES + ['label'])
             pi = mod.predict(mod.fit(tr[mod.FEATURES].values, tr['label'].values), d.loc[[t], mod.FEATURES])[0]
+            # Rolling accuracy: use d['label'], d['pred'] for the last 50 bars before t
+            past_labels = d['label'].iloc[-(window+1):-1].values  # up to t-1
+            past_preds = d['label'].iloc[-(window+1):-1].index.map(
+                lambda idx_: mod.predict(
+                    mod.fit(d.iloc[:idx_][mod.FEATURES].values, d.iloc[:idx_]['label'].values),
+                    d.loc[[idx_], mod.FEATURES]
+                )[0]
+            ).values if len(d) > window else np.array([])
+            if len(past_labels) > 0 and len(past_preds) == len(past_labels):  # safe fallback
+                acc = (np.round(past_preds) == past_labels).mean() if len(past_preds) > 0 else 0.5
+            else:
+                acc = 0.5
         elif hasattr(mod, 'compute_target'):
             d = mod.compute_target(df)
             tr = d.iloc[:-1].dropna(subset=mod.FEATURES + ['target'])
             pi = mod.predict(mod.fit(tr[mod.FEATURES], tr['target']), d.loc[[t], mod.FEATURES])[0]
+            # For regression, label is direction: >0 is up
+            past_labels = (d['target'].iloc[-(window+1):-1].values > 0).astype(int)
+            past_preds = d['target'].iloc[-(window+1):-1].index.map(
+                lambda idx_: int(mod.predict(
+                    mod.fit(d.iloc[:idx_][mod.FEATURES], d.iloc[:idx_]['target']),
+                    d.loc[[idx_], mod.FEATURES]
+                )[0] > 0)
+            ).values if len(d) > window else np.array([])
+            if len(past_labels) > 0 and len(past_preds) == len(past_labels):
+                acc = (np.round(past_preds) == past_labels).mean() if len(past_preds) > 0 else 0.5
+            else:
+                acc = 0.5
         p.append(pi)
-    # Rolling accuracy (using last 50 points in history)
-    accs = []
-    for i in range(5):
-        preds = hist[f"m{i+1}"].values[-50:] if len(hist) > 1 else []
-        labels = hist['meta_label'].values[-50:] if len(hist) > 1 else []
-        if len(preds) > 0 and len(labels) > 0:
-            acc = (np.round(preds) == labels).mean()
-        else:
-            acc = 0.5
-        accs.append(acc)
-    meta_input = np.array(p + accs).reshape(1, -1)
+        rolling_accs.append(acc)
+    meta_input = np.array(p + rolling_accs).reshape(1, -1)
 
     prob = float(meta.predict_proba(meta_input)[0,1])
     if prob > up:

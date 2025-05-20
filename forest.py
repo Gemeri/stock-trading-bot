@@ -1063,7 +1063,6 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
     # 10. Decide which models to run
     ml_models = parse_ml_models()
 
-    print(df_full)
     # 11. If using sub-logic, hand off the FULL df_full (with newest row) to sub/main.py
     if "sub-vote" in ml_models or "sub-meta" in ml_models:
         mode   = "sub-vote" if "sub-vote" in ml_models else "sub-meta"

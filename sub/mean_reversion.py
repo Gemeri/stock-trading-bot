@@ -37,9 +37,9 @@ FEATURES = [
 ]
 
 PARAM_GRID = {
-    'n_estimators':     [250, 500, 1000],
+    'n_estimators':     [250],
     'max_depth':        [5, 10, 20],
-    'min_samples_leaf': [1, 3, 5],
+    'min_samples_leaf': [1],
     'max_features':     [len(FEATURES)]
 }
 

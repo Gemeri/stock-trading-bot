@@ -37,11 +37,11 @@ FEATURES = [
 
 # 2) Hyperparameter grid for tuning
 PARAM_GRID = {
-    'n_estimators':     [100, 250, 500],
-    'max_depth':        [3, 6, 10],
-    'learning_rate':    [0.01, 0.1],
-    'subsample':        [0.8, 1.0],
-    'colsample_bytree': [0.8, 1.0]
+    'n_estimators':     [100],
+    'max_depth':        [10],
+    'learning_rate':    [0.05],
+    'subsample':        [0.8],
+    'colsample_bytree': [0.8]
 }
 
 

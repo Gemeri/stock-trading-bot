@@ -25,3 +25,4 @@ gplearn
 scikit-optimize
 pysr
 tqdm
+lightgbm

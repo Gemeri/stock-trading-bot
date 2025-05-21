@@ -29,8 +29,6 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 from alpaca_trade_api.rest import REST, QuoteV2, APIError
 import lightgbm as lgb
-import time
-
 
 # LSTM/TF/Keras for deep learning models
 import tensorflow as tf
@@ -53,6 +51,7 @@ ML_MODEL  = os.getenv("ML_MODEL", "forest")
 API_KEY   = os.getenv("ALPACA_API_KEY", "")
 API_SECRET= os.getenv("ALPACA_API_SECRET", "")
 API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+SUBMETA_USE_ACTION = os.getenv("SUBMETA_USE_ACTION", "false").strip().lower() == "true"
 
 # scheduling & run‑mode ----------------------------------------------------------------------
 RUN_SCHEDULE            = os.getenv("RUN_SCHEDULE", "on").lower().strip()
@@ -1065,10 +1064,20 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
 
     # 11. If using sub-logic, hand off the FULL df_full (with newest row) to sub/main.py
     if "sub-vote" in ml_models or "sub-meta" in ml_models:
-        mode   = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-        action = call_sub_main(mode, df_full, execution="live")
-        logging.info(f"Sub-{mode} run_live action: {action}")
-        return action  # "BUY", "SELL", or "NONE"
+        mode    = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
+        result  = call_sub_main(mode, df_full, execution="live")
+        logging.info(f"Sub-{mode} run_live returned: {result!r}")
+
+        # ── decide what we pass back upstream ───────────────────────────────
+        if mode == "sub-meta":
+            if SUBMETA_USE_ACTION:
+                action = result[1] if isinstance(result, tuple) else result
+                return action.upper()
+            else:
+                prob = result[0] if isinstance(result, tuple) else result
+                return prob
+        else:
+            return result
     out_preds = []
     out_names = []
 
@@ -1409,7 +1418,7 @@ def fetch_new_ai_tickers(num_needed, exclude_tickers):
         ]
 
         completion = openai_client.chat.completions.create(
-            model="",
+            model="gpt-4o",
             messages=messages,
             store=True
         )
@@ -1881,21 +1890,50 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
             if not check_latest_candle_condition(df, BAR_TIMEFRAME, scheduled_time_ny):
                 logging.info(f"[{ticker}] Latest candle condition not met for timeframe {BAR_TIMEFRAME} at scheduled time {scheduled_time_ny}. Skipping trade.")
                 continue
-        # ---------------------------------------------------------------------------
         raw_pred = train_and_predict(df)
-        if raw_pred is None:
-            logging.error(f"[{ticker}] Model training or prediction failed. Skipping trade logic.")
+        if isinstance(raw_pred, str) and raw_pred.upper() in {"BUY", "SELL", "HOLD", "NONE"}:
+            action_str    = raw_pred.upper()
+            live_price    = get_current_price()
+
+            if action_str == "BUY":
+                account  = api.get_account()
+                max_qty  = int(float(account.cash) // live_price)
+                if max_qty > 0:
+                    buy_shares(ticker, max_qty, live_price, live_price)
+                else:
+                    logging.info(f"[{ticker}] No cash available for BUY.")
+
+            elif action_str == "SELL":
+                try:
+                    pos_qty = int(float(api.get_position(ticker).qty))
+                except Exception:
+                    pos_qty = 0
+                if pos_qty > 0:
+                    sell_shares(ticker, pos_qty, live_price, live_price)
+                else:
+                    logging.info(f"[{ticker}] Nothing to SELL for {ticker}.")
+
+            else:
+                logging.info(f"[{ticker}] Action={action_str}. No trade executed.")
+
             continue
-        
+
+        if isinstance(raw_pred, tuple) and len(raw_pred) == 2:
+            raw_pred = raw_pred[0]
+        if raw_pred is None:
+            logging.error(f"[{ticker}] Model failed – skipping.")
+            continue
+
         try:
             pred_close = float(raw_pred)
-        except (TypeError, ValueError) as e:
-            logging.error(f"[{ticker}] Cannot convert prediction to float: {raw_pred!r} ({e}). Skipping.")
+        except (TypeError, ValueError):
+            logging.error(f"[{ticker}] Prediction not numeric ({raw_pred!r}). Skipping.")
             continue
-        
-        current_price = float(df.iloc[-1]['close'])
-        logging.info(f"[{ticker}] Current Price = {current_price:.2f}, Predicted Next Close = {pred_close:.2f}")
+
+        current_price = float(df.iloc[-1]["close"])
+        logging.info(f"[{ticker}] Current = {current_price:.2f}  •  Predicted = {pred_close:.2f}")
         trade_logic(current_price, pred_close, ticker)
+
 
 
 def setup_schedule_for_timeframe(timeframe: str) -> None:
@@ -2312,139 +2350,220 @@ def console_listener():
                             else:
                                 pred_stack = []
                                 for i_, row_idx in enumerate(idx_list):
+
+                                    # --- expanding-window dataframe used for this step
                                     if approach == "simple":
-                                        sub_df = pd.concat([train_df, test_df.iloc[:i_+1]], axis=0, ignore_index=True)
-                                    else:
+                                        sub_df = pd.concat(
+                                            [train_df, test_df.iloc[: i_ + 1]],
+                                            axis=0,
+                                            ignore_index=True,
+                                        )
+                                    else:  # complex
                                         sub_df = df.iloc[:row_idx]
+
                                     pred_close = train_and_predict(sub_df)
-                                    row_data = df.loc[row_idx]
-                                    real_close = row_data['close']
-                                    timestamps.append(row_data['timestamp'])
+                                    row_data   = df.loc[row_idx]
+                                    real_close = row_data["close"]
+
+                                    timestamps.append(row_data["timestamp"])
                                     predictions.append(pred_close)
                                     actuals.append(real_close)
 
+                                    # ─── trade decision from user logic script ─────────
                                     action = logic_module.run_backtest(
                                         current_price=real_close,
                                         predicted_price=pred_close,
                                         position_qty=position_qty,
-                                        current_timestamp=row_data['timestamp'],
-                                        candles=test_df if approach == "simple" else df.iloc[idx_list]
+                                        current_timestamp=row_data["timestamp"],
+                                        candles=(
+                                            test_df
+                                            if approach == "simple"
+                                            else df.iloc[idx_list]
+                                        ),
                                     )
 
-                                    # --- Prevent duplicate trades ---
-                                    if action == "BUY":
-                                        if position_qty > 0:
-                                            action = "NONE"
-                                    elif action == "SHORT":
-                                        if position_qty < 0:
-                                            action = "NONE"
-                                    elif action == "SELL":
-                                        if position_qty <= 0:
-                                            action = "NONE"
-                                    elif action == "COVER":
-                                        if position_qty >= 0:
-                                            action = "NONE"
+                                    # -------- duplicate-position guards ---------------
+                                    if action == "BUY"   and position_qty > 0:  action = "NONE"
+                                    if action == "SHORT" and position_qty < 0:  action = "NONE"
+                                    if action == "SELL"  and position_qty <= 0: action = "NONE"
+                                    if action == "COVER" and position_qty >= 0: action = "NONE"
 
+                                    # -------------- trade execution simulation -------
                                     if action == "BUY":
                                         if position_qty < 0:
-                                            pl = (avg_entry_price - real_close) * abs(position_qty)
+                                            pl   = (avg_entry_price - real_close) * abs(position_qty)
                                             cash += pl
-                                            record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
-                                            position_qty = 0
+                                            record_trade("COVER", row_data["timestamp"],
+                                                         abs(position_qty), real_close,
+                                                         pred_close, pl)
+                                            position_qty   = 0
                                             avg_entry_price = 0.0
+
                                         shares_to_buy = int(cash // real_close)
                                         if shares_to_buy > 0:
-                                            position_qty = shares_to_buy
+                                            position_qty    = shares_to_buy
                                             avg_entry_price = real_close
-                                            record_trade("BUY", row_data['timestamp'], shares_to_buy, real_close, pred_close, None)
+                                            record_trade("BUY", row_data["timestamp"],
+                                                         shares_to_buy, real_close,
+                                                         pred_close, None)
+
                                     elif action == "SELL":
                                         if position_qty > 0:
-                                            pl = (real_close - avg_entry_price) * position_qty
+                                            pl   = (real_close - avg_entry_price) * position_qty
                                             cash += pl
-                                            record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
-                                            position_qty = 0
+                                            record_trade("SELL", row_data["timestamp"],
+                                                         position_qty, real_close,
+                                                         pred_close, pl)
+                                            position_qty    = 0
                                             avg_entry_price = 0.0
+
                                     elif action == "SHORT":
                                         if position_qty > 0:
-                                            pl = (real_close - avg_entry_price) * position_qty
+                                            pl   = (real_close - avg_entry_price) * position_qty
                                             cash += pl
-                                            record_trade("SELL", row_data['timestamp'], position_qty, real_close, pred_close, pl)
-                                            position_qty = 0
+                                            record_trade("SELL", row_data["timestamp"],
+                                                         position_qty, real_close,
+                                                         pred_close, pl)
+                                            position_qty    = 0
                                             avg_entry_price = 0.0
+
                                         shares_to_short = int(cash // real_close)
                                         if shares_to_short > 0:
-                                            position_qty = -shares_to_short
+                                            position_qty    = -shares_to_short
                                             avg_entry_price = real_close
-                                            record_trade("SHORT", row_data['timestamp'], shares_to_short, real_close, pred_close, None)
+                                            record_trade("SHORT", row_data["timestamp"],
+                                                         shares_to_short, real_close,
+                                                         pred_close, None)
+
                                     elif action == "COVER":
                                         if position_qty < 0:
-                                            pl = (avg_entry_price - real_close) * abs(position_qty)
+                                            pl   = (avg_entry_price - real_close) * abs(position_qty)
                                             cash += pl
-                                            record_trade("COVER", row_data['timestamp'], abs(position_qty), real_close, pred_close, pl)
-                                            position_qty = 0
+                                            record_trade("COVER", row_data["timestamp"],
+                                                         abs(position_qty), real_close,
+                                                         pred_close, pl)
+                                            position_qty    = 0
                                             avg_entry_price = 0.0
 
-                                    val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
-                                    portfolio_records.append({
-                                        "timestamp": row_data['timestamp'],
-                                        "portfolio_value": val
-                                    })
+                                    # ---------- portfolio mark-to-market --------------
+                                    val = get_portfolio_value(
+                                        position_qty, cash, real_close, avg_entry_price
+                                    )
+                                    portfolio_records.append(
+                                        {
+                                            "timestamp": row_data["timestamp"],
+                                            "portfolio_value": val,
+                                        }
+                                    )
                         else:
-                            logging.warning(f"[{ticker}] Unknown approach={approach}. Skipping backtest.")
+                            logging.warning(
+                                f"[{ticker}] Unknown approach={approach}. Skipping backtest."
+                            )
                             continue
 
-                        y_pred = np.array(predictions)
-                        y_test = np.array(actuals)
-                        rmse = math.sqrt(mean_squared_error(y_test, y_pred))
-                        mae = mean_absolute_error(y_test, y_pred)
-                        avg_close = y_test.mean() if len(y_test) > 0 else 1e-6
-                        accuracy = 100 - (mae / avg_close * 100)
-                        logging.info(f"[{ticker}] Backtest ({approach}): test_size={test_size}, RMSE={rmse:.4f}, MAE={mae:.4f}, Accuracy={accuracy:.2f}%")
+                        # ------------------------------------------------------------------
+                        #  ▸  RESULTS & METRICS  (skip RMSE/MAE when no regression preds)
+                        # ------------------------------------------------------------------
+                        collecting_regression = len(predictions) > 0
 
-                        out_csv      = os.path.join(logic_subdir, f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.csv")
-                        out_img      = os.path.join(logic_subdir, f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.png")
-                        trade_log_csv= os.path.join(logic_subdir, f"backtest_trades_{ticker}_{test_size}_{tf_code}_{approach}.csv")
-                        port_csv     = os.path.join(logic_subdir, f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.csv")
-                        out_port_img = os.path.join(logic_subdir, f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.png")
+                        if collecting_regression:
+                            y_pred = np.array(predictions, dtype=float)
+                            y_test = np.array(actuals,      dtype=float)
 
-                        out_df = pd.DataFrame({
-                            'timestamp': timestamps,
-                            'actual_close': actuals,
-                            'predicted_close': predictions
-                        })
-                        out_df['timestamp'] = pd.to_datetime(out_df['timestamp'])
-                        out_df.to_csv(out_csv, index=False)
-                        logging.info(f"[{ticker}] Saved backtest predictions to {out_csv}.")
+                            rmse = math.sqrt(mean_squared_error(y_test, y_pred))
+                            mae  = mean_absolute_error(y_test, y_pred)
 
-                        plt.figure(figsize=(10, 6))
-                        plt.plot(out_df['timestamp'], out_df['actual_close'], label='Actual')
-                        plt.plot(out_df['timestamp'], out_df['predicted_close'], label='Predicted')
-                        plt.title(f"{ticker} Backtest ({approach} - Last {test_size} rows) - {timeframe_for_backtest}")
-                        plt.xlabel("Timestamp")
-                        plt.ylabel("Close Price")
-                        plt.legend()
-                        plt.grid(True)
-                        if test_size > 30:
-                            plt.xticks(rotation=45)
-                        plt.tight_layout()
-                        plt.savefig(out_img)
-                        plt.close()
-                        logging.info(f"[{ticker}] Saved backtest predictions plot to {out_img}.")
+                            avg_close = y_test.mean() if len(y_test) else 1e-6
+                            accuracy  = 100.0 - (mae / avg_close * 100.0)
 
-                        trade_log_df = pd.DataFrame(trade_records)
-                        if not trade_log_df.empty:
-                            trade_log_df.to_csv(trade_log_csv, index=False)
-                        logging.info(f"[{ticker}] Saved backtest trade log to {trade_log_csv}.")
+                            logging.info(
+                                f"[{ticker}] Backtest ({approach}) — "
+                                f"test_size={test_size}, "
+                                f"RMSE={rmse:.4f}, MAE={mae:.4f}, "
+                                f"Accuracy≈{accuracy:.2f}%"
+                            )
+                        else:
+                            logging.info(
+                                f"[{ticker}] Backtest ({approach}) — "
+                                "classification / signal mode "
+                                "(sub-vote / sub-meta) — RMSE/MAE not computed."
+                            )
 
+                        # ---------------- save artefacts ----------------
+                        tf_code       = timeframe_to_code(timeframe_for_backtest)
+                        results_dir   = os.path.join("results", logic_num_str)
+                        os.makedirs(results_dir, exist_ok=True)
+
+                        # ▸ prediction CSV & plot — only when we *have* predictions
+                        if collecting_regression:
+                            out_pred_csv = os.path.join(
+                                results_dir,
+                                f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.csv",
+                            )
+                            out_pred_png = os.path.join(
+                                results_dir,
+                                f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.png",
+                            )
+
+                            pd.DataFrame(
+                                {
+                                    "timestamp": timestamps,
+                                    "actual_close": actuals,
+                                    "predicted_close": predictions,
+                                }
+                            ).to_csv(out_pred_csv, index=False)
+
+                            plt.figure(figsize=(10, 6))
+                            plt.plot(timestamps, actuals,     label="Actual")
+                            plt.plot(timestamps, predictions, label="Predicted")
+                            plt.title(
+                                f"{ticker} Backtest ({approach} — last {test_size}) "
+                                f"[{timeframe_for_backtest}]"
+                            )
+                            plt.xlabel("Timestamp")
+                            plt.ylabel("Close Price")
+                            plt.legend()
+                            plt.grid(True)
+                            if test_size > 30:
+                                plt.xticks(rotation=45)
+                            plt.tight_layout()
+                            plt.savefig(out_pred_png)
+                            plt.close()
+
+                            logging.info(f"[{ticker}] Saved predictions → {out_pred_csv}")
+                            logging.info(f"[{ticker}] Saved prediction plot → {out_pred_png}")
+
+                        # ▸ trade log & portfolio series (always saved)
+                        trade_log_csv = os.path.join(
+                            results_dir,
+                            f"backtest_trades_{ticker}_{test_size}_{tf_code}_{approach}.csv",
+                        )
+                        port_csv = os.path.join(
+                            results_dir,
+                            f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.csv",
+                        )
+                        port_png = os.path.join(
+                            results_dir,
+                            f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.png",
+                        )
+
+                        pd.DataFrame(trade_records).to_csv(trade_log_csv, index=False)
+                        pd.DataFrame(portfolio_records).to_csv(port_csv, index=False)
+                        logging.info(f"[{ticker}] Saved trades → {trade_log_csv}")
+                        logging.info(f"[{ticker}] Saved portfolio series → {port_csv}")
+
+                        # portfolio value plot (only if records exist)
                         port_df = pd.DataFrame(portfolio_records)
                         if not port_df.empty:
-                            port_df.to_csv(port_csv, index=False)
-                        logging.info(f"[{ticker}] Saved backtest portfolio records to {port_csv}.")
-
-                        if not port_df.empty:
                             plt.figure(figsize=(10, 6))
-                            plt.plot(port_df['timestamp'], port_df['portfolio_value'], label='Portfolio Value')
-                            plt.title(f"{ticker} Portfolio Value Backtest ({approach})")
+                            plt.plot(
+                                port_df["timestamp"],
+                                port_df["portfolio_value"],
+                                label="Portfolio Value",
+                            )
+                            plt.title(
+                                f"{ticker} Portfolio Value Backtest ({approach})"
+                            )
                             plt.xlabel("Timestamp")
                             plt.ylabel("Portfolio Value (USD)")
                             plt.legend()
@@ -2452,9 +2571,10 @@ def console_listener():
                             if test_size > 30:
                                 plt.xticks(rotation=45)
                             plt.tight_layout()
-                            plt.savefig(out_port_img)
+                            plt.savefig(port_png)
                             plt.close()
-                            logging.info(f"[{ticker}] Saved backtest portfolio plot to {out_port_img}.")
+
+                            logging.info(f"[{ticker}] Saved portfolio plot → {port_png}")
 
         elif cmd == "feature-importance":
             if skip_data:

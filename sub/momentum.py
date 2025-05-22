@@ -37,11 +37,11 @@ FEATURES = [
 
 # 2) Hyperparameter grid for tuning
 PARAM_GRID = {
-    'n_estimators':     [100],
-    'max_depth':        [10],
-    'learning_rate':    [0.05],
-    'subsample':        [0.8],
-    'colsample_bytree': [0.8]
+    'n_estimators':     [100, 250, 500],
+    'max_depth':        [3, 6, 10],
+    'learning_rate':    [0.01, 0.1],
+    'subsample':        [0.8, 1.0],
+    'colsample_bytree': [0.8, 1.0]
 }
 
 
@@ -77,7 +77,7 @@ def fit(X_train: np.ndarray, y_train: np.ndarray) -> XGBClassifier:
     Grid-search CV on (X_train, y_train) to tune hyperparameters,
     then return the best-fitted XGBClassifier (best_estimator_).
     """
-    logging.info("Running FIT on momentum")
+    logging.info("Ruinning FIT on momentum")
     tscv = TimeSeriesSplit(n_splits=5)
     base = XGBClassifier(use_label_encoder=False,
                          eval_metric='logloss',
@@ -101,7 +101,7 @@ def predict(model: XGBClassifier, X: np.ndarray) -> np.ndarray:
     Given a fitted XGBClassifier and feature matrix X (n_samples×n_features),
     return the probability of the 'up' class for each row.
     """
-    logging.info("Running PREDICT on momentum")
+    logging.info("Ruinning PREDICT on momentum")
     return model.predict_proba(X)[:, 1]
 
 

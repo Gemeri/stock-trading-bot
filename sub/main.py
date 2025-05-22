@@ -83,7 +83,7 @@ def _make_meta_model():
     All models expose .fit(X,y) and .predict_proba(X) just like LogisticRegression.
     """
     if META_MODEL_TYPE == "logreg":
-        return LogisticRegression(max_iter=1000)
+        return LogisticRegression(max_iter=1000, class_weight="balanced")
     elif META_MODEL_TYPE == "lgbm":
         from lightgbm import LGBMClassifier
         return LGBMClassifier(
@@ -423,7 +423,7 @@ def _row(df_slice: pd.DataFrame, module, idx: int):
 
 
 # ────────────────────────── run_live (verbose always on) ────────────────────
-def run_live(return_result: bool = False):
+def run_live(return_result: bool = True):
     """
     Produce one live prediction.
 

@@ -71,14 +71,14 @@ def fit(X_train: pd.DataFrame, y_train: pd.Series) -> XGBRegressor:
     RandomizedSearchCV on (X_train, y_train) to tune hyperparameters,
     then return the best-fitted XGBRegressor.
     """
-    logging.info("Running FIT on lagged_return")
+    logging.info("Ruinning FIT on lagged_return")
     tscv = TimeSeriesSplit(n_splits=3)
     base = XGBRegressor(objective='reg:squarederror',
                         random_state=42, n_jobs=-1)
     rand = RandomizedSearchCV(
         estimator=base,
         param_distributions=PARAM_DIST,
-        n_iter=27,
+        n_iter=50,
         cv=tscv,
         scoring='neg_mean_squared_error',
         n_jobs=-1,
@@ -94,7 +94,7 @@ def predict(model: XGBRegressor, X: pd.DataFrame) -> np.ndarray:
     Given a fitted XGBRegressor and DataFrame X (n_samples×n_features),
     return the predicted next-bar returns for each row.
     """
-    logging.info("Running PREDICT on lagged_return")
+    logging.info("Ruinning PREDICT on lagged_return")
     return model.predict(X)
 
 

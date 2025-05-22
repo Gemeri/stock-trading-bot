@@ -68,7 +68,7 @@ ALL_FEATURES = [
     'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx',
     'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
     'lagged_close_5', 'lagged_close_10',
-    'candle_body_ratio', "predicted_close"
+    'candle_body_ratio', "predicted_close",
     'wick_dominance',
     'gap_vs_prev',
     'volume_zscore',

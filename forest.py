@@ -2361,26 +2361,27 @@ def console_listener():
                                     else:  # complex
                                         sub_df = df.iloc[:row_idx]
 
+                                    # … inside your `for i_, row_idx in enumerate(idx_list):` loop …
                                     pred_close = train_and_predict(sub_df)
                                     row_data   = df.loc[row_idx]
                                     real_close = row_data["close"]
 
-                                    timestamps.append(row_data["timestamp"])
-                                    predictions.append(pred_close)
-                                    actuals.append(real_close)
+                                    # ─── inject predicted_close into every row of the candles slice ───
+                                    if approach == "simple":
+                                        candles_bt = test_df.copy()
+                                    else:
+                                        candles_bt = df.iloc[idx_list].copy()
+                                    if "predicted_close" not in candles_bt.columns:
+                                        candles_bt["predicted_close"] = pred_close
 
-                                    # ─── trade decision from user logic script ─────────
                                     action = logic_module.run_backtest(
                                         current_price=real_close,
                                         predicted_price=pred_close,
                                         position_qty=position_qty,
                                         current_timestamp=row_data["timestamp"],
-                                        candles=(
-                                            test_df
-                                            if approach == "simple"
-                                            else df.iloc[idx_list]
-                                        ),
+                                        candles=candles_bt,
                                     )
+
 
                                     # -------- duplicate-position guards ---------------
                                     if action == "BUY"   and position_qty > 0:  action = "NONE"

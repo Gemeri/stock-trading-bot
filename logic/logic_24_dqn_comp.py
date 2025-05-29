@@ -89,11 +89,11 @@ class TradingEnv(gym.Env):
         # Portfolio state variables
         self.initial_balance = 10000
         self.balance = self.initial_balance
-        self.shares_held = 0    # positive for long, negative for short
-        self.position = 0       # 0: none, 1: long, -1: short
+        self.shares_held = 0    # positive for long
+        self.position = 0       # 0: none, 1: long
         
-        # Actions: 0: BUY, 1: SELL, 2: SHORT, 3: COVER, 4: NONE
-        self.action_space = spaces.Discrete(5)
+        # Actions: 0: BUY, 1: SELL, 2: NONE
+        self.action_space = spaces.Discrete(3)
         
         # Observation: features from the dataframe (excluding non-feature columns)
         excluded_columns = ['timestamp'] if 'timestamp' in self.df.columns else []
@@ -112,52 +112,20 @@ class TradingEnv(gym.Env):
         current_price = self.df.iloc[min(self.current_step, len(self.df)-1)]['close']
         if action == 0:  # BUY
             if self.position == 1:
-                action = 4
-            elif self.position == -1:
-                shares_to_cover = abs(self.shares_held)
-                cost = shares_to_cover * current_price
+                return
+            max_shares = int(self.balance // current_price)
+            if max_shares > 0:
+                cost = max_shares * current_price
                 self.balance -= cost
-                self.shares_held = 0
-                self.position = 0
-            if self.position == 0:
-                max_shares = int(self.balance // current_price)
-                if max_shares > 0:
-                    cost = max_shares * current_price
-                    self.balance -= cost
-                    self.shares_held += max_shares
-                    self.position = 1
+                self.shares_held += max_shares
+                self.position = 1
         elif action == 1:  # SELL
             if self.position == 1:
                 revenue = self.shares_held * current_price
                 self.balance += revenue
                 self.shares_held = 0
                 self.position = 0
-            else:
-                action = 4
-        elif action == 2:  # SHORT
-            if self.position == -1:
-                action = 4
-            elif self.position == 1:
-                revenue = self.shares_held * current_price
-                self.balance += revenue
-                self.shares_held = 0
-                self.position = 0
-            if self.position == 0:
-                max_shares = int(self.balance // current_price)
-                if max_shares > 0:
-                    revenue = max_shares * current_price
-                    self.balance += revenue
-                    self.shares_held -= max_shares
-                    self.position = -1
-        elif action == 3:  # COVER
-            if self.position == -1:
-                cost = abs(self.shares_held) * current_price
-                self.balance -= cost
-                self.shares_held = 0
-                self.position = 0
-            else:
-                action = 4
-        elif action == 4:  # NONE
+        elif action == 2:  # NONE
             pass
     
     def step(self, action):
@@ -173,8 +141,6 @@ class TradingEnv(gym.Env):
         portfolio_value = self.balance
         if self.position == 1:
             portfolio_value += self.shares_held * current_price
-        elif self.position == -1:
-            portfolio_value -= abs(self.shares_held) * current_price
         self.portfolio_history.append(portfolio_value)
         reward = portfolio_value
         obs = self._get_observation() if not self.done else np.zeros(self.observation_space.shape, dtype=np.float32)
@@ -206,7 +172,6 @@ def simulate_episode(model, env):
     return final_value, env.portfolio_history
 
 def run_rl_competition(df):
-    # Use the provided dataframe (which now includes predicted_price as a feature)
     env = TradingEnv(df)
     model1 = DQN("MlpPolicy", env, verbose=0)
     model2 = DQN("MlpPolicy", env, verbose=0)
@@ -231,7 +196,7 @@ def run_rl_competition(df):
     # Run through the full dataset using NONE action to get final observation
     obs = env.reset()
     while True:
-        obs, reward, done, info = env.step(4)
+        obs, reward, done, info = env.step(2)
         if done:
             break
     next_action, _ = best_model.predict(obs, deterministic=True)
@@ -256,12 +221,10 @@ def load_and_preprocess_csv(csv_path, predicted_price):
     return df
 
 def preprocess_candles_for_backtest(candles, current_timestamp, predicted_price):
-    # Use only the candles up to the current timestamp (if a timestamp column exists)
     if 'timestamp' in candles.columns:
         df = candles[candles['timestamp'] <= current_timestamp].copy()
     else:
         df = candles.copy()
-    # Remove disabled features
     for col in disabled_features:
         if col in df.columns:
             df.drop(columns=[col], inplace=True)
@@ -275,11 +238,6 @@ def preprocess_candles_for_backtest(candles, current_timestamp, predicted_price)
 # Main External Trade Logic Functions
 # =============================================================================
 def run_logic(current_price, predicted_price, ticker):
-    """
-    External trade logic function.
-    Loads the full CSV (using env configuration), runs the RL competition
-    (trained on the entire CSV), and executes a trade via forest's API.
-    """
     from forest import api, buy_shares, sell_shares, short_shares, close_short
 
     # Load and preprocess the CSV data
@@ -306,22 +264,9 @@ def run_logic(current_price, predicted_price, ticker):
     elif action == 1 and position_qty > 0:
         logging.info("sell")
         sell_shares(ticker, position_qty, current_price, predicted_price)
-    elif action == 2 and position_qty >= 0:
-        max_shares = int(cash // current_price)
-        logging.info("short")
-        short_shares(ticker, max_shares, current_price, predicted_price)
-    elif action == 3 and position_qty < 0:
-        qty_to_close = abs(position_qty)
-        logging.info("cover")
-        close_short(ticker, qty_to_close, current_price)
-    # Action 4 (NONE) means HOLD – do nothing.
+    # Action 2 (NONE) means HOLD – do nothing.
 
 def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles):
-    """
-    External backtest function.
-    Trains the RL competition using all candle data up to the provided current_timestamp,
-    then returns the trade decision as a string.
-    """
     df = preprocess_candles_for_backtest(candles, current_timestamp, predicted_price)
     action = run_rl_competition(df)
     
@@ -331,38 +276,5 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
     elif action == 1 and position_qty > 0:
         logging.info("sell")
         return "SELL"
-    elif action == 2 and position_qty >= 0:
-        logging.info("short")
-        return "SHORT"
-    elif action == 3 and position_qty < 0:
-        logging.info("cover")
-        return "COVER"
     else:
         return "NONE"
-
-# =============================================================================
-# Testing block (if run directly)
-# =============================================================================
-if __name__ == '__main__':
-    # These values are for testing purposes only.
-    test_current_price = 100.0
-    test_predicted_price = 102.0
-    test_ticker = "TSLA"
-    
-    print("Running run_logic:")
-    run_logic(test_current_price, test_predicted_price, test_ticker)
-    
-    # Create a dummy candles DataFrame for backtesting
-    dummy_data = {
-        'timestamp': pd.date_range(start='2023-01-01', periods=100, freq='H'),
-        'open': np.random.rand(100) * 100,
-        'high': np.random.rand(100) * 100,
-        'low': np.random.rand(100) * 100,
-        'close': np.random.rand(100) * 100,
-        'volume': np.random.randint(100, 1000, size=100)
-    }
-    dummy_candles = pd.DataFrame(dummy_data)
-    test_position_qty = 0
-    test_current_timestamp = dummy_candles['timestamp'].iloc[-1]
-    decision = run_backtest(test_current_price, test_predicted_price, test_position_qty, test_current_timestamp, dummy_candles)
-    print(f"Backtest decision: {decision}")

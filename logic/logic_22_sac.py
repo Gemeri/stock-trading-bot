@@ -1,44 +1,3 @@
-"""
-logic.py
-
-A demonstration of an actively trading, profitable RL+RF stock-trading strategy
-using SAC and Random Forest. This script meets the requested requirements:
-
-    1. Defines two externally-called functions:
-       - run_logic(current_price, predicted_price, ticker)
-       - run_backtest(current_price, predicted_price, position_qty)
-
-    2. Dynamically handles CSV data for stock candles based on .env variables:
-       - BAR_TIMEFRAME -> e.g. "4Hour" => "H4"
-       - TICKERS -> e.g. "TSLA,AAPL"
-       - DISABLED_FEATURES -> e.g. "body_size,candle_rise"
-
-    3. Filters out any disabled CSV features before feeding them to the RL model.
-
-    4. Integrates SAC (on-policy style updates) + a Random Forest for price prediction.
-       The predicted_price argument is also fed into the RL state.
-
-    5. Actively trades (minimizes the "NONE" action with a penalty).
-
-    6. The same RL logic is used for both run_logic and run_backtest (including partial re-training).
-
-    7. This script is a high-level example; some parts (e.g., environment resets, 
-       live retraining intervals, stable-baselines configs, Random Forest re-fitting, etc.)
-       can be expanded or modified as needed for a production environment.
-
-NOTE: 
-- This demo uses stable-baselines3 or a custom SAC approach, and scikit-learn for Random Forest. 
-- In practice, you'd install them via: 
-      pip install pandas numpy scikit-learn stable-baselines3
-- For actual production, you may need additional nuance for data handling, 
-  concurrency, memory, or re-training intervals.
-
-The main interface to the rest of the system is through:
-    run_logic(current_price, predicted_price, ticker)   # for live trading
-    run_backtest(current_price, predicted_price, position_qty)  # for backtesting
-
-"""
-
 import os
 import numpy as np
 import pandas as pd
@@ -82,9 +41,6 @@ class DummySACModel:
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def _convert_timeframe(tf: str) -> str:
-    """
-    Convert a textual timeframe from .env (e.g. '4Hour') into a shorter suffix (e.g. 'H4').
-    """
     # You can expand or adapt as needed
     mapping = {
         "4Hour":  "H4",
@@ -97,10 +53,6 @@ def _convert_timeframe(tf: str) -> str:
 
 
 def _get_enabled_features(df_columns, disabled_list):
-    """
-    Given all columns (df_columns) and a list of disabled features,
-    return the subset of columns that are *enabled* (i.e., not disabled).
-    """
     enabled = []
     for col in df_columns:
         if col not in disabled_list:
@@ -126,22 +78,6 @@ import gym
 from gym import spaces
 
 class TradingEnv(gym.Env):
-    """
-    A minimalistic RL environment for discrete trading actions:
-        Actions: [0=NONE, 1=BUY, 2=SELL, 3=SHORT, 4=COVER]
-    State: 
-        - Current row's features from the CSV (enabled features)
-        - predicted_price
-        - Current position quantity (discretized or just the raw float)
-
-    Reward:
-        - Driven by changes in unrealized PnL, or realized profit
-        - Negative penalty for taking "NONE" to encourage active trading
-        - Could incorporate Sharpe-like reward or other risk-adjusted measure
-
-    This environment expects you to call it row-by-row or in small batches.
-    For a real-time scenario, you'd step once per new candle.
-    """
     def __init__(self, data, initial_balance=100000.0, shares_per_trade=1):
         super(TradingEnv, self).__init__()
         
@@ -162,7 +98,7 @@ class TradingEnv(gym.Env):
         self.current_step = 0
 
         # Discrete action space: NONE=0, BUY=1, SELL=2, SHORT=3, COVER=4
-        self.action_space = spaces.Discrete(5)
+        self.action_space = spaces.Discrete(3)
 
         # Observation space: all features + predicted_price + position_qty
         # We'll store them in a flat vector for simplicity
@@ -182,9 +118,6 @@ class TradingEnv(gym.Env):
         return obs_vec
 
     def step(self, action):
-        """
-        Execute one time-step in the environment.
-        """
         # Current price for reward calculations (we can use 'close' or 'vwap')
         current_price = float(self.data.iloc[self.current_step]["close"])
 
@@ -280,12 +213,6 @@ GLOBAL_RF_MODEL = None
 GLOBAL_SAC_MODEL = None
 
 def _train_random_forest_for_price(df, target_col="close"):
-    """
-    Train (or re-train) a Random Forest to predict next-step price (or some horizon).
-    Returns the trained RF model and the predictions for 'df'.
-    For demonstration, we fit on all data except the last row, 
-    and predict the last row's price.
-    """
     # Example: We take features from the CSV (except 'close') to predict 'close'.
     # This is naive; you might want a shift, e.g. predict next candle's close, etc.
     X_cols = [c for c in df.columns if c not in ["timestamp", "close"]]
@@ -305,15 +232,6 @@ def _train_random_forest_for_price(df, target_col="close"):
 
 
 def _create_and_train_sac(env):
-    """
-    Create and train an SAC model on the given environment.
-    Because stable-baselines3's default SAC is continuous, 
-    we're using a dummy discrete placeholder here (DummySACModel).
-
-    For real usage:
-        - Use a discrete version of SAC (e.g., from SB3-Contrib) or
-          discretize your action space differently with a custom approach.
-    """
     sac_model = DummySACModel(action_space_size=env.action_space.n)
 
     # A naive "train" loop over the environment
@@ -338,16 +256,6 @@ def _create_and_train_sac(env):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def run_logic(current_price, predicted_price, ticker):
-    """
-    Called during live trading. 
-    1) Dynamically load CSV data for the ticker + timeframe
-    2) Filter out disabled features
-    3) Train/Update Random Forest for predicted price (optional re-fit)
-    4) Build/Use the RL model (SAC)
-    5) Get current open position from live API
-    6) Decide an action -> forest.buy_shares, forest.sell_shares, forest.short_shares, forest.close_short
-    7) Attempt to keep "NONE" minimal
-    """
     from forest import api, buy_shares, sell_shares, short_shares, close_short
 
     # Read environment variables
@@ -470,14 +378,6 @@ def run_logic(current_price, predicted_price, ticker):
 
 
 def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles):
-    """
-    Called during backtesting. 
-    1) Load CSV for the *first ticker in TICKERS* + timeframe
-    2) Filter out the same features
-    3) Use the same RL + RF approach
-    4) Return "BUY", "SELL", "SHORT", "COVER", or "NONE"
-    5) Use position_qty to avoid duplicating trades
-    """
     # Read environment variables
     bar_tf = os.getenv("BAR_TIMEFRAME", "1Hour")
     suffix = _convert_timeframe(bar_tf)

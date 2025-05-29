@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-"""
-logic.py
-
-A fully functional, high-performance Python script that implements an actively trading,
-profitable stock trading strategy using Reinforcement Learning (RL) with DDQN and a 
-Random Forest (RF) model for price prediction.
-
-Core functions:
-    - run_logic(current_price, predicted_price, ticker)
-    - run_backtest(current_price, predicted_price, position_qty)
-
-Features:
-    • Dynamically loads CSV data based on environment variables (.env)
-    • Converts BAR_TIMEFRAME (e.g. "4Hour"→"H4", "1Hour"→"H1", etc.)
-    • Filters out disabled CSV features (via DISABLED_FEATURES) while ensuring numeric consistency
-    • Uses a DDQN agent that integrates a Random Forest signal (for predicted_price)
-    • Actively trades with minimal "NONE" actions and no duplicate trades
-    • Implements on-policy learning with experience replay and a reward function based on profitability
-
-Note: This is a demonstration implementation. In production, further tuning, risk controls,
-robust error handling, and additional features (e.g. stop-loss/take-profit) would be added.
-"""
-
 import os
 import numpy as np
 import pandas as pd
@@ -61,34 +37,39 @@ CONVERTED_TIMEFRAME = TIMEFRAME_MAP.get(BAR_TIMEFRAME, BAR_TIMEFRAME)
 
 # List of all possible CSV columns (features)
 ALL_FEATURES = [
-    'timeframe', 'open', 'high', 'low', 'close', 'volume', 'vwap',
-    'price_change', 'high_low_range', 'log_volume', 'sentiment',
-    'price_return', 'candle_rise', 'body_size', 'wick_to_body', 'macd_line',
-    'rsi', 'momentum', 'roc', 'atr', 'hist_vol', 'obv', 'volume_change',
-    'stoch_k', 'bollinger_upper', 'bollinger_lower',
+    'open', 'high', 'low', 'close', 'volume', 'vwap', 'sentiment',
+    'macd_line', 'macd_signal', 'macd_histogram',
+    'rsi', 'momentum', 'roc', 'atr', 'obv',
+    'bollinger_upper', 'bollinger_lower',
+    'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx',
     'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
-    'lagged_close_5', 'lagged_close_10'
+    'lagged_close_5', 'lagged_close_10',
+    'candle_body_ratio', "predicted_close"
+    'wick_dominance',
+    'gap_vs_prev',
+    'volume_zscore',
+    'atr_zscore',
+    'rsi_zscore',
+    'adx_trend',
+    'macd_cross',
+    'macd_hist_flip',
+    'day_of_week',
+    'days_since_high',
+    'days_since_low'
 ]
 
 def get_enabled_features():
-    """Return list of features enabled for RL input (CSV columns minus disabled ones)."""
     return [feat for feat in ALL_FEATURES if feat not in DISABLED_FEATURES]
 
 def get_csv_filename(ticker: str) -> str:
-    """Return the CSV filename given a ticker and the converted timeframe."""
     return f"{ticker}_{CONVERTED_TIMEFRAME}.csv"
 
 def load_csv_data(ticker: str) -> pd.DataFrame:
-    """Load CSV data for the given ticker using the converted timeframe."""
     filename = get_csv_filename(ticker)
     df = pd.read_csv(filename)
     return df
 
 def filter_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filter out disabled features and keep only the enabled ones.
-    Also convert all enabled columns to numeric to ensure consistency.
-    """
     enabled = get_enabled_features()
     features = [feat for feat in enabled if feat in df.columns]
     df_filtered = df[features].copy()
@@ -97,13 +78,6 @@ def filter_features(df: pd.DataFrame) -> pd.DataFrame:
     return df_filtered
 
 def get_state(df: pd.DataFrame, predicted_price: float, current_position: float) -> np.ndarray:
-    """
-    Build the RL state from the last row of filtered CSV data.
-    The state consists of:
-      - the enabled numeric features (last row)
-      - the predicted_price
-      - the current open position quantity
-    """
     latest = df.iloc[-1]
     features = latest.values.astype(float)
     # Append predicted_price and current_position as additional state info
@@ -114,7 +88,7 @@ def get_state(df: pd.DataFrame, predicted_price: float, current_position: float)
 # DDQN Agent Implementation
 # =============================================================================
 
-ACTIONS = ["BUY", "SELL", "SHORT", "COVER", "NONE"]
+ACTIONS = ["BUY", "SELL", "NONE"]
 
 class DDQNAgent:
     def __init__(self, state_size, action_size, 
@@ -139,7 +113,6 @@ class DDQNAgent:
         self.update_target_model()
 
     def _build_model(self):
-        """Build a simple fully-connected NN model."""
         model = Sequential()
         model.add(Dense(64, input_dim=self.state_size, activation='relu'))
         model.add(Dense(64, activation='relu'))
@@ -148,17 +121,14 @@ class DDQNAgent:
         return model
 
     def update_target_model(self):
-        """Update target model weights from the main model."""
         self.target_model.set_weights(self.model.get_weights())
 
     def remember(self, state, action, reward, next_state, done):
-        """Store experience in replay buffer."""
         if len(self.memory) >= self.memory_size:
             self.memory.pop(0)
         self.memory.append((state, action, reward, next_state, done))
 
     def act(self, state):
-        """Choose action using epsilon-greedy policy."""
         if np.random.rand() <= self.epsilon:
             # Random action
             return random.randrange(self.action_size)
@@ -166,7 +136,6 @@ class DDQNAgent:
         return np.argmax(q_values[0])
 
     def replay(self):
-        """Train on a batch of experiences from the replay buffer."""
         if len(self.memory) < self.batch_size:
             return
 
@@ -205,10 +174,6 @@ class RFPricePredictor:
         self.trained = False
 
     def train(self, df: pd.DataFrame, target_column: str = 'close'):
-        """
-        Train the random forest using historical data.
-        Here we assume the target is the 'close' price.
-        """
         # Use enabled features (numeric columns) as predictors
         features = filter_features(df)
         # Ensure consistency with training by using only numeric columns
@@ -221,10 +186,6 @@ class RFPricePredictor:
             self.trained = True
 
     def predict(self, X_features: np.ndarray) -> float:
-        """
-        Predict the next price based on X_features.
-        X_features should be 2D (1, n_features) matching the training features.
-        """
         if self.trained:
             return self.model.predict(X_features)[0]
         else:
@@ -260,16 +221,6 @@ except Exception:
 # =============================================================================
 
 def run_logic(current_price: float, predicted_price: float, ticker: str):
-    """
-    Live trading logic:
-      1. Load CSV data dynamically using ticker + converted timeframe.
-      2. Filter out disabled CSV features.
-      3. Create RL state (enabled features + predicted_price + current open position).
-      4. Retrieve current open position from live API.
-      5. Use the RL agent (DDQN + RF) to decide among BUY, SELL, SHORT, COVER, or NONE.
-      6. Execute the chosen trade via the API (avoiding duplicate trades).
-      7. Update the RL model with new experience.
-    """
     # Import live trading API and execution functions (assumed available)
     from forest import api, buy_shares, sell_shares, short_shares, close_short
 
@@ -355,16 +306,6 @@ def run_logic(current_price: float, predicted_price: float, ticker: str):
     agent.update_target_model()
 
 def run_backtest(current_price: float, predicted_price: float, position_qty: float, current_timestamp, candles) -> str:
-    """
-    Backtesting logic:
-      1. Load CSV data using the first ticker from TICKERS + converted timeframe,
-         but only consider the last 500 candles.
-      2. Filter out disabled features.
-      3. Create RL state (enabled features + predicted_price + provided position_qty).
-      4. Use the same RL agent (DDQN + RF) to determine a trade signal.
-      5. Apply a confidence threshold so that minor predicted moves do not trigger trades.
-      6. Return one of: "BUY", "SELL", "SHORT", "COVER", or "NONE" (with duplicate trade avoidance).
-    """
     ticker = TICKERS[0]
     try:
         df = load_csv_data(ticker)

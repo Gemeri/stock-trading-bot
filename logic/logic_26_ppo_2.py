@@ -19,21 +19,29 @@ TIMEFRAME_SUFFIX = {
     "30Min": "M30", "15Min": "M15"
 }[BAR_TIMEFRAME]
 
-ACTIONS = ["BUY", "SELL", "SHORT", "COVER", "NONE"]
+# Only BUY, SELL, and NONE
+ACTIONS = ["BUY", "SELL", "NONE"]
 
 
 # Helper Functions
 def load_data(ticker):
     filename = f"{ticker}_{TIMEFRAME_SUFFIX}.csv"
     df = pd.read_csv(filename)
-    df = df.drop(columns=[feat for feat in DISABLED_FEATURES if feat in df.columns], errors='ignore')
-    return df.select_dtypes(include=[np.number])
+    # Remove any disabled features
+    df.drop(columns=[feat for feat in DISABLED_FEATURES if feat in df.columns], inplace=True, errors='ignore')
+    # Handle infinite and missing values
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.fillna(method='ffill', inplace=True)
+    df.fillna(method='bfill', inplace=True)
+    df.dropna(inplace=True)
+    # Return only numeric columns as float32
+    return df.select_dtypes(include=[np.number]).astype(np.float32)
 
 
 def get_features(df, predicted_price, rf_columns):
-    df = df.copy()
-    df['predicted_price'] = predicted_price
-    features_df = df[rf_columns]
+    df_copy = df.copy()
+    df_copy['predicted_price'] = predicted_price
+    features_df = df_copy[rf_columns]
     return features_df.iloc[-1:].values
 
 
@@ -62,9 +70,12 @@ class StockTradingEnv(gym.Env):
 
     def _calculate_reward(self, action):
         price_change = self.df['close'].iloc[self.current_step] - self.df['open'].iloc[self.current_step]
-        reward = price_change if ACTIONS[action] in ["BUY", "COVER"] else -price_change
-        if ACTIONS[action] == "NONE":
-            reward -= abs(price_change) * 0.1
+        if ACTIONS[action] == "BUY":
+            reward = price_change
+        elif ACTIONS[action] == "SELL":
+            reward = -price_change
+        else:  # NONE
+            reward = -abs(price_change) * 0.1
         return reward
 
 
@@ -89,7 +100,7 @@ def load_rf_model(df):
 
 # Main Functions
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares, short_shares, close_short
+    from forest import api, buy_shares, sell_shares
 
     df = load_data(ticker)
     rf_model = load_rf_model(df)
@@ -120,24 +131,15 @@ def run_logic(current_price, predicted_price, ticker):
     elif ACTIONS[action] == "SELL" and position_qty > 0:
         print("sell")
         sell_shares(ticker, position_qty, current_price, predicted_price)
-    elif ACTIONS[action] == "SHORT" and position_qty >= 0:
-        max_shares = int(cash // current_price)
-        print("short")
-        short_shares(ticker, max_shares, current_price, predicted_price)
-    elif ACTIONS[action] == "COVER" and position_qty < 0:
-        qty_to_close = abs(position_qty)
-        print("cover")
-        close_short(ticker, qty_to_close, current_price)
 
 
 def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles):
     ticker = TICKERS[0]
     df = load_data(ticker)
 
-    candles = candles.shape[0] if isinstance(candles, pd.DataFrame) else int(candles)
-
-    backtest_df = df.tail(candles)
-    train_df = df.head(len(df) - candles)
+    num_candles = candles.shape[0] if isinstance(candles, pd.DataFrame) else int(candles)
+    backtest_df = df.tail(num_candles)
+    train_df = df.head(len(df) - num_candles)
 
     rf_model = load_rf_model(train_df)
     rf_columns = train_df.drop(columns=['close'], errors='ignore').columns
@@ -153,8 +155,4 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
         return "BUY"
     elif ACTIONS[action] == "SELL" and position_qty > 0:
         return "SELL"
-    elif ACTIONS[action] == "SHORT" and position_qty >= 0:
-        return "SHORT"
-    elif ACTIONS[action] == "COVER" and position_qty < 0:
-        return "COVER"
     return "NONE"

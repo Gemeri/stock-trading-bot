@@ -40,7 +40,7 @@ A highly configurable and extensible stock trading bot that fetches market data,
 1. **Clone the repository**:
 
    ```bash
-   git clone https://github.com/yourusername/stock-trading-bot.git
+   git clone https://github.com/Gemeri/stock-trading-bot.git
    cd stock-trading-bot
    ```
 

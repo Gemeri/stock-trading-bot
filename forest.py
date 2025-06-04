@@ -2412,67 +2412,108 @@ def console_listener():
                                 logging.error(f"[{ticker}] Not enough training rows for {approach} approach.")
                                 continue
                             if "sub-vote" in ml_models or "sub-meta" in ml_models:
-                                mode = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-                                signal_df = call_sub_main(mode, df, execution="backtest")
+                                mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
+                                signal_df  = call_sub_main(mode, df, execution="backtest")
 
-                                trade_actions = signal_df[signal_df["action"].isin(["BUY", "SELL"])].reset_index(drop=True)
-                                predictions = []
-                                actuals = []
-                                timestamps = []
-                                trade_records = []
-                                portfolio_records = []
-                                start_balance = 10000.0
-                                cash = start_balance
-                                position_qty = 0
-                                avg_entry_price = 0.0
-
-                                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                                trade_actions['timestamp'] = pd.to_datetime(trade_actions['timestamp'])
-                                df_sorted = df.sort_values('timestamp').reset_index(drop=True)
-                                trade_actions_sorted = trade_actions.sort_values('timestamp').reset_index(drop=True)
-                                merged_actions = pd.merge_asof(
-                                    trade_actions_sorted, df_sorted, on='timestamp', direction="backward"
+                                # --- keep only actionable rows and order chronologically ---------------
+                                trade_actions = (
+                                    signal_df[signal_df["action"].isin(["BUY", "SELL"])]
+                                    .copy()
+                                    .sort_values("timestamp")
+                                    .reset_index(drop=True)
                                 )
 
-                                def record_trade(action, tstamp, shares, curr_price, pl):
+                                # -----------------------------------------------------------------------
+                                #  Portfolio state variables
+                                # -----------------------------------------------------------------------
+                                trade_records      = []
+                                portfolio_records  = []
+                                predictions        = []
+                                actuals            = []
+                                timestamps         = []
+
+                                START_BALANCE      = 10_000.0
+                                cash               = START_BALANCE
+                                position_qty       = 0
+                                avg_entry_price    = 0.0
+
+                                # convenience -----------------------------------------------------------
+                                def record_trade(act, ts, qty, px, pl=None):
                                     trade_records.append({
-                                        "timestamp": tstamp,
-                                        "action": action,
-                                        "shares": shares,
-                                        "current_price": curr_price,
-                                        "profit_loss": pl
+                                        "timestamp"     : ts,
+                                        "action"        : act,
+                                        "shares"        : qty,
+                                        "current_price" : px,
+                                        "profit_loss"   : pl
                                     })
 
-                                for idx, row in merged_actions.iterrows():
-                                    action = row["action"]
-                                    ts = row["timestamp"]
-                                    price = row["close"]
-                                    
-                                    if action == "BUY":
-                                        if position_qty < 0:
+                                # timestamp alignment ---------------------------------------------------
+                                df['timestamp']           = pd.to_datetime(df['timestamp'])
+                                trade_actions['timestamp'] = pd.to_datetime(trade_actions['timestamp'])
+
+                                df_sorted          = df.sort_values('timestamp').reset_index(drop=True)
+                                actions_sorted     = trade_actions.sort_values('timestamp').reset_index(drop=True)
+
+                                merged_actions = pd.merge_asof(
+                                    actions_sorted,
+                                    df_sorted,
+                                    on='timestamp',
+                                    direction='backward'
+                                )
+
+                                # -----------------------------------------------------------------------
+                                #  Iterate over each (action, candle) row – enforce position sanity
+                                # -----------------------------------------------------------------------
+                                for _, row in merged_actions.iterrows():
+                                    raw_act = row["action"]
+                                    ts      = row["timestamp"]
+                                    price   = row["close"]
+
+                                    if raw_act == "BUY":
+                                        # If already long, ignore duplicate BUY
+                                        if position_qty > 0:
+                                            raw_act = "NONE"
+                                        # If short, COVER first
+                                        elif position_qty < 0:
                                             pl = (avg_entry_price - price) * abs(position_qty)
                                             cash += pl
                                             record_trade("COVER", ts, abs(position_qty), price, pl)
-                                            position_qty = 0
+                                            position_qty    = 0
                                             avg_entry_price = 0.0
+
+                                    elif raw_act == "SELL":
+                                        if position_qty <= 0:
+                                            raw_act = "NONE"
+
+                                    # ------------------------------------------------ execute action ---
+                                    if raw_act == "BUY":
                                         shares_to_buy = int(cash // price)
                                         if shares_to_buy > 0:
-                                            position_qty = shares_to_buy
+                                            position_qty    = shares_to_buy
                                             avg_entry_price = price
-                                            record_trade("BUY", ts, shares_to_buy, price, None)
-                                    elif action == "SELL":
-                                        if position_qty > 0:
-                                            pl = (price - avg_entry_price) * position_qty
-                                            cash += pl
-                                            record_trade("SELL", ts, position_qty, price, pl)
-                                            position_qty = 0
-                                            avg_entry_price = 0.0
-                                    val = cash + (position_qty * (price - avg_entry_price) if position_qty > 0 else 0)
-                                    portfolio_records.append({"timestamp": ts, "portfolio_value": val})
+                                            record_trade("BUY", ts, shares_to_buy, price)
 
+                                    elif raw_act == "SELL":
+                                        pl   = (price - avg_entry_price) * position_qty
+                                        cash += pl
+                                        record_trade("SELL", ts, position_qty, price, pl)
+                                        position_qty    = 0
+                                        avg_entry_price = 0.0
+
+                                    # ------------------------------------------------ portfolio value --
+                                    port_val = (
+                                        cash
+                                        + (price - avg_entry_price) * position_qty
+                                        if position_qty != 0 else cash
+                                    )
+                                    portfolio_records.append({"timestamp": ts, "portfolio_value": port_val})
+
+                                # -----------------------------------------------------------------------
+                                #  Ensure results directory exists (unchanged)
+                                # -----------------------------------------------------------------------
                                 results_dir = os.path.join("sub", "sub-results")
-                                if not os.path.exists(results_dir):
-                                    os.makedirs(results_dir)
+                                os.makedirs(results_dir, exist_ok=True)
+
 
                             # ----------- ALL OTHER ML MODES -----------------------------------
                             else:

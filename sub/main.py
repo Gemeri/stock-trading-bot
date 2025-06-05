@@ -27,7 +27,7 @@ import sub.mean_reversion      as mod3
 import sub.lagged_return       as mod4
 import sub.sentiment_volume    as mod5
 
-USE_CLASSIFIER = False
+USE_CLASSIFIER = True
 if USE_CLASSIFIER:
     import sub.classifier as mod6
     SUBMODS = [mod1, mod2, mod3, mod4, mod5, mod6]
@@ -58,7 +58,7 @@ EXECUTION  = globals().get("EXECUTION", "backtest")
 REG_UP, REG_DOWN = 0.003, -0.003
 
 # Set to True to force thresholds to 0.55/0.45 everywhere
-FORCE_STATIC_THRESHOLDS = False
+FORCE_STATIC_THRESHOLDS = True
 STATIC_UP = 0.55
 STATIC_DOWN = 0.45
 
@@ -124,12 +124,15 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
     Handles an arbitrary number of sub-models (N_SUBMODS).
     """
     df = pd.read_csv(CSV_PATH)
+    print("── DEBUG: CSV_PATH =", CSV_PATH)
+    print("── DEBUG: columns in CSV:", df.columns.tolist())
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
     col_m  = [f"m{i+1}"   for i in range(len(submods))]
     col_acc= [f"acc{i+1}" for i in range(len(submods))]
-
+    print(HISTORY_PATH)
     if os.path.exists(HISTORY_PATH):
+        print("exists")
         hist = pd.read_csv(HISTORY_PATH)
         hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True)
         last_ts   = hist["timestamp"].iloc[-1]
@@ -139,7 +142,7 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
             return hist
     else:
         hist = pd.DataFrame(columns=["timestamp", *col_m, *col_acc, "meta_label"])
-        start_idx = int(len(df) * 0.8)
+        start_idx = int(len(df) * 0.6)
 
     # rolling storage for accuracy -----------------------------------------
     preds_hist  = [[] for _ in submods]
@@ -339,23 +342,79 @@ def backtest_submodels(
 
     return pd.DataFrame(rec).set_index("t")
 
+# ─── NEW: Walk-forward meta back-test ────────────────────────────────────────
+def walkforward_meta_backtest(
+    cache_csv: str,
+    n_mods: int = N_SUBMODS,
+    initial_frac: float = 0.8,
+    metric: str = "accuracy",
+):
+    """
+    Incremental (i+1) walk-forward evaluation:
+
+    • Train on the first ⌊initial_frac·N⌋ rows
+    • Predict row i
+    • Append row i to the training set
+    • Repeat until the end of the history file
+    """
+    hist = pd.read_csv(cache_csv)
+    feature_cols = (
+        [f"m{k}"   for k in range(1, n_mods + 1)] +
+        [f"acc{k}" for k in range(1, n_mods + 1)]
+    )
+    N = len(hist)
+    start = int(N * initial_frac)
+    if start < 10:
+        raise ValueError("History too short for walk-forward meta test.")
+
+    records = []
+
+    for i in tqdm(range(start, N), desc="Walk-forward (meta)"):
+        # ─── ❶ train on rows [: i] ─────────────────────────────────────────
+        X_train = hist.loc[:i - 1, feature_cols].values
+        y_train = hist.loc[:i - 1, "meta_label"].values
+
+        meta = _make_meta_model()
+        meta.fit(X_train, y_train)
+
+        # ─── ❷ choose asymmetric thresholds on an *internal* validation split
+        #      (20 % of the current training slice)
+        split_val = max(1, int(len(y_train) * 0.2))
+        X_val, y_val = X_train[-split_val:], y_train[-split_val:]
+        probs_val = meta.predict_proba(X_val)[:, 1]
+        up, down = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
+
+        # ─── ❸ predict the held-out row i ──────────────────────────────────
+        prob_up = float(meta.predict_proba(hist.loc[i, feature_cols].values.reshape(1, -1))[0, 1])
+        action = "BUY" if prob_up > up else ("SELL" if prob_up < down else "HOLD")
+
+        # ─── ❹ collect results ────────────────────────────────────────────
+        rec = {
+            "timestamp": hist["timestamp"].iloc[i],
+            "meta_prob": prob_up,
+            "action": action,
+            "up_thresh": up,
+            "down_thresh": down,
+        }
+        for k in range(1, n_mods + 1):
+            rec[f"m{k}"]   = hist[f"m{k}"].iloc[i]
+            rec[f"acc{k}"] = hist[f"acc{k}"].iloc[i]
+        records.append(rec)
+
+    return pd.DataFrame(records)
 
 
 # ───────────────────────── run_backtest ──────────────────────────────────────
 def run_backtest(return_df: bool = False):
     """
-    Back-test either classic sub-vote or the meta-model pipeline.
-    If USE_CLASSIFIER is true an extra (sixth) XGBoost sub-model is added;
-    otherwise behaviour is identical to the original 5-model version.
+    Back-test either classic sub-vote or the walk-forward meta pipeline.
     """
     df_orig = pd.read_csv(CSV_PATH)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     # ─── Assemble active sub-model list ────────────────────────────────────
-    submods = [mod1, mod2, mod3, mod4, mod5]
-    if "USE_CLASSIFIER" in globals() and USE_CLASSIFIER:
-        submods.append(mod6)            # mod6 == sub.classifier imported earlier
-    n_mods = len(submods)
+    submods = [mod1, mod2, mod3, mod4, mod5] + ([mod6] if USE_CLASSIFIER else [])
+    n_mods  = len(submods)
 
     # ----------------------------------------------------------------------
     # ---------- Classic majority-vote pipeline ----------------------------
@@ -367,15 +426,15 @@ def run_backtest(return_df: bool = False):
         # one vote column per active sub-model -----------------------------
         for k, mod in enumerate(submods, start=1):
             pred_col, vote_col = f"m{k}", f"v{k}"
-            if hasattr(mod, "compute_labels"):             # classifier-style
+            if hasattr(mod, "compute_labels"):          # classifier style
                 back[vote_col] = back[pred_col].map(
                     lambda p: vote_from_prob(p, VOTE_UP, VOTE_DOWN)
                 )
-            else:                                          # regression-style
+            else:                                       # regression style
                 back[vote_col] = back[pred_col].map(vote_from_ret)
 
         vote_cols    = [f"v{k}" for k in range(1, n_mods + 1)]
-        majority_req = (n_mods // 2) + 1                  # 3 of 5, 4 of 6, …
+        majority_req = (n_mods // 2) + 1
 
         back["buy_votes"]  = (back[vote_cols] == 1).sum(axis=1)
         back["sell_votes"] = (back[vote_cols] == 0).sum(axis=1)
@@ -394,64 +453,25 @@ def run_backtest(return_df: bool = False):
         ]
 
     # ----------------------------------------------------------------------
-    # ---------- Meta-model pipeline ---------------------------------------
+    # ---------- NEW: Walk-forward meta pipeline ---------------------------
     # ----------------------------------------------------------------------
     else:
-        cache_csv  = os.path.join(
+        cache_csv = os.path.join(
             RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv"
         )
-        meta_pkl   = os.path.join(RESULTS_DIR, "meta_model.pkl")
-        thresh_pkl = os.path.join(RESULTS_DIR, "meta_thresholds.pkl")
+        # ensure history is up-to-date
+        update_submeta_history(CSV_PATH, cache_csv, submods=submods, verbose=True)
 
-        hist = update_submeta_history(
-            CSV_PATH, cache_csv, submods=submods, verbose=True
+        df_out = walkforward_meta_backtest(
+            cache_csv=cache_csv,
+            n_mods=n_mods,
+            initial_frac=0.8,
+            metric="accuracy",
         )
 
-        # ▸ load or retrain meta-model -------------------------------------
-        must_retrain = True
-        if os.path.exists(meta_pkl) and os.path.exists(thresh_pkl):
-            with open(thresh_pkl, "rb") as f:
-                thresh_dict = pickle.load(f)
-            if thresh_dict.get("model_type") == META_MODEL_TYPE:
-                with open(meta_pkl, "rb") as f:
-                    meta = pickle.load(f)
-                up, down  = thresh_dict["up"], thresh_dict["down"]
-                must_retrain = False
-                print(
-                    f"[META] Loaded cached {META_MODEL_TYPE} "
-                    f"(BUY>{up:.2f} / SELL<{down:.2f})"
-                )
-
-        if must_retrain:
-            meta, up, down = train_and_save_meta(cache_csv, meta_pkl, thresh_pkl)
-            print(
-                f"[META] Trained new {META_MODEL_TYPE} "
-                f"(BUY>{up:.2f} / SELL<{down:.2f})"
-            )
-
-        # ▸ walk through cached rows ---------------------------------------
-        hist = pd.read_csv(cache_csv)  # ensure latest version
-        X = hist[
-            [f"m{k}"   for k in range(1, n_mods + 1)] +
-            [f"acc{k}" for k in range(1, n_mods + 1)]
-        ].values
-
-        records = []
-        for i in tqdm(range(len(hist)), desc="Meta Backtest"):
-            prob   = float(meta.predict_proba(X[i].reshape(1, -1))[0, 1])
-            action = "BUY" if prob > up else ("SELL" if prob < down else "HOLD")
-
-            rec = {"timestamp": hist["timestamp"].iloc[i]}
-            for k in range(1, n_mods + 1):
-                rec[f"m{k}"]   = hist[f"m{k}"].iloc[i]
-                rec[f"acc{k}"] = hist[f"acc{k}"].iloc[i]
-            rec.update({"meta_prob": prob, "action": action})
-            records.append(rec)
-
-        df_out = pd.DataFrame(records)
-        out_fn = os.path.join(RESULTS_DIR, f"meta_results_{MODE}.csv")
+        out_fn = os.path.join(RESULTS_DIR, f"meta_results_walkforward.csv")
         df_out.to_csv(out_fn, index=False, float_format="%.8f")
-        print(f"[RESULT] Results saved to {out_fn}")
+        print(f"[RESULT] Walk-forward results saved to {out_fn}")
 
     # ----------------------------------------------------------------------
     if return_df:

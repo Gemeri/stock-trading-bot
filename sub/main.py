@@ -157,14 +157,16 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
             if hasattr(mod, "compute_labels"):
                 d   = mod.compute_labels(slc)
                 tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["label"])
-                p   = mod.predict(mod.fit(tr[mod.FEATURES].values, tr["label"].values),
-                                  d.loc[[len(slc)-1], mod.FEATURES])[0]
+                last_feats = d[mod.FEATURES].iloc[[-1]]
+                p = mod.predict(mod.fit(tr[mod.FEATURES].values, tr["label"].values),
+                                    last_feats)[0]
                 lbl = d["label"].iloc[-1]
             else:                                    # regression style
                 d   = mod.compute_target(slc)
                 tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["target"])
-                p   = mod.predict(mod.fit(tr[mod.FEATURES], tr["target"]),
-                                  d.loc[[len(slc)-1], mod.FEATURES])[0]
+                last_feats = d[mod.FEATURES].iloc[[-1]]
+                p = mod.predict(mod.fit(tr[mod.FEATURES], tr["target"]),
+                                    last_feats)[0]
                 lbl = int(d["target"].iloc[-1] > 0)
             preds.append(p); labels.append(lbl)
 
@@ -306,17 +308,19 @@ def backtest_submodels(
             if hasattr(mod, "compute_labels"):          # classifier sub-model
                 d   = mod.compute_labels(slice_df)
                 tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["label"])
+                last_feats = d[mod.FEATURES].iloc[[-1]]
                 p   = mod.predict(
                         mod.fit(tr[mod.FEATURES].values, tr["label"].values),
-                        d.loc[[t], mod.FEATURES],
+                        last_feats,
                     )[0]
                 lbl = d["label"].iloc[-1]
             else:                                       # regression sub-model
                 d   = mod.compute_target(slice_df)
                 tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["target"])
+                last_feats = d[mod.FEATURES].iloc[[-1]]
                 p   = mod.predict(
                         mod.fit(tr[mod.FEATURES], tr["target"]),
-                        d.loc[[t], mod.FEATURES],
+                        last_feats,
                     )[0]
                 lbl = int(d["target"].iloc[-1] > 0)
             preds.append(p); labels.append(lbl)
@@ -491,10 +495,19 @@ def _prepare_train(df_slice: pd.DataFrame, module):
     return tr[module.FEATURES], tr["target"]
 
 
-def _row(df_slice: pd.DataFrame, module, idx: int):
-    """Single-row feature frame/array for prediction."""
-    d = module.compute_labels(df_slice) if hasattr(module, "compute_labels") else module.compute_target(df_slice)
-    return d.loc[[idx], module.FEATURES]
+def _row(df_slice: pd.DataFrame, module, idx: int | None = None):
+    d = (
+        module.compute_labels(df_slice)
+        if hasattr(module, "compute_labels")
+        else module.compute_target(df_slice)
+    )
+
+    if idx is not None and idx in d.index:
+        return d.loc[[idx], module.FEATURES]
+
+    # graceful fall-back when the requested index is missing
+    return d[module.FEATURES].iloc[[-1]]
+
 
 
 # ────────────────────────── run_live (verbose always on) ────────────────────

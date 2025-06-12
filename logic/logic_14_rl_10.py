@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.policies import ActorCriticPolicy
 
 # Memory system
 import faiss
@@ -73,6 +74,9 @@ def preprocess_df(df: pd.DataFrame, FEATURES: list) -> pd.DataFrame:
 # ---------------------------------
 # Custom Gym Environment
 # ---------------------------------
+
+EXCLUDE_ON_SAVE: list[str] = ["env", "policy_class"]
+
 class TradingEnv(gym.Env):
     metadata = {"render.modes": ["human"]}
 
@@ -200,7 +204,8 @@ def train_or_load_agent(env: gym.Env, model_path: str) -> tuple[PPO, VecNormaliz
     norm_stats_path = model_path.replace(".zip", "_vecnormalize.pkl")
 
     if os.path.exists(model_path) and os.path.exists(norm_stats_path):
-        model = PPO.load(model_path, env=vec_env)
+        custom_objects = {"policy_class": ActorCriticPolicy}
+        model = PPO.load(model_path, env=vec_env, custom_objects=custom_objects)
         vec_env = VecNormalize.load(norm_stats_path, vec_env)
         model.set_env(vec_env)
     else:
@@ -211,31 +216,7 @@ def train_or_load_agent(env: gym.Env, model_path: str) -> tuple[PPO, VecNormaliz
             tensorboard_log="./ppo_tb/"
         )
         model.learn(total_timesteps=200_000)
-        model.save(model_path)
-        vec_env.save(norm_stats_path)
-
-    return model, vec_env
-
-def train_or_load_agent(env: gym.Env, model_path: str) -> tuple[PPO, VecNormalize]:
-    vec_env = DummyVecEnv([lambda: env])
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-
-    norm_stats_path = model_path.replace(".zip", "_vecnormalize.pkl")
-
-    if os.path.exists(model_path) and os.path.exists(norm_stats_path):
-        model = PPO.load(model_path, env=vec_env)
-        vec_env = VecNormalize.load(norm_stats_path, vec_env)
-        model.set_env(vec_env)
-    else:
-        model = PPO(
-            "MlpPolicy",
-            vec_env,
-            verbose=1,
-            tensorboard_log="./ppo_tb/"
-        )
-        model.learn(total_timesteps=200_000)
-        # exclude the env when saving the model to avoid pickling recursion
-        model.save(model_path, exclude=["env"])
+        model.save(model_path, exclude=EXCLUDE_ON_SAVE)
         vec_env.save(norm_stats_path)
 
     return model, vec_env
@@ -261,7 +242,7 @@ def run_backtest(current_price: float,
 
     model.learn(total_timesteps=10_000)
     # again exclude the env when saving
-    model.save(model_path, exclude=["env"])
+    model.save(model_path, exclude=EXCLUDE_ON_SAVE)
     vec_env.save(norm_stats_path)
 
     # prepare & normalize obs from `candles`

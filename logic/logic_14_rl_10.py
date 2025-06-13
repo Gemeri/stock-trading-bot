@@ -6,6 +6,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import gym
+import sys
 from gym import spaces
 from dotenv import load_dotenv
 import torch
@@ -58,6 +59,8 @@ FEATURES = [
     'days_since_low'
 ]
 
+sys.setrecursionlimit(10000)
+
 def get_csv_filename(ticker: str) -> str:
     return f"{ticker}_{CONVERTED_TIMEFRAME}.csv"
 
@@ -75,7 +78,7 @@ def preprocess_df(df: pd.DataFrame, FEATURES: list) -> pd.DataFrame:
 # Custom Gym Environment
 # ---------------------------------
 
-EXCLUDE_ON_SAVE: list[str] = ["env", "policy_class"]
+EXCLUDE_ON_SAVE: list[str] = ["env"]
 
 class TradingEnv(gym.Env):
     metadata = {"render.modes": ["human"]}

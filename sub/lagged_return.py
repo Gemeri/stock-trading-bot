@@ -33,14 +33,17 @@ PARAM_DIST = {
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def compute_target(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add a column 'target' = next-bar open→open return.
+    """Add a 'target' column using close-to-close returns.
+
+    The regression model originally predicted next-bar open→open returns.
+    Using close→close makes its output directionally comparable with the
+    classification-based submodels and the meta label.
     """
     df = df.copy()
     if USE_META_LABEL:
         return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
-    df['open_t1'] = df['open'].shift(-1)
-    df['target']  = (df['open_t1'] - df['open']) / df['open']
+    df['close_t1'] = df['close'].shift(-1)
+    df['target'] = (df['close_t1'] - df['close']) / df['close']
     return df
 
 def sharpe(returns: np.ndarray) -> float:

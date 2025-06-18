@@ -58,7 +58,8 @@ EXECUTION  = globals().get("EXECUTION", "backtest")
 REG_UP, REG_DOWN = 0.003, -0.003
 
 # Set to True to force thresholds to 0.55/0.45 everywhere
-FORCE_STATIC_THRESHOLDS = True
+# Default is False so thresholds are optimised from validation data.
+FORCE_STATIC_THRESHOLDS = False
 STATIC_UP = 0.55
 STATIC_DOWN = 0.45
 
@@ -93,7 +94,12 @@ def _make_meta_model():
     All models expose .fit(X,y) and .predict_proba(X) just like LogisticRegression.
     """
     if META_MODEL_TYPE == "logreg":
-        return LogisticRegression(max_iter=1000, class_weight="balanced")
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+        return Pipeline([
+            ("scaler", StandardScaler()),
+            ("logreg", LogisticRegression(max_iter=1000, class_weight="balanced"))
+        ])
     elif META_MODEL_TYPE == "lgbm":
         from lightgbm import LGBMClassifier
         return LGBMClassifier(
@@ -264,7 +270,18 @@ def train_and_save_meta(
     X_val,   y_val   = X[split:], y[split:]
 
     meta = _make_meta_model()
-    meta.fit(X_train, y_train)
+
+    # Additional tuning for the logistic-regression meta model
+    if META_MODEL_TYPE == "logreg":
+        from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+        # Pipeline already contains scaler + estimator
+        param_grid = {"logreg__C": [0.01, 0.1, 1.0, 10.0]}
+        tscv = TimeSeriesSplit(n_splits=5)
+        grid = GridSearchCV(meta, param_grid, cv=tscv, scoring="roc_auc", n_jobs=-1)
+        grid.fit(X_train, y_train)
+        meta = grid.best_estimator_
+    else:
+        meta.fit(X_train, y_train)
 
     probs_val = meta.predict_proba(X_val)[:, 1]
     up, down  = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
@@ -379,7 +396,15 @@ def walkforward_meta_backtest(
         y_train = hist.loc[:i - 1, "meta_label"].values
 
         meta = _make_meta_model()
-        meta.fit(X_train, y_train)
+        if META_MODEL_TYPE == "logreg":
+            from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+            param_grid = {"logreg__C": [0.01, 0.1, 1.0, 10.0]}
+            tscv = TimeSeriesSplit(n_splits=5)
+            grid = GridSearchCV(meta, param_grid, cv=tscv, scoring="roc_auc", n_jobs=-1)
+            grid.fit(X_train, y_train)
+            meta = grid.best_estimator_
+        else:
+            meta.fit(X_train, y_train)
 
         # ─── ❷ choose asymmetric thresholds on an *internal* validation split
         #      (20 % of the current training slice)

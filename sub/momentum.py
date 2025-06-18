@@ -49,15 +49,19 @@ PARAM_GRID = {
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def compute_labels(df):
-    """
-    Compute binary momentum label:
-      label = 1 if next bar's open > this bar's open, else 0.
+    """Compute binary momentum label.
+
+    Historically this model used an open-to-open definition which was
+    inconsistent with the meta-label (close-to-close).  To ensure all
+    submodels align, the default label is now **close-to-close**:
+
+    ``label = 1 if next close > current close else 0``.
     """
     df = df.copy()
     if USE_META_LABEL:
         return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
-    df['open_t1'] = df['open'].shift(-1)
-    df['label']   = (df['open_t1'] > df['open']).astype(int)
+    df['close_t1'] = df['close'].shift(-1)
+    df['label'] = (df['close_t1'] > df['close']).astype(int)
     return df
 
 def sharpe(returns):

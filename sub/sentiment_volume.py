@@ -45,15 +45,20 @@ LGBM_PARAMS = {
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Label a breakout (1) if next-bar open→open return is in the top X% of abs returns.
-    By default, top 15% abs returns are breakouts.
+    """Compute breakout labels.
+
+    The original implementation used an open-to-open return when
+    determining breakouts.  This conflicted with the meta-model's
+    close-to-close orientation.  Labels now use **close-to-close**
+    returns so that all sub-models share the same target definition.
+    A breakout (label=1) occurs when the absolute next-bar return is in
+    the top 15% by default.
     """
     df = df.copy()
     if USE_META_LABEL:
         return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
-    df['open_t1'] = df['open'].shift(-1)
-    df['raw_ret'] = (df['open_t1'] - df['open']) / df['open']
+    df['close_t1'] = df['close'].shift(-1)
+    df['raw_ret'] = (df['close_t1'] - df['close']) / df['close']
     absrets = df['raw_ret'].abs()
 
     # Use percentile-based threshold if min_return not provided

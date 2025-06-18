@@ -58,7 +58,8 @@ EXECUTION  = globals().get("EXECUTION", "backtest")
 REG_UP, REG_DOWN = 0.003, -0.003
 
 # Set to True to force thresholds to 0.55/0.45 everywhere
-FORCE_STATIC_THRESHOLDS = True
+# Disabled by default so thresholds can adapt to data
+FORCE_STATIC_THRESHOLDS = False
 STATIC_UP = 0.55
 STATIC_DOWN = 0.45
 
@@ -124,15 +125,18 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
     Handles an arbitrary number of sub-models (N_SUBMODS).
     """
     df = pd.read_csv(CSV_PATH)
-    print("── DEBUG: CSV_PATH =", CSV_PATH)
-    print("── DEBUG: columns in CSV:", df.columns.tolist())
+    if verbose:
+        print("── DEBUG: CSV_PATH =", CSV_PATH)
+        print("── DEBUG: columns in CSV:", df.columns.tolist())
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
     col_m  = [f"m{i+1}"   for i in range(len(submods))]
     col_acc= [f"acc{i+1}" for i in range(len(submods))]
-    print(HISTORY_PATH)
+    if verbose:
+        print(HISTORY_PATH)
     if os.path.exists(HISTORY_PATH):
-        print("exists")
+        if verbose:
+            print("exists")
         hist = pd.read_csv(HISTORY_PATH)
         hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True)
         last_ts   = hist["timestamp"].iloc[-1]
@@ -143,6 +147,14 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
     else:
         hist = pd.DataFrame(columns=["timestamp", *col_m, *col_acc, "meta_label"])
         start_idx = int(len(df) * 0.6)
+
+    # pre-compute full labels/targets for ground truth accuracy
+    label_dfs = {}
+    for mod in submods:
+        if hasattr(mod, "compute_labels"):
+            label_dfs[mod] = mod.compute_labels(df).reset_index(drop=True)
+        else:
+            label_dfs[mod] = mod.compute_target(df).reset_index(drop=True)
 
     # rolling storage for accuracy -----------------------------------------
     preds_hist  = [[] for _ in submods]
@@ -158,16 +170,16 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
                 d   = mod.compute_labels(slc)
                 tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["label"])
                 last_feats = d[mod.FEATURES].iloc[[-1]]
-                p = mod.predict(mod.fit(tr[mod.FEATURES].values, tr["label"].values),
-                                    last_feats)[0]
-                lbl = d["label"].iloc[-1]
+                model = mod.fit(tr[mod.FEATURES].values, tr["label"].values)
+                p = mod.predict(model, last_feats)[0]
+                lbl = label_dfs[mod]["label"].iloc[i]
             else:                                    # regression style
                 d   = mod.compute_target(slc)
                 tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["target"])
                 last_feats = d[mod.FEATURES].iloc[[-1]]
-                p = mod.predict(mod.fit(tr[mod.FEATURES], tr["target"]),
-                                    last_feats)[0]
-                lbl = int(d["target"].iloc[-1] > 0)
+                model = mod.fit(tr[mod.FEATURES], tr["target"])
+                p = mod.predict(model, last_feats)[0]
+                lbl = int(label_dfs[mod]["target"].iloc[i] > 0)
             preds.append(p); labels.append(lbl)
 
         # rolling accuracies ------------------------------------------------
@@ -295,6 +307,14 @@ def backtest_submodels(
     cut = int(n * initial_frac)
     rec = []
 
+    # pre-compute full labels/targets once for accuracy reference ----------
+    label_dfs = {}
+    for mod in submods:
+        if hasattr(mod, "compute_labels"):
+            label_dfs[mod] = mod.compute_labels(df).reset_index(drop=True)
+        else:
+            label_dfs[mod] = mod.compute_target(df).reset_index(drop=True)
+
     # rolling containers for accuracy computation ---------------------------
     preds_history  = [[] for _ in range(n_mods)]
     labels_history = [[] for _ in range(n_mods)]
@@ -309,20 +329,16 @@ def backtest_submodels(
                 d   = mod.compute_labels(slice_df)
                 tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["label"])
                 last_feats = d[mod.FEATURES].iloc[[-1]]
-                p   = mod.predict(
-                        mod.fit(tr[mod.FEATURES].values, tr["label"].values),
-                        last_feats,
-                    )[0]
-                lbl = d["label"].iloc[-1]
+                model = mod.fit(tr[mod.FEATURES].values, tr["label"].values)
+                p   = mod.predict(model, last_feats)[0]
+                lbl = label_dfs[mod]["label"].iloc[t]
             else:                                       # regression sub-model
                 d   = mod.compute_target(slice_df)
                 tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["target"])
                 last_feats = d[mod.FEATURES].iloc[[-1]]
-                p   = mod.predict(
-                        mod.fit(tr[mod.FEATURES], tr["target"]),
-                        last_feats,
-                    )[0]
-                lbl = int(d["target"].iloc[-1] > 0)
+                model = mod.fit(tr[mod.FEATURES], tr["target"])
+                p   = mod.predict(model, last_feats)[0]
+                lbl = int(label_dfs[mod]["target"].iloc[t] > 0)
             preds.append(p); labels.append(lbl)
 
         # ---------- rolling accuracy histories ----------------------------

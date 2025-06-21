@@ -113,7 +113,7 @@ POSSIBLE_FEATURE_COLS = [
     'days_since_low'
 ]
 
-def call_sub_main(mode, df, execution):
+def call_sub_main(mode, df, execution, position_open=False):
     sub_main_path = os.path.join(os.path.dirname(__file__), "sub", "main.py")
     spec = importlib.util.spec_from_file_location("sub_main", sub_main_path)
     sub_main = importlib.util.module_from_spec(spec)
@@ -125,7 +125,7 @@ def call_sub_main(mode, df, execution):
         csv_path = "_sub_tmp_live.csv"
         df.to_csv(csv_path, index=False)
         sub_main.CSV_PATH = csv_path
-        result = sub_main.run_live(return_result=True)
+        result = sub_main.run_live(return_result=True, position_open=position_open)
         os.remove(csv_path)
         return result
     else:
@@ -244,14 +244,14 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
                 )
                 self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
                 self.dropout = nn.Dropout(0.20)
-                self.fc1 = nn.Linear(seq_len * d_model, 32)
+                self.fc1 = nn.Linear(d_model, 32)
                 self.relu = nn.ReLU()
                 self.out = nn.Linear(32, 1)
             def forward(self, x):
                 em = self.embedding(x)
                 out = self.transformer(em)
+                out = out.mean(dim=1)
                 out = self.dropout(out)
-                out = out.reshape(out.size(0), -1)
                 out = self.fc1(out)
                 out = self.relu(out)
                 return self.out(out)
@@ -271,14 +271,14 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
                 )
                 self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
                 self.dropout = nn.Dropout(0.20)
-                self.fc1 = nn.Linear(seq_len * d_model, 32)
+                self.fc1 = nn.Linear(d_model, 32)
                 self.relu = nn.ReLU()
                 self.out = nn.Linear(32, 2)
             def forward(self, x):
                 em = self.embedding(x)
                 out = self.transformer(em)
+                out = out.mean(dim=1)
                 out = self.dropout(out)
-                out = out.reshape(out.size(0), -1)
                 out = self.fc1(out)
                 out = self.relu(out)
                 return self.out(out)
@@ -1104,25 +1104,25 @@ def _train_meta_classifier(models: dict[str, object],
                            X_scaled: np.ndarray,
                            y_bin:    np.ndarray,
                            seq_len:  int) -> RidgeCV:
-    meta_X = []
-    meta_y = []
+    preds = []
+    for name in ("forest_cls", "xgboost_cls", "lightgbm_cls"):
+        preds.append(models[name].predict_proba(X_scaled)[:, 1])
 
-    for i in range(seq_len, len(X_scaled)):
-        base_row = []
-        for name in ("forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"):
-            if name == "transformer_cls":
-                seq = X_scaled[i - seq_len:i].reshape(1, seq_len, -1)
-                prob = torch.softmax(
-                    models[name](torch.tensor(seq, dtype=torch.float32)),
-                    dim=1
-                )[0, 1].item()
-            else:
-                prob = models[name].predict_proba(X_scaled[i:i+1])[0, 1]
-            base_row.append(prob)
-        meta_X.append(base_row)
-        meta_y.append(y_bin[i])
+    # transformer predictions
+    Xs, _ = series_to_supervised(X_scaled, y_bin, seq_len)
+    if len(Xs):
+        seq_t = torch.tensor(Xs, dtype=torch.float32)
+        models["transformer_cls"].eval()
+        with torch.no_grad():
+            p = torch.softmax(models["transformer_cls"](seq_t), dim=1)[:, 1].numpy()
+        tr_preds = np.concatenate([np.full(seq_len, np.nan), p])
+    else:
+        tr_preds = np.full(len(X_scaled), np.nan)
+    preds.append(tr_preds)
 
-    return RidgeCV().fit(np.array(meta_X), np.array(meta_y))
+    meta_X = np.column_stack(preds)
+    valid = ~np.isnan(meta_X).any(axis=1)
+    return RidgeCV().fit(meta_X[valid], y_bin[valid])
 
 
 def _predict_meta(models: dict[str, object],
@@ -1149,7 +1149,7 @@ def _predict_meta(models: dict[str, object],
 # -------------------------------
 # 8. Enhanced Train & Predict Pipeline
 # -------------------------------
-def train_and_predict(df: pd.DataFrame, return_model_stack=False):
+def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | None = None):
     if 'sentiment' in df.columns and df["sentiment"].dtype == object:
         try:
             df["sentiment"] = df["sentiment"].astype(float)
@@ -1200,7 +1200,14 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
 
     if "sub-vote" in ml_models or "sub-meta" in ml_models:
         mode    = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-        result  = call_sub_main(mode, df_full, execution="live")
+        position_open = False
+        if ticker is not None:
+            try:
+                pos_qty = float(api.get_position(ticker).qty)
+                position_open = abs(pos_qty) > 0
+            except Exception:
+                position_open = False
+        result  = call_sub_main(mode, df_full, execution="live", position_open=position_open)
         logging.info(f"Sub-{mode} run_live returned: {result!r}")
 
         # ── decide what we pass back upstream ───────────────────────────────
@@ -1237,7 +1244,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
         # --------------------------------------------------
         if len(ml_models) == 1 and ml_models[0] != "all_cls":
             name = ml_models[0]
-            base_models = _fit_base_classifiers(X_scaled, y_bin, seq_len)
+            base_models = _fit_base_classifiers(X_scaled[:-1], y_bin[:-1], seq_len)
             if name not in base_models:
                 logging.error(f"Unknown classifier {name}.")
                 return 0.5
@@ -1256,9 +1263,9 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False):
         wanted = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
         if (ml_models == ["all_cls"]) or set(ml_models) == wanted:
 
-            base_models = _fit_base_classifiers(X_scaled, y_bin, seq_len)
+            base_models = _fit_base_classifiers(X_scaled[:-1], y_bin[:-1], seq_len)
             meta_model  = _train_meta_classifier(
-                base_models, X_scaled, y_bin, seq_len
+                base_models, X_scaled[:-1], y_bin[:-1], seq_len
             )
             return _predict_meta(
                 base_models, meta_model, X_last_s, X_scaled, seq_len
@@ -2016,7 +2023,7 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
             if not check_latest_candle_condition(df, BAR_TIMEFRAME, scheduled_time_ny):
                 logging.info(f"[{ticker}] Latest candle condition not met for timeframe {BAR_TIMEFRAME} at scheduled time {scheduled_time_ny}. Skipping trade.")
                 continue
-        raw_pred = train_and_predict(df)
+        raw_pred = train_and_predict(df, ticker)
         if isinstance(raw_pred, str) and raw_pred.upper() in {"BUY", "SELL", "HOLD", "NONE"}:
             action_str    = raw_pred.upper()
             live_price    = get_current_price()
@@ -2229,7 +2236,7 @@ def console_listener():
                 allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
                 df = df.loc[:, [c for c in df.columns if c in allowed]]
 
-                pred_close = train_and_predict(df)
+                pred_close = train_and_predict(df, ticker)
                 if pred_close is None:
                     logging.error(f"[{ticker}] No prediction generated.")
                     continue
@@ -2533,7 +2540,7 @@ def console_listener():
                                     else:
                                         sub_df = df.iloc[:row_idx]
 
-                                    pred_close = train_and_predict(sub_df)
+                                    pred_close = train_and_predict(sub_df, ticker)
                                     row_data   = df.loc[row_idx]
                                     real_close = row_data["close"]
 

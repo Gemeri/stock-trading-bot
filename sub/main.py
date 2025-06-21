@@ -425,7 +425,30 @@ def walkforward_meta_backtest(
 
 
 # ───────────────────────── run_backtest ──────────────────────────────────────
-def run_backtest(return_df: bool = False):
+def _enforce_position_rules(actions, start_open=False):
+    """Adjust BUY/SELL signals based on existing position state."""
+    out = []
+    open_pos = start_open
+    for act in actions:
+        a = str(act).upper()
+        if a == "BUY":
+            if open_pos:
+                out.append("NONE")
+            else:
+                out.append("BUY")
+                open_pos = True
+        elif a == "SELL":
+            if not open_pos:
+                out.append("NONE")
+            else:
+                out.append("SELL")
+                open_pos = False
+        else:
+            out.append(a)
+    return out
+
+
+def run_backtest(return_df: bool = False, start_open: bool = False):
     """
     Back-test either classic sub-vote or the walk-forward meta pipeline.
     """
@@ -471,6 +494,7 @@ def run_backtest(return_df: bool = False):
         df_out = back[
             ["timestamp", *[f"m{k}" for k in range(1, n_mods + 1)], "action"]
         ]
+        df_out["action"] = df_out["action"].map({1: "BUY", 0: "SELL", 0.5: "HOLD"})
 
     # ----------------------------------------------------------------------
     # ---------- NEW: Walk-forward meta pipeline ---------------------------
@@ -495,6 +519,7 @@ def run_backtest(return_df: bool = False):
 
     # ----------------------------------------------------------------------
     if return_df:
+        df_out["action"] = _enforce_position_rules(df_out["action"].tolist(), start_open)
         return df_out
 
     
@@ -527,7 +552,7 @@ def _row(df_slice: pd.DataFrame, module, idx: int | None = None):
 
 
 # ────────────────────────── run_live (verbose always on) ────────────────────
-def run_live(return_result: bool = True):
+def run_live(return_result: bool = True, position_open: bool = False):
     """
     Produce one live prediction.
 
@@ -572,9 +597,10 @@ def run_live(return_result: bool = True):
         majority_req = (n_mods // 2) + 1                # 3 of 5, 4 of 6, …
         majority     = 1 if buy  >= majority_req else \
                        (0 if sell >= majority_req else 0.5)
-
-        print(f"[LIVE-VOTE] result = {majority}")
-        return majority if return_result else None
+        action = "BUY" if majority == 1 else ("SELL" if majority == 0 else "HOLD")
+        action = _enforce_position_rules([action], position_open)[0]
+        print(f"[LIVE-VOTE] result = {action}")
+        return action if return_result else None
 
     # ─── Meta-model path ──────────────────────────────────────────────────
     hist = update_submeta_history(
@@ -638,6 +664,7 @@ def run_live(return_result: bool = True):
 
     prob   = float(meta.predict_proba(np.array(p + accs).reshape(1, -1))[0, 1])
     action = "BUY" if prob > up else ("SELL" if prob < down else "HOLD")
+    action = _enforce_position_rules([action], position_open)[0]
     print(f"[LIVE] P(up)={prob:.3f}  →  {action}  (BUY>{up:.2f} / SELL<{down:.2f})")
 
     return (prob, action) if return_result else None

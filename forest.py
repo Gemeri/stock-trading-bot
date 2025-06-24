@@ -2023,7 +2023,7 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
             if not check_latest_candle_condition(df, BAR_TIMEFRAME, scheduled_time_ny):
                 logging.info(f"[{ticker}] Latest candle condition not met for timeframe {BAR_TIMEFRAME} at scheduled time {scheduled_time_ny}. Skipping trade.")
                 continue
-        raw_pred = train_and_predict(df, ticker)
+        raw_pred = train_and_predict(df, ticker=ticker)
         if isinstance(raw_pred, str) and raw_pred.upper() in {"BUY", "SELL", "HOLD", "NONE"}:
             action_str    = raw_pred.upper()
             live_price    = get_current_price()
@@ -2540,7 +2540,7 @@ def console_listener():
                                     else:
                                         sub_df = df.iloc[:row_idx]
 
-                                    pred_close = train_and_predict(sub_df, ticker)
+                                    pred_close = train_and_predict(sub_df, ticker=ticker)
                                     row_data   = df.loc[row_idx]
                                     real_close = row_data["close"]
 
@@ -2550,10 +2550,17 @@ def console_listener():
                                     start_idx  = max(0, row_idx - ROLL_WIN + 1)      # never < 0
                                     candles_bt = df.iloc[start_idx : row_idx + 1].copy()
 
-                                    # make sure the prediction column exists & is filled
+                                    # make sure the prediction column exists & is float-typed
                                     if "predicted_close" not in candles_bt.columns:
                                         candles_bt["predicted_close"] = np.nan
+                                    candles_bt["predicted_close"] = candles_bt["predicted_close"].astype(float)
+
+                                    # ensure pred_close is a scalar, then set it
+                                    if isinstance(pred_close, dict):
+                                        pred_close = list(pred_close.values())[-1]  # grab last value
+                                    pred_close = float(np.asarray(pred_close).flatten()[-1])
                                     candles_bt.at[candles_bt.index[-1], "predicted_close"] = pred_close
+
 
                                     # ───────────────────────────────────────────────────────────
                                     # 3. Call the user’s trading-logic module

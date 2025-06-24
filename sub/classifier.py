@@ -32,9 +32,7 @@ FEATURES = [
     # engineered flags
     "adx_trend", "macd_cross", "macd_hist_flip",
     # calendar / rolling extremes
-    "day_of_week", "days_since_high", "days_since_low",
-    # external forecast
-    "predicted_close",
+    "day_of_week", "days_since_high", "days_since_low"
 ]
 
 # ─── Hyper‑parameter Grid for XGBClassifier ────────────────────────────────

@@ -271,7 +271,7 @@ def train_and_save_meta(
     ].values
     y = hist["meta_label"].values
 
-    split = int(len(y) * 0.8)
+    split = int(len(y) * 0.6)
     X_train, y_train = X[:split], y[:split]
     X_val,   y_val   = X[split:], y[split:]
 
@@ -291,7 +291,7 @@ def train_and_save_meta(
 
 def backtest_submodels(
     df: pd.DataFrame,
-    initial_frac: float = 0.8,
+    initial_frac: float = 0.6,
     window: int = 50,
 ) -> pd.DataFrame:
     """
@@ -366,7 +366,7 @@ def backtest_submodels(
 def walkforward_meta_backtest(
     cache_csv: str,
     n_mods: int = N_SUBMODS,
-    initial_frac: float = 0.8,
+    initial_frac: float = 0.6,
     metric: str = "accuracy",
 ):
     """
@@ -463,7 +463,7 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
     # ---------- Classic majority-vote pipeline ----------------------------
     # ----------------------------------------------------------------------
     if MODE == "sub-vote":
-        back = backtest_submodels(df_orig, initial_frac=0.8)
+        back = backtest_submodels(df_orig, initial_frac=0.6)
         VOTE_UP, VOTE_DOWN = 0.55, 0.45
 
         # one vote column per active sub-model -----------------------------
@@ -509,7 +509,7 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
         df_out = walkforward_meta_backtest(
             cache_csv=cache_csv,
             n_mods=n_mods,
-            initial_frac=0.8,
+            initial_frac=0.6,
             metric="accuracy",
         )
 

@@ -38,6 +38,8 @@ import lightgbm as lgb
 from sklearn.ensemble import RandomForestClassifier
 from xgboost            import   XGBClassifier
 from lightgbm           import  LGBMClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 # LSTM/TF/Keras for deep learning models
 import tensorflow as tf
@@ -1062,31 +1064,44 @@ def _fit_base_classifiers(
         model_names = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
 
     models: dict[str, object] = {}
+    pos_weight = (len(y_bin) - y_bin.sum()) / max(y_bin.sum(), 1)
 
     # ── tree models ────────────────────────────────────────────────────────
     if "forest_cls" in model_names:
-        rf = RandomForestClassifier(n_estimators=N_ESTIMATORS,
-                                   random_state=RANDOM_SEED)
-        rf.fit(X_scaled, y_bin)
-        models["forest_cls"] = rf
+        rf = RandomForestClassifier(
+            n_estimators=N_ESTIMATORS,
+            random_state=RANDOM_SEED,
+            class_weight="balanced"
+        )
+        rf_cal = CalibratedClassifierCV(rf, method="isotonic", cv=3)
+        rf_cal.fit(X_scaled, y_bin)
+        models["forest_cls"] = rf_cal
 
     if "xgboost_cls" in model_names:
-        xgb_model = XGBClassifier(n_estimators=N_ESTIMATORS,
-                                  random_state=RANDOM_SEED,
-                                  use_label_encoder=False,
-                                  eval_metric="logloss")
-        xgb_model.fit(X_scaled, y_bin)
-        models["xgboost_cls"] = xgb_model
+        xgb_model = XGBClassifier(
+            n_estimators=N_ESTIMATORS,
+            random_state=RANDOM_SEED,
+            use_label_encoder=False,
+            eval_metric="logloss",
+            scale_pos_weight=pos_weight
+        )
+        xgb_cal = CalibratedClassifierCV(xgb_model, method="isotonic", cv=3)
+        xgb_cal.fit(X_scaled, y_bin)
+        models["xgboost_cls"] = xgb_cal
 
     if "lightgbm_cls" in model_names:
-        lgbm = LGBMClassifier(n_estimators=N_ESTIMATORS,
-                              random_state=RANDOM_SEED,
-                              verbose=-1)
-        lgbm.fit(X_scaled, y_bin)
-        models["lightgbm_cls"] = lgbm
+        lgbm = LGBMClassifier(
+            n_estimators=N_ESTIMATORS,
+            random_state=RANDOM_SEED,
+            verbose=-1,
+            is_unbalance=True
+        )
+        lgbm_cal = CalibratedClassifierCV(lgbm, method="isotonic", cv=3)
+        lgbm_cal.fit(X_scaled, y_bin)
+        models["lightgbm_cls"] = lgbm_cal
 
     # ── transformer classifier ────────────────────────────────────────────
-    if "transformer_cls" in model_names:
+    if "transformer_cls" in model_names and len(X_scaled) >= seq_len + 1:
         Xs, ys = series_to_supervised(X_scaled, y_bin, seq_len)
         if len(Xs):
             TCls = get_single_model("transformer_cls",
@@ -1114,12 +1129,12 @@ def _train_meta_classifier(models: dict[str, object],
                            y_bin:    np.ndarray,
                            seq_len:  int) -> tuple[RidgeCV, list[str]]:
     """Train a simple meta classifier using out-of-fold probabilities."""
-    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+    from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
     from sklearn.base import clone
 
     preds = []
     names_used: list[str] = []
-    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_SEED)
+    cv = TimeSeriesSplit(n_splits=3, test_size=seq_len)
 
     for name in ("forest_cls", "xgboost_cls", "lightgbm_cls"):
         if name not in models:
@@ -1248,10 +1263,13 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
 
     if any(m in classifier_set for m in ml_models):
 
-        scaler   = StandardScaler()
-        X_scaled = scaler.fit_transform(X.values)
-        y_bin    = (y.values > X.values[:, available_cols.index("close")]).astype(int)
+        scaler = StandardScaler()
+        X_train = X.iloc[:-1]
+        scaler.fit(X_train)
+        X_train_s = scaler.transform(X_train)
         X_last_s = scaler.transform(last_row_df)
+        X_scaled = np.vstack([X_train_s, X_last_s])
+        y_bin = (df_train['target'] > df_train['close']).astype(int).values
 
         # --------------------------------------------------
         #  a)   SIMPLE single-classifier request

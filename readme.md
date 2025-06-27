@@ -1,7 +1,5 @@
 # Stock Trading Bot
 
-> **Note:** Some parts of the script may currently contain errors related to the ML_MODEL options being transformer and the "all" meta model. These issues are known and will be fixed in an upcoming update
-
 A highly configurable and extensible stock trading bot that fetches market data, computes advanced features, trains and evaluates machine learning models, and executes trades via the Alpaca API. It supports multiple strategies (supervised, reinforcement learning, genetic algorithms, mathematical heuristics), ensemble submodels (sub-vote, sub-meta), news sentiment integration, interactive console commands, scheduling, backtesting, and optional Discord notifications.
 
 ---

@@ -1271,9 +1271,13 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         X_cls = df_train[cls_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
         y_bin = df_train["direction"].values
 
-        scaler = StandardScaler().fit(X_cls.iloc[:-1])
-        X_scaled = scaler.transform(X_cls.iloc[:-1])
-        X_last_s = scaler.transform(X_cls.iloc[[-1]])
+        # Fit the scaler on all available training rows so that the feature
+        # matrix used for model fitting aligns with the label vector.  The
+        # final row is reserved for prediction only and removed when
+        # training the classifiers below.
+        scaler = StandardScaler().fit(X_cls)
+        X_scaled = scaler.transform(X_cls)
+        X_last_s = X_scaled[[-1]]
 
         # --------------------------------------------------
         #  a)   SIMPLE single-classifier request

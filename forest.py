@@ -38,6 +38,7 @@ import lightgbm as lgb
 from sklearn.ensemble import RandomForestClassifier
 from xgboost            import   XGBClassifier
 from lightgbm           import  LGBMClassifier
+from sklearn.calibration import CalibratedClassifierCV
 
 # LSTM/TF/Keras for deep learning models
 import tensorflow as tf
@@ -1062,27 +1063,42 @@ def _fit_base_classifiers(
         model_names = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
 
     models: dict[str, object] = {}
+    pos_weight = ((len(y_bin) - y_bin.sum()) / y_bin.sum()) if y_bin.sum() else 1.0
 
     # ── tree models ────────────────────────────────────────────────────────
     if "forest_cls" in model_names:
-        rf = RandomForestClassifier(n_estimators=N_ESTIMATORS,
-                                   random_state=RANDOM_SEED)
+        rf = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=8,
+            min_samples_leaf=20,
+            class_weight="balanced_subsample",
+            random_state=RANDOM_SEED,
+        )
         rf.fit(X_scaled, y_bin)
+        rf = CalibratedClassifierCV(rf, method="isotonic", cv=3).fit(X_scaled, y_bin)
         models["forest_cls"] = rf
 
     if "xgboost_cls" in model_names:
-        xgb_model = XGBClassifier(n_estimators=N_ESTIMATORS,
-                                  random_state=RANDOM_SEED,
-                                  use_label_encoder=False,
-                                  eval_metric="logloss")
+        xgb_model = XGBClassifier(
+            n_estimators=300,
+            random_state=RANDOM_SEED,
+            use_label_encoder=False,
+            eval_metric="logloss",
+            scale_pos_weight=pos_weight,
+        )
         xgb_model.fit(X_scaled, y_bin)
+        xgb_model = CalibratedClassifierCV(xgb_model, method="isotonic", cv=3).fit(X_scaled, y_bin)
         models["xgboost_cls"] = xgb_model
 
     if "lightgbm_cls" in model_names:
-        lgbm = LGBMClassifier(n_estimators=N_ESTIMATORS,
-                              random_state=RANDOM_SEED,
-                              verbose=-1)
+        lgbm = LGBMClassifier(
+            n_estimators=300,
+            random_state=RANDOM_SEED,
+            verbose=-1,
+            scale_pos_weight=pos_weight,
+        )
         lgbm.fit(X_scaled, y_bin)
+        lgbm = CalibratedClassifierCV(lgbm, method="isotonic", cv=3).fit(X_scaled, y_bin)
         models["lightgbm_cls"] = lgbm
 
     # ── transformer classifier ────────────────────────────────────────────
@@ -1181,7 +1197,9 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         return None
 
     df_full = df_feat.copy()
-    df_full['target'] = df_full['close'].shift(-1)
+    df_full['ret1']    = df_full['close'].pct_change()
+    df_full['direction'] = (df_full['ret1'].shift(-1) > 0).astype(int)
+    df_full['target']  = df_full['close'].shift(-1)
 
     df_train = df_full.dropna(subset=['target']).copy()
     if len(df_train) < 70:
@@ -1248,10 +1266,14 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
 
     if any(m in classifier_set for m in ml_models):
 
-        scaler   = StandardScaler()
-        X_scaled = scaler.fit_transform(X.values)
-        y_bin    = (y.values > X.values[:, available_cols.index("close")]).astype(int)
-        X_last_s = scaler.transform(last_row_df)
+        price_like = {"open", "high", "low", "close", "vwap"}
+        cls_cols = [c for c in available_cols if c not in price_like]
+        X_cls = df_train[cls_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        y_bin = df_train["direction"].values
+
+        scaler = StandardScaler().fit(X_cls.iloc[:-1])
+        X_scaled = scaler.transform(X_cls.iloc[:-1])
+        X_last_s = scaler.transform(X_cls.iloc[[-1]])
 
         # --------------------------------------------------
         #  a)   SIMPLE single-classifier request

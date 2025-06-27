@@ -1054,84 +1054,98 @@ def series_to_supervised(Xvalues: np.ndarray,
 def _fit_base_classifiers(
     X_scaled:  np.ndarray,
     y_bin:     np.ndarray,
-    seq_len:   int
+    seq_len:   int,
+    model_names: set[str] | None = None
 ) -> dict[str, object]:
+    """Fit only the requested base classifiers."""
+    if model_names is None:
+        model_names = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
+
     models: dict[str, object] = {}
 
     # ── tree models ────────────────────────────────────────────────────────
-    rf  = RandomForestClassifier(n_estimators=N_ESTIMATORS,
-                                 random_state=RANDOM_SEED)
-    xgb = XGBClassifier(n_estimators=N_ESTIMATORS,
-                        random_state=RANDOM_SEED,
-                        use_label_encoder=False,
-                        eval_metric="logloss")
-    lgbm = LGBMClassifier(n_estimators=N_ESTIMATORS,
-                          random_state=RANDOM_SEED,
-                          verbose=-1)
+    if "forest_cls" in model_names:
+        rf = RandomForestClassifier(n_estimators=N_ESTIMATORS,
+                                   random_state=RANDOM_SEED)
+        rf.fit(X_scaled, y_bin)
+        models["forest_cls"] = rf
 
-    rf.fit (X_scaled, y_bin)
-    xgb.fit(X_scaled, y_bin)
-    lgbm.fit(X_scaled, y_bin)
+    if "xgboost_cls" in model_names:
+        xgb_model = XGBClassifier(n_estimators=N_ESTIMATORS,
+                                  random_state=RANDOM_SEED,
+                                  use_label_encoder=False,
+                                  eval_metric="logloss")
+        xgb_model.fit(X_scaled, y_bin)
+        models["xgboost_cls"] = xgb_model
 
-    models["forest_cls"]     = rf
-    models["xgboost_cls"]    = xgb
-    models["lightgbm_cls"]   = lgbm
+    if "lightgbm_cls" in model_names:
+        lgbm = LGBMClassifier(n_estimators=N_ESTIMATORS,
+                              random_state=RANDOM_SEED,
+                              verbose=-1)
+        lgbm.fit(X_scaled, y_bin)
+        models["lightgbm_cls"] = lgbm
 
     # ── transformer classifier ────────────────────────────────────────────
-    Xs, ys = series_to_supervised(X_scaled, y_bin, seq_len)
-    if len(Xs):
-        TCls = get_single_model("transformer_cls",
-                                num_features=X_scaled.shape[1])
-        net  = TCls(num_features=X_scaled.shape[1], seq_len=seq_len)
-        opt  = torch.optim.Adam(net.parameters(), lr=5e-4)
-        loss = nn.CrossEntropyLoss()
+    if "transformer_cls" in model_names:
+        Xs, ys = series_to_supervised(X_scaled, y_bin, seq_len)
+        if len(Xs):
+            TCls = get_single_model("transformer_cls",
+                                    num_features=X_scaled.shape[1])
+            net = TCls(num_features=X_scaled.shape[1], seq_len=seq_len)
+            opt = torch.optim.Adam(net.parameters(), lr=5e-4)
+            loss = nn.CrossEntropyLoss()
 
-        X_t = torch.tensor(Xs, dtype=torch.float32)
-        y_t = torch.tensor(ys, dtype=torch.long)
+            X_t = torch.tensor(Xs, dtype=torch.float32)
+            y_t = torch.tensor(ys, dtype=torch.long)
 
-        net.train()
-        for _ in range(10):                     # very small budget
-            opt.zero_grad()
-            loss(net(X_t), y_t).backward()
-            opt.step()
+            net.train()
+            for _ in range(10):  # very small budget
+                opt.zero_grad()
+                loss(net(X_t), y_t).backward()
+                opt.step()
 
-        net.eval()
-        models["transformer_cls"] = net
+            net.eval()
+            models["transformer_cls"] = net
 
     return models
 
 def _train_meta_classifier(models: dict[str, object],
                            X_scaled: np.ndarray,
                            y_bin:    np.ndarray,
-                           seq_len:  int) -> RidgeCV:
-    preds = []
-    for name in ("forest_cls", "xgboost_cls", "lightgbm_cls"):
-        preds.append(models[name].predict_proba(X_scaled)[:, 1])
+                           seq_len:  int) -> tuple[RidgeCV, list[str]]:
+    """Train a simple meta classifier using out-of-fold probabilities."""
+    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+    from sklearn.base import clone
 
-    # transformer predictions
-    Xs, _ = series_to_supervised(X_scaled, y_bin, seq_len)
-    if len(Xs):
-        seq_t = torch.tensor(Xs, dtype=torch.float32)
-        models["transformer_cls"].eval()
-        with torch.no_grad():
-            p = torch.softmax(models["transformer_cls"](seq_t), dim=1)[:, 1].numpy()
-        tr_preds = np.concatenate([np.full(seq_len, np.nan), p])
-    else:
-        tr_preds = np.full(len(X_scaled), np.nan)
-    preds.append(tr_preds)
+    preds = []
+    names_used: list[str] = []
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_SEED)
+
+    for name in ("forest_cls", "xgboost_cls", "lightgbm_cls"):
+        if name not in models:
+            continue
+        model = models[name]
+        p = cross_val_predict(clone(model), X_scaled, y_bin, cv=cv,
+                              method="predict_proba")[:, 1]
+        preds.append(p)
+        names_used.append(name)
+
+    if not preds:
+        raise ValueError("No base classifier predictions available for meta model")
 
     meta_X = np.column_stack(preds)
-    valid = ~np.isnan(meta_X).any(axis=1)
-    return RidgeCV().fit(meta_X[valid], y_bin[valid])
+    meta_model = RidgeCV().fit(meta_X, y_bin)
+    return meta_model, names_used
 
 
 def _predict_meta(models: dict[str, object],
                   meta_model: RidgeCV,
+                  names_used: list[str],
                   X_last_scaled: np.ndarray,
                   X_scaled:      np.ndarray,
                   seq_len:       int) -> float:
-    base_now = []
-    for name in ("forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"):
+    base_now: list[float] = []
+    for name in names_used:
         if name == "transformer_cls":
             seq = X_scaled[-seq_len:].reshape(1, seq_len, -1)
             prob = torch.softmax(
@@ -1244,7 +1258,9 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         # --------------------------------------------------
         if len(ml_models) == 1 and ml_models[0] != "all_cls":
             name = ml_models[0]
-            base_models = _fit_base_classifiers(X_scaled[:-1], y_bin[:-1], seq_len)
+            base_models = _fit_base_classifiers(
+                X_scaled[:-1], y_bin[:-1], seq_len, set(ml_models)
+            )
             if name not in base_models:
                 logging.error(f"Unknown classifier {name}.")
                 return 0.5
@@ -1263,12 +1279,14 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         wanted = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
         if (ml_models == ["all_cls"]) or set(ml_models) == wanted:
 
-            base_models = _fit_base_classifiers(X_scaled[:-1], y_bin[:-1], seq_len)
-            meta_model  = _train_meta_classifier(
+            base_models = _fit_base_classifiers(
+                X_scaled[:-1], y_bin[:-1], seq_len, wanted
+            )
+            meta_model, names_used = _train_meta_classifier(
                 base_models, X_scaled[:-1], y_bin[:-1], seq_len
             )
             return _predict_meta(
-                base_models, meta_model, X_last_s, X_scaled, seq_len
+                base_models, meta_model, names_used, X_last_s, X_scaled, seq_len
             )
 
         # --------------------------------------------------
@@ -2237,11 +2255,20 @@ def console_listener():
                 df = df.loc[:, [c for c in df.columns if c in allowed]]
 
                 pred_close = train_and_predict(df, ticker)
+                if isinstance(pred_close, tuple):
+                    pred_close = pred_close[0]
                 if pred_close is None:
                     logging.error(f"[{ticker}] No prediction generated.")
                     continue
                 current_price = float(df.iloc[-1]['close'])
-                logging.info(f"[{ticker}] Current Price={current_price:.2f}, Predicted Next Close={pred_close:.2f}")
+                try:
+                    pred_val = float(pred_close)
+                except Exception:
+                    logging.error(f"[{ticker}] Prediction not numeric: {pred_close}")
+                    continue
+                logging.info(
+                    f"[{ticker}] Current Price={current_price:.2f}, Predicted Next Close={pred_val:.2f}"
+                )
 
         elif cmd == "run-sentiment":
             logging.info("Running sentiment update job...")

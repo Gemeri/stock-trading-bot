@@ -45,10 +45,15 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 
 import torch
 import torch.nn as nn
 import importlib.util
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 
 # -------------------------------
 # 1. Load Configuration (from .env)
@@ -113,6 +118,12 @@ POSSIBLE_FEATURE_COLS = [
     'days_since_high',
     'days_since_low'
 ]
+
+def make_pipeline(base_est): 
+    return Pipeline([ 
+        ("sc",  StandardScaler()), 
+        ("cal", CalibratedClassifierCV(base_est, method="isotonic", cv=3)), 
+    ])
 
 def call_sub_main(mode, df, execution, position_open=False):
     sub_main_path = os.path.join(os.path.dirname(__file__), "sub", "main.py")
@@ -1067,39 +1078,42 @@ def _fit_base_classifiers(
 
     # ── tree models ────────────────────────────────────────────────────────
     if "forest_cls" in model_names:
-        rf = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=8,
-            min_samples_leaf=20,
+        rf_raw = RandomForestClassifier(
+            n_estimators=400,          # a bit deeper
+            max_depth=None,
+            min_samples_leaf=5,
             class_weight="balanced_subsample",
             random_state=RANDOM_SEED,
         )
-        rf.fit(X_scaled, y_bin)
-        rf = CalibratedClassifierCV(rf, method="isotonic", cv=3).fit(X_scaled, y_bin)
-        models["forest_cls"] = rf
+        models["forest_cls"] = make_pipeline(rf_raw).fit(X_scaled, y_bin)
 
+    # ▸ xgboost
     if "xgboost_cls" in model_names:
-        xgb_model = XGBClassifier(
-            n_estimators=300,
+        xgb_raw = XGBClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
             random_state=RANDOM_SEED,
-            use_label_encoder=False,
             eval_metric="logloss",
             scale_pos_weight=pos_weight,
+            tree_method="hist",
         )
-        xgb_model.fit(X_scaled, y_bin)
-        xgb_model = CalibratedClassifierCV(xgb_model, method="isotonic", cv=3).fit(X_scaled, y_bin)
-        models["xgboost_cls"] = xgb_model
+        models["xgboost_cls"] = make_pipeline(xgb_raw).fit(X_scaled, y_bin)
 
+    # ▸ lightgbm
     if "lightgbm_cls" in model_names:
-        lgbm = LGBMClassifier(
-            n_estimators=300,
+        lgb_raw = LGBMClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=64,
+            subsample=0.8,
+            colsample_bytree=0.8,
             random_state=RANDOM_SEED,
-            verbose=-1,
-            scale_pos_weight=pos_weight,
+            is_unbalance=True,
         )
-        lgbm.fit(X_scaled, y_bin)
-        lgbm = CalibratedClassifierCV(lgbm, method="isotonic", cv=3).fit(X_scaled, y_bin)
-        models["lightgbm_cls"] = lgbm
+        models["lightgbm_cls"] = make_pipeline(lgb_raw).fit(X_scaled, y_bin)
 
     # ── transformer classifier ────────────────────────────────────────────
     if "transformer_cls" in model_names:
@@ -1128,21 +1142,23 @@ def _fit_base_classifiers(
 def _train_meta_classifier(models: dict[str, object],
                            X_scaled: np.ndarray,
                            y_bin:    np.ndarray,
-                           seq_len:  int) -> tuple[RidgeCV, list[str]]:
+                           seq_len:  int) -> tuple[CalibratedClassifierCV, list[str]]:
     """Train a simple meta classifier using out-of-fold probabilities."""
-    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+    from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
     from sklearn.base import clone
 
-    preds = []
+    preds: list[np.ndarray] = []
     names_used: list[str] = []
-    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_SEED)
+    cv = TimeSeriesSplit(n_splits=4, test_size=seq_len)
 
     for name in ("forest_cls", "xgboost_cls", "lightgbm_cls"):
         if name not in models:
             continue
-        model = models[name]
-        p = cross_val_predict(clone(model), X_scaled, y_bin, cv=cv,
-                              method="predict_proba")[:, 1]
+        pipe = models[name]   
+        p = cross_val_predict(
+                pipe, X_scaled, y_bin,
+                cv=cv, method="predict_proba"
+        )[:, 1]
         preds.append(p)
         names_used.append(name)
 
@@ -1150,12 +1166,19 @@ def _train_meta_classifier(models: dict[str, object],
         raise ValueError("No base classifier predictions available for meta model")
 
     meta_X = np.column_stack(preds)
-    meta_model = RidgeCV().fit(meta_X, y_bin)
-    return meta_model, names_used
+
+    # ① fit ridge on the stacked OOF probabilities
+    ridge = RidgeCV().fit(meta_X, y_bin)
+
+    # ② calibrate that ridge so its output is a true probability
+    meta_cal = CalibratedClassifierCV(ridge, method="isotonic", cv=3)
+    meta_cal.fit(meta_X, y_bin)
+
+    return meta_cal, names_used
 
 
 def _predict_meta(models: dict[str, object],
-                  meta_model: RidgeCV,
+                  meta_model: CalibratedClassifierCV,
                   names_used: list[str],
                   X_last_scaled: np.ndarray,
                   X_scaled:      np.ndarray,
@@ -1172,7 +1195,8 @@ def _predict_meta(models: dict[str, object],
             prob = models[name].predict_proba(X_last_scaled)[0, 1]
         base_now.append(prob)
 
-    return float(np.clip(meta_model.predict([base_now])[0], 0.0, 1.0))
+    meta_prob = meta_model.predict_proba([base_now])[0, 1]
+    return float(meta_prob)
 
 
 

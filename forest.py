@@ -84,8 +84,24 @@ OPENAI_API_KEY= os.getenv("OPENAI_API_KEY", "")
 AI_TICKER_COUNT = int(os.getenv("AI_TICKER_COUNT", "0"))
 AI_TICKERS: list[str] = []
 
-TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "TSLA").split(",") if t.strip()]
-TRADE_LOG_FILENAME = "trade_log.csv"
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+TICKERLIST_PATH = os.path.join(DATA_DIR, "tickerlist.txt")
+
+USE_FULL_SHARES = os.getenv("USE_FULL_SHARES", "true").strip().lower() == "true"
+
+tickers_env = os.getenv("TICKERS", "TSLA")
+TICKERLIST_MODE = tickers_env.lower().startswith("tickerlist")
+TICKERLIST_TOP_N = 1
+if TICKERLIST_MODE:
+    parts = [p.strip() for p in tickers_env.split(",")]
+    if len(parts) > 1 and parts[1].isdigit():
+        TICKERLIST_TOP_N = int(parts[1])
+    TICKERS: list[str] = []
+else:
+    TICKERS = [t.strip().upper() for t in tickers_env.split(",") if t.strip()]
+
+TRADE_LOG_FILENAME = os.path.join(DATA_DIR, "trade_log.csv")
 
 # misc ---------------------------------------------------------------------------------------
 N_ESTIMATORS = 100
@@ -528,8 +544,8 @@ def fetch_candles_plus_features_and_predclose(
 ) -> pd.DataFrame:
 
     tf_code       = timeframe_to_code(timeframe)
-    csv_filename  = f"{ticker}_{tf_code}.csv"
-    sentiment_csv = f"{ticker}_sentiment_{tf_code}.csv"
+    csv_filename  = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
+    sentiment_csv = os.path.join(DATA_DIR, f"{ticker}_sentiment_{tf_code}.csv")
 
     def get_features(df: pd.DataFrame):
         exclude = {'predicted_close'}
@@ -809,7 +825,7 @@ def save_news_to_csv(ticker: str, news_list: list):
         rows.append(row)
 
     df_news = pd.DataFrame(rows)
-    csv_filename = f"{ticker}_articles_sentiment.csv"
+    csv_filename = os.path.join(DATA_DIR, f"{ticker}_articles_sentiment.csv")
     df_news.to_csv(csv_filename, index=False)
     logging.info(f"[{ticker}] Saved articles with sentiment to {csv_filename}")
 
@@ -835,13 +851,13 @@ def run_sentiment_job(skip_data=False):
         df_sentiment['sentiment'] = sentiments
         df_sentiment['sentiment'] = df_sentiment['sentiment'].apply(lambda x: f"{x:.15f}")
         tf_code = timeframe_to_code(BAR_TIMEFRAME)
-        sentiment_csv_filename = f"{ticker}_sentiment_{tf_code}.csv"
+        sentiment_csv_filename = os.path.join(DATA_DIR, f"{ticker}_sentiment_{tf_code}.csv")
         df_sentiment.to_csv(sentiment_csv_filename, index=False)
         logging.info(f"[{ticker}] Updated sentiment CSV: {sentiment_csv_filename}")
 
 def merge_sentiment_from_csv(df, ticker):
     tf_code = timeframe_to_code(BAR_TIMEFRAME)
-    sentiment_csv_filename = f"{ticker}_sentiment_{tf_code}.csv"
+    sentiment_csv_filename = os.path.join(DATA_DIR, f"{ticker}_sentiment_{tf_code}.csv")
     if not os.path.exists(sentiment_csv_filename):
         logging.error(f"Sentiment CSV {sentiment_csv_filename} not found for ticker {ticker}.")
         return df
@@ -1670,6 +1686,50 @@ def _ensure_ai_tickers():
     else:
         logging.info("No need to fetch new AI tickers; current AI Tickers are sufficient.")
 
+
+def select_best_tickers() -> list[str]:
+    if not TICKERLIST_MODE:
+        return TICKERS
+
+    if not os.path.exists(TICKERLIST_PATH):
+        logging.error(f"Ticker list file not found: {TICKERLIST_PATH}")
+        return []
+
+    with open(TICKERLIST_PATH) as f:
+        tickers = [ln.strip().upper() for ln in f if ln.strip()]
+
+    ml_models = parse_ml_models()
+    classifier_set = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
+    results: list[tuple[float, str]] = []
+
+    for tck in tickers:
+        df = fetch_candles_plus_features_and_predclose(
+            tck,
+            bars=N_BARS,
+            timeframe=BAR_TIMEFRAME,
+            rewrite_mode=REWRITE,
+        )
+        allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+        df = df.loc[:, [c for c in df.columns if c in allowed]]
+        pred = train_and_predict(df, ticker=tck)
+        if pred is None:
+            continue
+        try:
+            pred_val = float(pred)
+        except (TypeError, ValueError):
+            continue
+        current_price = float(df.iloc[-1]["close"])
+        if set(ml_models) & classifier_set:
+            metric = pred_val
+        else:
+            metric = (pred_val - current_price) / current_price
+        results.append((metric, tck))
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    selected = [t for _, t in results[: max(1, TICKERLIST_TOP_N)]]
+    logging.info(f"Selected tickers from list: {selected}")
+    return selected
+
 # -------------------------------
 # 9. Trading Logic & Order Functions
 # -------------------------------
@@ -1742,19 +1802,20 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
             total_ticker_slots = (len(TICKERS) if TICKERS else 0) + AI_TICKER_COUNT
             total_ticker_slots = max(total_ticker_slots, 1)
             split_cash = available_cash / total_ticker_slots
-            max_shares = int(split_cash // buy_price)
+            max_shares = (split_cash // buy_price) if USE_FULL_SHARES else (split_cash / buy_price)
             final_qty = min(qty, max_shares)
             if final_qty <= 0:
                 logging.info(f"[{ticker}] Not enough split cash to buy any shares. Skipping.")
                 return
             api.submit_order(
                 symbol=ticker,
-                qty=int(final_qty),
+                qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
                 side='buy',
                 type='market',
                 time_in_force='gtc'
             )
-            logging.info(f"[{ticker}] BUY {int(final_qty)} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
+            log_qty = int(final_qty) if USE_FULL_SHARES else round(final_qty, 4)
+            logging.info(f"[{ticker}] BUY {log_qty} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
             log_trade("BUY", ticker, final_qty, buy_price, predicted_price, None)
             if ticker not in TICKERS and ticker not in AI_TICKERS:
                 AI_TICKERS.append(ticker)
@@ -1796,13 +1857,14 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
             avg_entry = float(pos.avg_entry_price) if pos else 0.0
             api.submit_order(
                 symbol=ticker,
-                qty=int(sellable_qty),
+                qty=int(sellable_qty) if USE_FULL_SHARES else round(sellable_qty, 4),
                 side='sell',
                 type='market',
                 time_in_force='gtc'
             )
             pl = (sell_price - avg_entry) * sellable_qty
-            logging.info(f"[{ticker}] SELL {int(sellable_qty)} at {sell_price:.2f} (Predicted: {predicted_price:.2f}, P/L: {pl:.2f})")
+            log_qty = int(sellable_qty) if USE_FULL_SHARES else round(sellable_qty, 4)
+            logging.info(f"[{ticker}] SELL {log_qty} at {sell_price:.2f} (Predicted: {predicted_price:.2f}, P/L: {pl:.2f})")
             log_trade("SELL", ticker, sellable_qty, sell_price, predicted_price, pl)
             try:
                 new_pos = api.get_position(ticker)
@@ -1845,19 +1907,21 @@ def short_shares(ticker, qty, short_price, predicted_price):
                 avg_entry = float(pos.avg_entry_price)
                 api.submit_order(
                     symbol=ticker,
-                    qty=int(abs_long_qty),
+                    qty=int(abs_long_qty) if USE_FULL_SHARES else round(abs_long_qty, 4),
                     side='sell',
                     type='market',
                     time_in_force='gtc'
                 )
                 pl = (short_price - avg_entry) * abs_long_qty
-                logging.info(f"[{ticker}] Auto-SELL {int(abs_long_qty)} at {short_price:.2f} before SHORT")
+                log_qty = int(abs_long_qty) if USE_FULL_SHARES else round(abs_long_qty, 4)
+                logging.info(f"[{ticker}] Auto-SELL {log_qty} at {short_price:.2f} before SHORT")
                 log_trade("SELL", ticker, abs_long_qty, short_price, predicted_price, pl)
             pos_qty = 0.0
 
         # Step 2: If already short, avoid duplicate short
         if already_short:
-            logging.info(f"[{ticker}] Already short {int(abs_short_qty)} shares. Skipping new SHORT to prevent duplicate short position.")
+            log_qty = int(abs_short_qty) if USE_FULL_SHARES else round(abs_short_qty, 4)
+            logging.info(f"[{ticker}] Already short {log_qty} shares. Skipping new SHORT to prevent duplicate short position.")
             return
 
         # Step 3: Proceed to open new SHORT for qty
@@ -1872,19 +1936,20 @@ def short_shares(ticker, qty, short_price, predicted_price):
             total_ticker_slots = (len(TICKERS) if TICKERS else 0) + AI_TICKER_COUNT
             total_ticker_slots = max(total_ticker_slots, 1)
             split_cash = available_cash / total_ticker_slots
-            max_shares = int(split_cash // short_price)
+            max_shares = (split_cash // short_price) if USE_FULL_SHARES else (split_cash / short_price)
             final_qty = min(qty, max_shares)
             if final_qty <= 0:
                 logging.info(f"[{ticker}] Not enough split cash/margin to short any shares. Skipping.")
                 return
             api.submit_order(
                 symbol=ticker,
-                qty=int(final_qty),
+                qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
                 side='sell',
                 type='market',
                 time_in_force='gtc'
             )
-            logging.info(f"[{ticker}] SHORT {int(final_qty)} at {short_price:.2f} (Predicted: {predicted_price:.2f})")
+            log_qty = int(final_qty) if USE_FULL_SHARES else round(final_qty, 4)
+            logging.info(f"[{ticker}] SHORT {log_qty} at {short_price:.2f} (Predicted: {predicted_price:.2f})")
             log_trade("SHORT", ticker, final_qty, short_price, predicted_price, None)
             if ticker not in TICKERS and ticker not in AI_TICKERS:
                 AI_TICKERS.append(ticker)
@@ -1925,13 +1990,14 @@ def close_short(ticker, qty, cover_price):
             avg_entry = float(pos.avg_entry_price) if pos else 0.0
             api.submit_order(
                 symbol=ticker,
-                qty=int(coverable_qty),
+                qty=int(coverable_qty) if USE_FULL_SHARES else round(coverable_qty, 4),
                 side='buy',
                 type='market',
                 time_in_force='gtc'
             )
             pl = (avg_entry - cover_price) * coverable_qty
-            logging.info(f"[{ticker}] COVER SHORT {int(coverable_qty)} at {cover_price:.2f} (P/L: {pl:.2f})")
+            log_qty = int(coverable_qty) if USE_FULL_SHARES else round(coverable_qty, 4)
+            logging.info(f"[{ticker}] COVER SHORT {log_qty} at {cover_price:.2f} (P/L: {pl:.2f})")
             log_trade("COVER", ticker, coverable_qty, cover_price, None, pl)
             try:
                 new_pos = api.get_position(ticker)
@@ -2050,9 +2116,11 @@ def check_latest_candle_condition(df: pd.DataFrame, timeframe: str, scheduled_ti
 
 
 def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
-    for ticker in TICKERS:
+    _ensure_ai_tickers()
+    tickers_run = sorted(set(TICKERS + AI_TICKERS))
+    for ticker in tickers_run:
         tf_code = timeframe_to_code(BAR_TIMEFRAME)
-        csv_filename = f"{ticker}_{tf_code}.csv"
+        csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
 
         if not skip_data:
             df = fetch_candles_plus_features_and_predclose(
@@ -2200,6 +2268,10 @@ def run_job(scheduled_time_ny: str):
                 logging.error("Max retries exceeded. Skipping the scheduled job.")
                 return
 
+    global TICKERS
+    if TICKERLIST_MODE:
+        TICKERS = select_best_tickers()
+
     _perform_trading_job(skip_data=False, scheduled_time_ny=scheduled_time_ny)
     logging.info("Scheduled trading job finished.")
 
@@ -2274,14 +2346,14 @@ def console_listener():
                 )
 
                 tf_code = timeframe_to_code(timeframe)
-                csv_filename = f"{ticker}_{tf_code}.csv"
+                csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
                 df.to_csv(csv_filename, index=False)
                 logging.info(f"[{ticker}] Saved candle data + advanced features (minus disabled) to {csv_filename}.")
 
         elif cmd == "predict-next":
             for ticker in TICKERS:
                 tf_code = timeframe_to_code(BAR_TIMEFRAME)
-                csv_filename = f"{ticker}_{tf_code}.csv"
+                csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
                 if skip_data:
                     logging.info(f"[{ticker}] predict-next -r: Using existing CSV {csv_filename}")
                     if not os.path.exists(csv_filename):
@@ -2325,7 +2397,7 @@ def console_listener():
             run_sentiment_job(skip_data=skip_data)
             for ticker in TICKERS:
                 tf_code = timeframe_to_code(BAR_TIMEFRAME)
-                candle_csv = f"{ticker}_{tf_code}.csv"
+                candle_csv = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
                 if not os.path.exists(candle_csv):
                     logging.error(f"[{ticker}] Candle CSV {candle_csv} not found, skipping merge.")
                     continue
@@ -2418,7 +2490,7 @@ def console_listener():
 
                     for ticker in TICKERS:
                         tf_code = timeframe_to_code(timeframe_for_backtest)
-                        csv_filename = f"{ticker}_{tf_code}.csv"
+                        csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
                         if skip_data:
                             logging.info(f"[{ticker}] backtest -r: using existing CSV {csv_filename}")
                             if not os.path.exists(csv_filename):
@@ -2856,7 +2928,7 @@ def console_listener():
 
             for ticker in TICKERS:
                 tf_code  = timeframe_to_code(BAR_TIMEFRAME)
-                csv_file = f"{ticker}_{tf_code}.csv"
+                csv_file = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
 
                 # ─── FETCH OR LOAD ──────────────────────────────────────────────────────
                 if not skip_data:

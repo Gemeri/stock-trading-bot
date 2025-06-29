@@ -81,6 +81,8 @@ BING_API_KEY=your_bing_api_key
 
 # Trading & Data Settings
 TICKERS=TSLA, AAPL             # Comma‑separated list of tickers
+# Or use `tickerlist` to pick the best from `data/tickerlist.txt`
+# e.g. `TICKERS=tickerlist,5` for the top 5
 BAR_TIMEFRAME=30Min            # 15Min, 30Min, 1Hour, 2Hour, 4Hour, etc.
 N_BARS=5000                    # Number of historical bars to fetch
 NEWS_MODE=on                   # on/off to enable news sentiment integration
@@ -91,6 +93,7 @@ AI_TICKER_COUNT=0              # Number of tickers to generate via AI models (0=
 ML_MODEL=forest                # forest, xgboost, lstm, transformer, sub-vote, sub-meta
 META_MODEL_TYPE=logreg         # logreg, lgbm, xgb, nn (for sub-meta)
 USE_META_LABEL=false           # true/false to use meta labels in ensemble
+USE_FULL_SHARES=true           # true to trade whole shares only
 
 # Scheduling
 RUN_SCHEDULE=on                # on/off to enable scheduled jobs

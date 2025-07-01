@@ -88,6 +88,7 @@ N_BARS=5000                    # Number of historical bars to fetch
 NEWS_MODE=on                   # on/off to enable news sentiment integration
 TRADE_LOGIC=1                  # Select logic script ID from `logic/` folder
 AI_TICKER_COUNT=0              # Number of tickers to generate via AI models (0=disabled)
+MAX_TICKERS=0                  # Max distinct tickers allowed in portfolio (0=unlimited)
 
 # Machine Learning Settings
 ML_MODEL=forest                # forest, xgboost, lstm, transformer, sub-vote, sub-meta
@@ -136,6 +137,7 @@ At any time, type commands in the terminal where the bot is running:
 * `run-sentiment [-r]`               – Updates news sentiment scores.
 * `force-run [-r]`                   – Immediately runs sentiment + trading job, ignoring market hours.
 * `backtest <TEST_SIZE> [simple|complex]`  – Runs backtest on last `TEST_SIZE` bars.
+* `get-best-tickers <N> [-r]`       – Computes top tickers from `tickerlist`.
 * `trade-logic <ID>`                 – Switches to logic script `logic_<ID>`.py.
 * `set-tickers <T1,T2,...>`         – Updates `TICKERS` list at runtime.
 * `set-timeframe <TF>`               – Updates `BAR_TIMEFRAME` at runtime.

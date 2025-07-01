@@ -84,9 +84,13 @@ OPENAI_API_KEY= os.getenv("OPENAI_API_KEY", "")
 AI_TICKER_COUNT = int(os.getenv("AI_TICKER_COUNT", "0"))
 AI_TICKERS: list[str] = []
 
+# maximum number of distinct tickers allowed in portfolio (0=unlimited)
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "0"))
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 TICKERLIST_PATH = os.path.join(DATA_DIR, "tickerlist.txt")
+BEST_TICKERS_CACHE = os.path.join(DATA_DIR, "best_tickers_cache.json")
 
 USE_FULL_SHARES = os.getenv("USE_FULL_SHARES", "true").strip().lower() == "true"
 
@@ -1687,9 +1691,42 @@ def _ensure_ai_tickers():
         logging.info("No need to fetch new AI tickers; current AI Tickers are sufficient.")
 
 
-def select_best_tickers() -> list[str]:
-    if not TICKERLIST_MODE:
+def get_owned_tickers() -> set[str]:
+    try:
+        positions = api.list_positions()
+        return {p.symbol for p in positions if abs(float(p.qty)) > 0}
+    except Exception as e:
+        logging.error(f"Error retrieving positions: {e}")
+        return set()
+
+
+def owned_ticker_count() -> int:
+    return len(get_owned_tickers())
+
+
+def available_cash() -> float:
+    try:
+        account = api.get_account()
+        return float(account.cash)
+    except Exception as e:
+        logging.error(f"Error retrieving account cash: {e}")
+        return 0.0
+
+
+def max_tickers_reached() -> bool:
+    return MAX_TICKERS > 0 and owned_ticker_count() >= MAX_TICKERS
+
+
+def cash_below_minimum() -> bool:
+    return available_cash() < 10
+
+
+def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> list[str]:
+    if not TICKERLIST_MODE and top_n is None:
         return TICKERS
+
+    if top_n is None:
+        top_n = TICKERLIST_TOP_N
 
     if not os.path.exists(TICKERLIST_PATH):
         logging.error(f"Ticker list file not found: {TICKERLIST_PATH}")
@@ -1703,12 +1740,27 @@ def select_best_tickers() -> list[str]:
     results: list[tuple[float, str]] = []
 
     for tck in tickers:
-        df = fetch_candles_plus_features_and_predclose(
-            tck,
-            bars=N_BARS,
-            timeframe=BAR_TIMEFRAME,
-            rewrite_mode=REWRITE,
-        )
+        tf_code = timeframe_to_code(BAR_TIMEFRAME)
+        csv_file = os.path.join(DATA_DIR, f"{tck}_{tf_code}.csv")
+        if skip_data:
+            if not os.path.exists(csv_file):
+                logging.error(f"[{tck}] CSV {csv_file} not found, skipping.")
+                continue
+            df = pd.read_csv(csv_file, parse_dates=["timestamp"])
+            if df.empty:
+                logging.error(f"[{tck}] CSV empty, skipping.")
+                continue
+        else:
+            df = fetch_candles_plus_features_and_predclose(
+                tck,
+                bars=N_BARS,
+                timeframe=BAR_TIMEFRAME,
+                rewrite_mode=REWRITE,
+            )
+            try:
+                df.to_csv(csv_file, index=False)
+            except Exception as e:
+                logging.error(f"[{tck}] Unable to save CSV: {e}")
         allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
         df = df.loc[:, [c for c in df.columns if c in allowed]]
         pred = train_and_predict(df, ticker=tck)
@@ -1726,8 +1778,53 @@ def select_best_tickers() -> list[str]:
         results.append((metric, tck))
 
     results.sort(key=lambda x: x[0], reverse=True)
-    selected = [t for _, t in results[: max(1, TICKERLIST_TOP_N)]]
+    selected = [t for _, t in results[: max(1, top_n)]]
     logging.info(f"Selected tickers from list: {selected}")
+    return selected
+
+
+def load_best_ticker_cache() -> tuple[list[str], datetime | None]:
+    if not os.path.exists(BEST_TICKERS_CACHE):
+        return [], None
+    try:
+        with open(BEST_TICKERS_CACHE, "r") as f:
+            data = json.load(f)
+        tickers = data.get("tickers", [])
+        ts_raw = data.get("timestamp")
+        ts = datetime.fromisoformat(ts_raw) if ts_raw else None
+        return tickers, ts
+    except Exception as e:
+        logging.error(f"Error reading best ticker cache: {e}")
+        return [], None
+
+
+def save_best_ticker_cache(tickers: list[str]) -> None:
+    data = {
+        "tickers": tickers,
+        "timestamp": datetime.now(NY_TZ).isoformat()
+    }
+    try:
+        with open(BEST_TICKERS_CACHE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logging.error(f"Unable to save best ticker cache: {e}")
+
+
+def compute_and_cache_best_tickers() -> list[str]:
+    global TICKERS
+
+    if not TICKERLIST_MODE:
+        return TICKERS
+
+    if cash_below_minimum() or max_tickers_reached():
+        owned = list(get_owned_tickers())
+        TICKERS = owned
+        save_best_ticker_cache(owned)
+        return owned
+
+    selected = select_best_tickers()
+    TICKERS = selected
+    save_best_ticker_cache(selected)
     return selected
 
 # -------------------------------
@@ -1753,6 +1850,14 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
     if qty <= 0:
         return
     try:
+        if cash_below_minimum():
+            logging.info("Available cash below $10. BUY rejected.")
+            return
+
+        if max_tickers_reached() and ticker not in get_owned_tickers():
+            logging.info(f"max_tickers limit {MAX_TICKERS} reached. BUY of {ticker} denied.")
+            return
+
         pos = None
         try:
             pos = api.get_position(ticker)
@@ -2270,9 +2375,17 @@ def run_job(scheduled_time_ny: str):
 
     global TICKERS
     if TICKERLIST_MODE:
-        TICKERS = select_best_tickers()
+        cached, _ = load_best_ticker_cache()
+        if cached:
+            TICKERS = cached
+        else:
+            TICKERS = compute_and_cache_best_tickers()
 
     _perform_trading_job(skip_data=False, scheduled_time_ny=scheduled_time_ny)
+
+    if TICKERLIST_MODE and clock.is_open:
+        compute_and_cache_best_tickers()
+
     logging.info("Scheduled trading job finished.")
 
 
@@ -2920,6 +3033,17 @@ def console_listener():
 
                             logging.info(f"[{ticker}] Saved portfolio plot → {port_png}")
 
+        elif cmd == "get-best-tickers":
+            n = 1
+            if len(parts) > 1 and parts[1] != "-r":
+                try:
+                    n = int(parts[1])
+                except ValueError:
+                    logging.error("Invalid number for get-best-tickers.")
+                    continue
+            result = select_best_tickers(top_n=n, skip_data=skip_data)
+            logging.info(f"Best tickers: {result}")
+
         elif cmd == "feature-importance":
             if skip_data:
                 logging.info("feature-importance -r: Will use existing CSV data for each ticker.")
@@ -3013,6 +3137,7 @@ def console_listener():
             logging.info("  run-sentiment [-r]")
             logging.info("  force-run [-r]")
             logging.info("  backtest <N> [simple|complex] [timeframe?] [-r?]")
+            logging.info("  get-best-tickers <N> [-r]")
             logging.info("  feature-importance [-r]")
             logging.info("  set-tickers (tickers)")
             logging.info("  set-timeframe (timeframe)")
@@ -3154,11 +3279,13 @@ def console_listener():
 
 def main():
     _update_logic_json()
+    if RUN_SCHEDULE == "on" and TICKERLIST_MODE:
+        compute_and_cache_best_tickers()
     setup_schedule_for_timeframe(BAR_TIMEFRAME)
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], feature-importance [-r], commands, set-tickers, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name)")
+    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-tickers, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name)")
 
     while not SHUTDOWN:
         try:

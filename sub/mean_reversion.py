@@ -27,6 +27,11 @@ import matplotlib.pyplot as plt
 from sub.common import compute_meta_labels, USE_META_LABEL
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -48,24 +53,28 @@ PARAM_GRID = {
 
 def compute_labels(df):
     """
-    Label = 1 if any of the next 2 bars snaps back toward the mean 
-    by ≥ 1×ATR, else 0.  Also stores `mean_band`.
+    Same snap-back definition, now guarantees the returned frame
+    has no missing values in FEATURES + label and still supports
+    USE_META_LABEL override.
     """
     df = df.copy()
+
     if USE_META_LABEL:
+        # hand off to meta-label helper exactly as before
         return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
+
     df['mean_band'] = (df['bollinger_upper'] + df['bollinger_lower']) / 2
-    c0 = df['close']
-    c1 = c0.shift(-1)
-    c2 = c0.shift(-2)
-    # upstream snaps
+    c0, c1, c2 = df['close'], df['close'].shift(-1), df['close'].shift(-2)
+
     up1 = (c0 > df['mean_band']) & ((c0 - c1) >= df['atr'])
     up2 = (c0 > df['mean_band']) & ((c0 - c2) >= df['atr'])
-    # downstream snaps
     dn1 = (c0 < df['mean_band']) & ((c1 - c0) >= df['atr'])
     dn2 = (c0 < df['mean_band']) & ((c2 - c0) >= df['atr'])
-    df['label'] = (up1|up2|dn1|dn2).astype(int)
-    return df.dropna(subset=FEATURES + ['label'])
+
+    df['label'] = (up1 | up2 | dn1 | dn2).astype(int)
+
+    # Drop any row still missing required features or label
+    return df.dropna(subset=FEATURES + ['label']).reset_index(drop=True)
 
 def sharpe(returns):
     """Annualized Sharpe assuming 252 trades/year."""
@@ -80,35 +89,48 @@ def max_drawdown(equity):
 
 # ─── Fit & Predict for Meta‐Model ───────────────────────────────────────────────
 
-def fit(X_train: np.ndarray, y_train: np.ndarray) -> RandomForestClassifier:
+def fit(X_train: np.ndarray, y_train: np.ndarray):
     """
-    Grid-search CV on (X_train, y_train) to tune hyperparameters,
-    then return the best-fitted RandomForestClassifier.
+    • Time-series GridSearchCV tunes the Random Forest hyper-params.  
+    • Best RF is then **isotonic-calibrated** with another TS split.  
+    • Returns the calibrated model while still exposing .get_params()
+      for external cloning inside main.py.
     """
-    logging.info("Running FIT on mean_reversion")
-    # time-series CV splitter
+    logging.info("Running FIT on mean_reversion (TS-CV + calibration)")
+
     tscv = TimeSeriesSplit(n_splits=5)
 
-    # base classifier
-    base = RandomForestClassifier(
-        class_weight='balanced',
+    base_rf = RandomForestClassifier(
+        class_weight="balanced",
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
     )
 
-    # grid-search
     grid = GridSearchCV(
-        estimator=base,
+        estimator=base_rf,
         param_grid=PARAM_GRID,
         cv=tscv,
-        scoring='roc_auc',
+        scoring="roc_auc",
         n_jobs=-1,
-        verbose=1
-    )
-    grid.fit(X_train, y_train)
+        verbose=1,
+    ).fit(X_train, y_train)
 
-    # return the best estimator (already fitted)
-    return grid.best_estimator_
+    best_rf = grid.best_estimator_
+    logging.info("Best params ⇒ %s", grid.best_params_)
+
+    # ── calibrate with isotonic regression using *another* TS split ──
+    calib = CalibratedClassifierCV(
+        best_rf, method="isotonic", cv=TimeSeriesSplit(n_splits=3)
+    ).fit(X_train, y_train)
+
+    # expose RF params so walk-forward code can re-instantiate fresh RFs
+    _rf_params = best_rf.get_params()
+
+    def _get_params(deep=True):
+        return {k: _rf_params[k] for k in PARAM_GRID}
+
+    calib.get_params = _get_params  # monkey-patch for compatibility
+    return calib
 
 
 def predict(model: RandomForestClassifier, X: np.ndarray) -> np.ndarray:

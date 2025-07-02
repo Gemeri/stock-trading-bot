@@ -21,13 +21,10 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import Union
 
-from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier, Pool
 from sub.common import compute_meta_labels, USE_META_LABEL
 from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
-
-# ─── Silence LightGBM warnings ─────────────────────────────────────────────────
-logging.getLogger('lightgbm').setLevel(logging.ERROR)
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -37,14 +34,12 @@ FEATURES = [
     'rsi', 'macd_line'
 ]
 
-# Tweaked PARAM_GRID for deeper trees & lower min_child_samples
 PARAM_GRID = {
-    'n_estimators':      [250],
-    'num_leaves':        [100, 150, 200],
-    'learning_rate':     [0.05],
-    'subsample':         [0.7],
-    'colsample_bytree':  [0.9],
-    'min_child_samples': [5, 10]
+    'iterations':      [400, 600],
+    'depth':           [4, 6, 8],
+    'learning_rate':   [0.03, 0.06],
+    'l2_leaf_reg':     [1, 3, 5],
+    'bagging_temperature':[0.1, 1.0]
 }
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -94,50 +89,66 @@ def _to_numpy(x: ArrayLike) -> np.ndarray:
         return x.values
     return np.asarray(x)
 
-def fit(X_train: ArrayLike, y_train: ArrayLike) -> LGBMClassifier:
+def fit(X_train: ArrayLike, y_train: ArrayLike) -> CatBoostClassifier:
     """
-    Manual grid-search CV over PARAM_GRID with tqdm.
-    Accepts *either* a pandas DataFrame/Series *or* NumPy array for X_train / y_train.
-    Returns the best-fitted LGBMClassifier (retrained on full data).
+    Manual grid-search over PARAM_GRID using TimeSeriesSplit.
+    Uses CatBoost with ordered boosting & early-stopping.
+    Returns the best-fitted CatBoostClassifier.
     """
-    logging.info("Running FIT on trend_continuation")
+    logging.info("Running FIT (CatBoost) on trend_continuation")
 
-    # --- ensure NumPy (TimeSeriesSplit only needs index positions) -------------
     X_all = _to_numpy(X_train)
-    y_all = _to_numpy(y_train).ravel()        # flatten in case it’s a column vector
+    y_all = _to_numpy(y_train).ravel()
 
-    tscv = TimeSeriesSplit(n_splits=5)
+    tscv        = TimeSeriesSplit(n_splits=5)
     best_score  = -np.inf
     best_params = None
 
-    for params in tqdm(ParameterGrid(PARAM_GRID), desc="Hyperparameter grid", unit="combo"):
-        scores = []
+    # iterate over parameter combinations
+    for params in tqdm(ParameterGrid(PARAM_GRID), desc="Hyper-param grid", unit="combo"):
+        fold_scores = []
+
         for tr_idx, val_idx in tscv.split(X_all):
-            X_tr, X_val = X_all[tr_idx], X_all[val_idx]
-            y_tr, y_val = y_all[tr_idx], y_all[val_idx]
+            pool_tr  = Pool(X_all[tr_idx],  y_all[tr_idx])
+            pool_val = Pool(X_all[val_idx], y_all[val_idx])
 
-            mdl = LGBMClassifier(random_state=42, verbosity=-1, **params)
-            mdl.fit(X_tr, y_tr)                       # ⚠️  NO early stopping here
-            probs = mdl.predict_proba(X_val)[:, 1]
-            scores.append(roc_auc_score(y_val, probs))
+            mdl = CatBoostClassifier(
+                loss_function="Logloss",
+                eval_metric="AUC",
+                random_state=42,
+                verbose=False,
+                **params
+            )
+            mdl.fit(
+                pool_tr,
+                eval_set=pool_val,
+                early_stopping_rounds=50,
+                use_best_model=True,
+            )
+            prob_val   = mdl.predict_proba(pool_val)[:, 1]
+            fold_scores.append(roc_auc_score(y_all[val_idx], prob_val))
 
-        mean_score = np.mean(scores)
-        if mean_score > best_score:
-            best_score, best_params = mean_score, params
+        mean_auc = float(np.mean(fold_scores))
+        if mean_auc > best_score:
+            best_score, best_params = mean_auc, params
 
     logging.info(f"Best params: {best_params} | CV ROC-AUC: {best_score:.4f}")
 
-    best_model = LGBMClassifier(random_state=42, verbosity=-1, **best_params)
-    best_model.fit(X_all, y_all)
+    # retrain best model on *all* data
+    full_pool   = Pool(X_all, y_all)
+    best_model  = CatBoostClassifier(
+        loss_function="Logloss",
+        eval_metric="AUC",
+        random_state=42,
+        verbose=False,
+        **best_params
+    )
+    best_model.fit(full_pool, early_stopping_rounds=50, use_best_model=True)
     return best_model
 
 
-def predict(model: LGBMClassifier, X: ArrayLike) -> np.ndarray:
-    """
-    Return continuation probabilities for rows in X.
-    Handles DataFrame, Series or NumPy array seamlessly.
-    """
-    logging.info("Running PREDICT on trend_continuation")
+def predict(model: CatBoostClassifier, X: ArrayLike) -> np.ndarray:
+    logging.info("Running PREDICT (CatBoost) on trend_continuation")
     X_np = _to_numpy(X)
     return model.predict_proba(X_np)[:, 1]
 
@@ -193,29 +204,53 @@ def main():
 
     records = []
     for t in tqdm(range(start, end), desc="WF backtest", unit="bar"):
+        # ---------------- rolling train slice ----------------
         tr0 = max(0, t - args.window)
         tr1 = t - 1
-        train = df.iloc[tr0:tr1+1]
-        X_tr, y_tr = train[FEATURES], train['label']
+        train_df = df.iloc[tr0:tr1 + 1]
 
-        model = LGBMClassifier(**{k: best_params[k] for k in PARAM_GRID},
-                               random_state=42,
-                               verbosity=-1)
-        model.fit(X_tr, y_tr)
+        # 15 % of the slice as chronological validation for early-stopping
+        val_split = int(len(train_df) * 0.15)
+        train_part = train_df.iloc[:-val_split]
+        val_part   = train_df.iloc[-val_split:]
 
-        X_t = df.loc[[t], FEATURES]
-        p_t = predict(model, X_t)[0]
+        X_tr, y_tr = train_part[FEATURES], train_part['label']
+        X_val, y_val = val_part[FEATURES],  val_part['label']
 
-        # trade direction: sign of expected move, or use forward return direction
-        sign = 1  # Always buy (can add shorting logic if label is symmetrical)
+        # ---------- CatBoost model (params taken from “best_params”) ----------
+        cat_params = {
+            'iterations'            : best_params.get('iterations', 1000),
+            'learning_rate'         : best_params.get('learning_rate', 0.05),
+            'depth'                 : best_params.get('depth', 6),
+            'l2_leaf_reg'           : best_params.get('l2_leaf_reg', 3),
+            'loss_function'         : 'Logloss',
+            'eval_metric'           : 'AUC',
+            'random_seed'           : 42,
+            'verbose'               : False,
+            'early_stopping_rounds' : 50,     # <-- key change
+            'allow_writing_files'   : False   # avoid clutter
+        }
 
-        op1 = df.at[t+1, 'open']
-        op2 = df.at[t+2, 'open']
+        model = CatBoostClassifier(**cat_params)
+        model.fit(
+            Pool(X_tr, y_tr), 
+            eval_set = Pool(X_val, y_val),
+            use_best_model = True
+        )
+
+        # -------------- one-step-ahead probability --------------
+        X_t  = df.loc[[t], FEATURES]
+        p_t  = model.predict_proba(X_t)[:, 1][0]    # same shape as before
+
+        # -------------- trade simulation math ------------------
+        sign = 1
+        op1  = df.at[t+1, 'open']
+        op2  = df.at[t+2, 'open']
         raw_ret = sign * (op2 - op1) / op1
-
         clipped = np.clip(raw_ret, -args.stop_loss, +args.take_profit)
         net_ret = clipped - (args.commission + args.slippage)
 
+        # -------------- logging --------------------------------
         records.append({
             't':           t,
             'prob':        p_t,

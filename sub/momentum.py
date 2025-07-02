@@ -26,6 +26,7 @@ from xgboost import XGBClassifier
 from sub.common import compute_meta_labels, USE_META_LABEL
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.calibration import CalibratedClassifierCV
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -50,15 +51,19 @@ PARAM_GRID = {
 
 def compute_labels(df):
     """
-    Compute binary momentum label:
-      label = 1 if next bar's open > this bar's open, else 0.
+    Same momentum definition but returns a frame free of NaNs in
+    FEATURES + label and still honours USE_META_LABEL override.
     """
     df = df.copy()
+
     if USE_META_LABEL:
         return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
+
     df['open_t1'] = df['open'].shift(-1)
     df['label']   = (df['open_t1'] > df['open']).astype(int)
-    return df
+
+    # ensure training slice is clean
+    return df.dropna(subset=FEATURES + ['label']).reset_index(drop=True)
 
 def sharpe(returns):
     """Annualized Sharpe assuming 252 trades/year."""
@@ -75,28 +80,51 @@ def max_drawdown(equity):
 
 # ─── Fit & Predict API ─────────────────────────────────────────────────────────
 
-def fit(X_train: np.ndarray, y_train: np.ndarray) -> XGBClassifier:
+def fit(X_train: np.ndarray, y_train: np.ndarray):
     """
-    Grid-search CV on (X_train, y_train) to tune hyperparameters,
-    then return the best-fitted XGBClassifier (best_estimator_).
+    • Time-series GridSearchCV tunes an XGBClassifier.  
+    • The winning model is **isotonic-calibrated** (TS split).  
+    • The returned object still exposes .get_params() so that
+      main() can clone fresh XGBClassifiers for walk-forward.
     """
-    logging.info("Ruinning FIT on momentum")
-    tscv = TimeSeriesSplit(n_splits=5)
-    base = XGBClassifier(use_label_encoder=False,
-                         eval_metric='logloss',
-                         verbosity=0,
-                         random_state=42)
+    logging.info("Running FIT on momentum (TS-CV + calibration)")
+
+    splitter = TimeSeriesSplit(n_splits=5)
+
+    base = XGBClassifier(
+        use_label_encoder=False,
+        eval_metric="logloss",
+        verbosity=0,
+        random_state=42,
+        n_jobs=-1,
+    )
+
     grid = GridSearchCV(
         estimator=base,
         param_grid=PARAM_GRID,
-        cv=tscv,
-        scoring='roc_auc',
+        cv=splitter,
+        scoring="roc_auc",
         n_jobs=-1,
-        verbose=1
-    )
-    grid.fit(X_train, y_train)
-    # best_estimator_ is already fitted on the hyperparameter slice
-    return grid.best_estimator_
+        verbose=1,
+    ).fit(X_train, y_train)
+
+    best_xgb = grid.best_estimator_
+    logging.info("Best params ⇒ %s", grid.best_params_)
+
+    # ── isotonic calibration on a fresh TS splitter ──────────────
+    iso = CalibratedClassifierCV(
+        best_xgb, method="isotonic", cv=TimeSeriesSplit(n_splits=3)
+    ).fit(X_train, y_train)
+
+    # expose tuned hyper-params so main() can re-instantiate
+    _best = best_xgb.get_params()
+
+    def _get_params(deep=True):
+        return {k: _best[k] for k in PARAM_GRID}
+
+    iso.get_params = _get_params  # keep downstream interface unchanged
+    return iso
+
 
 
 def predict(model: XGBClassifier, X: np.ndarray) -> np.ndarray:

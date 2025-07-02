@@ -17,7 +17,9 @@ from tqdm import tqdm
 
 from lightgbm import LGBMClassifier
 from sub.common import compute_meta_labels, USE_META_LABEL
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import roc_auc_score, accuracy_score, make_scorer
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.calibration import CalibratedClassifierCV
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -44,28 +46,45 @@ LGBM_PARAMS = {
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
-def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Label a breakout (1) if next-bar open→open return is in the top X% of abs returns.
-    By default, top 15% abs returns are breakouts.
-    """
+def compute_labels(
+    df: pd.DataFrame,
+    min_return: float | None = None,
+    breakout_pct: float = 0.15,
+) -> pd.DataFrame:
     df = df.copy()
+
+    # meta-labels override
     if USE_META_LABEL:
-        return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
-    df['open_t1'] = df['open'].shift(-1)
-    df['raw_ret'] = (df['open_t1'] - df['open']) / df['open']
-    absrets = df['raw_ret'].abs()
+        return (
+            compute_meta_labels(df)
+            .rename(columns={"meta_label": "label"})
+            .dropna(subset=FEATURES + ["label"])
+            .reset_index(drop=True)
+        )
 
-    # Use percentile-based threshold if min_return not provided
-    min_return = absrets.quantile(1 - 0.15)
-    print(f"[LABEL] Using percentile-based min_return: {min_return:.5f} for top {0.15*100:.1f}% breakouts")
+    # raw next-bar return
+    df["open_t1"] = df["open"].shift(-1)
+    df["raw_ret"] = (df["open_t1"] - df["open"]) / df["open"]
 
-    df['label'] = (absrets > min_return).astype(int)
+    absrets = df["raw_ret"].abs()
+    if min_return is None:
+        min_return = absrets.quantile(1 - breakout_pct)
+        logging.info(
+            "[LABEL] Percentile mode → min_return=%.5f (top %.1f%%)",
+            min_return,
+            breakout_pct * 100,
+        )
 
-    # Print class balance
-    label_counts = df['label'].value_counts(normalize=True)
-    print(f"[LABEL BALANCE] Fraction breakout=1: {label_counts.get(1,0):.2f}, non-breakout=0: {label_counts.get(0,0):.2f}")
-    return df
+    df["label"] = (absrets > min_return).astype(int)
+
+    bal = df["label"].value_counts(normalize=True).to_dict()
+    logging.info(
+        "[LABEL BALANCE] breakout=%.2f  non-breakout=%.2f",
+        bal.get(1, 0.0),
+        bal.get(0, 0.0),
+    )
+
+    return df.dropna(subset=FEATURES + ["label"]).reset_index(drop=True)
 
 def sharpe(returns: np.ndarray) -> float:
     arr = np.asarray(returns)
@@ -77,11 +96,52 @@ def max_drawdown(equity: pd.Series) -> float:
     roll_max = equity.cummax()
     return ((equity - roll_max) / roll_max).min()
 
-def fit(X_train: pd.DataFrame, y_train: pd.Series) -> LGBMClassifier:
-    logging.info("Running FIT on sentiment_volume")
-    model = LGBMClassifier(**LGBM_PARAMS)
-    model.fit(X_train, y_train)
-    return model
+
+def fit(X_train: pd.DataFrame, y_train: pd.Series):
+    """
+    Time-series aware CV to pick num_leaves / min_child_samples,
+    then isotonic-calibrate the resulting model for sharper
+    probability estimates.  Returns the calibrated wrapper,
+    but still exposes `.get_params()` for cloning.
+    """
+    logging.info("Running FIT on sentiment_volume (TS-CV + calibration)")
+
+    # small grid focusing on controlling variance
+    param_grid = {
+        "num_leaves":        [7, 15, 31],
+        "min_child_samples": [20, 50, 100],
+    }
+
+    splitter = TimeSeriesSplit(n_splits=5)
+
+    base = LGBMClassifier(**LGBM_PARAMS)
+
+    grid = GridSearchCV(
+        estimator=base,
+        param_grid=param_grid,
+        cv=splitter,
+        scoring=make_scorer(roc_auc_score, needs_proba=True),
+        n_jobs=-1,
+        verbose=1,
+    ).fit(X_train, y_train)
+
+    logging.info("Best TS-CV params ⇒ %s", grid.best_params_)
+
+    best_lgb = grid.best_estimator_
+
+    # ── isotonic calibration ────────────────────────────────────────────
+    iso = CalibratedClassifierCV(
+        best_lgb, method="isotonic", cv=TimeSeriesSplit(n_splits=3)
+    ).fit(X_train, y_train)
+
+    # keep downstream compatibility
+    _best = best_lgb.get_params()
+
+    def _params(deep=True):
+        return {k: _best[k] for k in LGBM_PARAMS}
+
+    iso.get_params = _params
+    return iso
 
 def predict(model: LGBMClassifier, X: pd.DataFrame) -> np.ndarray:
     logging.info("Running PREDICT on sentiment_volume")

@@ -45,7 +45,6 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from sklearn.preprocessing import StandardScaler
-from sklearn.calibration import CalibratedClassifierCV
 
 import torch
 import torch.nn as nn
@@ -53,7 +52,6 @@ import importlib.util
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.calibration import CalibratedClassifierCV
 
 # -------------------------------
 # 1. Load Configuration (from .env)
@@ -1735,52 +1733,57 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
     with open(TICKERLIST_PATH) as f:
         tickers = [ln.strip().upper() for ln in f if ln.strip()]
 
-    ml_models = parse_ml_models()
+    ml_models      = parse_ml_models()
     classifier_set = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
     results: list[tuple[float, str]] = []
 
     for tck in tickers:
-        tf_code = timeframe_to_code(BAR_TIMEFRAME)
+        tf_code  = timeframe_to_code(BAR_TIMEFRAME)
         csv_file = os.path.join(DATA_DIR, f"{tck}_{tf_code}.csv")
+
         if skip_data:
             if not os.path.exists(csv_file):
-                logging.error(f"[{tck}] CSV {csv_file} not found, skipping.")
                 continue
             df = pd.read_csv(csv_file, parse_dates=["timestamp"])
             if df.empty:
-                logging.error(f"[{tck}] CSV empty, skipping.")
                 continue
         else:
             df = fetch_candles_plus_features_and_predclose(
-                tck,
-                bars=N_BARS,
-                timeframe=BAR_TIMEFRAME,
-                rewrite_mode=REWRITE,
+                tck, bars=N_BARS, timeframe=BAR_TIMEFRAME, rewrite_mode=REWRITE
             )
-            try:
-                df.to_csv(csv_file, index=False)
-            except Exception as e:
-                logging.error(f"[{tck}] Unable to save CSV: {e}")
+            df.to_csv(csv_file, index=False)
+
         allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
-        df = df.loc[:, [c for c in df.columns if c in allowed]]
-        pred = train_and_predict(df, ticker=tck)
+        df      = df.loc[:, [c for c in df.columns if c in allowed]]
+        pred    = train_and_predict(df, ticker=tck)
         if pred is None:
             continue
+
         try:
             pred_val = float(pred)
         except (TypeError, ValueError):
             continue
+
         current_price = float(df.iloc[-1]["close"])
-        if set(ml_models) & classifier_set:
+        if set(ml_models) & classifier_set:                 # classifier prob
             metric = pred_val
-        else:
+        else:                                               # regression %
             metric = (pred_val - current_price) / current_price
+        print(tck, ": ", metric)
         results.append((metric, tck))
 
+    # ─── thresholds ────────────────────────────────────────────────────────
+    if set(ml_models) & classifier_set:
+        results = [(m, t) for m, t in results if m >= 0.55]
+    else:
+        results = [(m, t) for m, t in results if m >= 0.01]
+
+    if not results:
+        logging.info("No tickers met selection thresholds.")
+        return []
+
     results.sort(key=lambda x: x[0], reverse=True)
-    selected = [t for _, t in results[: max(1, top_n)]]
-    logging.info(f"Selected tickers from list: {selected}")
-    return selected
+    return [t for _, t in results[:max(1, top_n)]]
 
 
 def load_best_ticker_cache() -> tuple[list[str], datetime | None]:
@@ -1826,6 +1829,36 @@ def compute_and_cache_best_tickers() -> list[str]:
     TICKERS = selected
     save_best_ticker_cache(selected)
     return selected
+
+def maybe_update_best_tickers(scheduled_time_ny: str | None = None):
+    """Re-compute best tickers when the cache predates the reference time.
+
+    • `scheduled_time_ny` – "%H:%M" string from TIMEFRAME_SCHEDULE, or
+      None when called at script start-up.
+    """
+    if not TICKERLIST_MODE:
+        return
+
+    try:
+        clock = api.get_clock()
+        if not clock.is_open:
+            return
+    except Exception as e:
+        logging.error(f"Clock check failed: {e}")
+        return
+
+    _, cache_ts = load_best_ticker_cache()
+
+    if scheduled_time_ny is None:            # start-up path
+        run_dt_ny = datetime.now(NY_TZ)
+    else:                                    # scheduled path
+        h, m = map(int, scheduled_time_ny.split(":"))
+        run_dt_ny = datetime.now(NY_TZ).replace(
+            hour=h, minute=m, second=0, microsecond=0
+        )
+
+    if cache_ts is None or cache_ts < run_dt_ny:
+        compute_and_cache_best_tickers()
 
 # -------------------------------
 # 9. Trading Logic & Order Functions
@@ -2330,6 +2363,7 @@ def setup_schedule_for_timeframe(timeframe: str) -> None:
     # build the jobs ------------------------------------------------------------------------
     for t in times_list:
         schedule.every().day.at(t).do(lambda t=t: run_job(t))
+        schedule.every().day.at(t).do(lambda t=t: maybe_update_best_tickers(t))
 
         if NEWS_MODE == "on":
             try:
@@ -2382,9 +2416,6 @@ def run_job(scheduled_time_ny: str):
             TICKERS = compute_and_cache_best_tickers()
 
     _perform_trading_job(skip_data=False, scheduled_time_ny=scheduled_time_ny)
-
-    if TICKERLIST_MODE and clock.is_open:
-        compute_and_cache_best_tickers()
 
     logging.info("Scheduled trading job finished.")
 
@@ -3282,6 +3313,8 @@ def main():
     if RUN_SCHEDULE == "on" and TICKERLIST_MODE:
         compute_and_cache_best_tickers()
     setup_schedule_for_timeframe(BAR_TIMEFRAME)
+    if TICKERLIST_MODE: 
+        maybe_update_best_tickers()
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")

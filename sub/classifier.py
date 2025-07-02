@@ -3,6 +3,7 @@ import logging
 import numpy as np
 import pandas as pd
 
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from xgboost import XGBClassifier
 
@@ -50,19 +51,21 @@ PARAM_GRID = {
 def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Allow meta‑label override to keep pipeline consistent
     if USE_META_LABEL:
+        # keep behavior identical to previous pipeline
         return compute_meta_labels(df).rename(columns={"meta_label": "label"})
 
     df["label"] = (df["close"].shift(-1) > df["close"]).astype(int)
+    # drop rows that still contain NaNs in feature set or label
     return df.dropna(subset=FEATURES + ["label"]).reset_index(drop=True)
+
 
 # ─── Fit & Predict for Meta‑Model Integration ───────────────────────────────
 
-def fit(X_train: np.ndarray, y_train: np.ndarray) -> XGBClassifier:
-    logging.info("Running FIT on all_features_xgboost")
+def fit(X_train: np.ndarray, y_train: np.ndarray):
+    logging.info("Running FIT on all_features_xgboost (TS-aware, calibrated)")
 
-    splitter = TimeSeriesSplit(n_splits=5)
+    tscv = TimeSeriesSplit(n_splits=5)
 
     base = XGBClassifier(
         objective="binary:logistic",
@@ -75,19 +78,27 @@ def fit(X_train: np.ndarray, y_train: np.ndarray) -> XGBClassifier:
     grid = GridSearchCV(
         estimator=base,
         param_grid=PARAM_GRID,
-        cv=splitter,
+        cv=tscv,
         scoring="roc_auc",
         n_jobs=-1,
         verbose=1,
-    )
-    grid.fit(X_train, y_train)
+    ).fit(X_train, y_train)
 
-    logging.info("Best params => %s", grid.best_params_)
-    return grid.best_estimator_
+    best_xgb = grid.best_estimator_
+    logging.info("Best params ⇒ %s", grid.best_params_)
 
+    # ── Calibrate the best model on OOF probabilities (again TS-CV) ─────────
+    calib = CalibratedClassifierCV(
+        best_xgb, method="isotonic", cv=TimeSeriesSplit(n_splits=3)
+    ).fit(X_train, y_train)
 
-def predict(model: XGBClassifier, X: np.ndarray) -> np.ndarray:
-    logging.info("Running PREDICT on all_features_xgboost")
+    # expose get_xgb_params so external code keeps working -------------------
+    calib.get_xgb_params = best_xgb.get_xgb_params
+
+    return calib
+
+def predict(model, X: np.ndarray) -> np.ndarray:
+    logging.info("Running PREDICT on all_features_xgboost (calibrated)")
     return model.predict_proba(X)[:, 1]
 
 # ─── Optional Stand‑Alone Test Harness ──────────────────────────────────────

@@ -27,8 +27,6 @@ import matplotlib.pyplot as plt
 from sub.common import compute_meta_labels, USE_META_LABEL
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler

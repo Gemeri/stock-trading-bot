@@ -26,3 +26,4 @@ scikit-optimize
 pysr
 tqdm
 lightgbm
+catboost

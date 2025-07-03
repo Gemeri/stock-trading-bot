@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from lightgbm import LGBMClassifier
 from sub.common import compute_meta_labels, USE_META_LABEL
-from sklearn.metrics import roc_auc_score, accuracy_score, make_scorer
+from sklearn.metrics import roc_auc_score, accuracy_score
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 
@@ -117,12 +117,12 @@ def fit(X_train: pd.DataFrame, y_train: pd.Series):
     base = LGBMClassifier(**LGBM_PARAMS)
 
     grid = GridSearchCV(
-        estimator=base,
-        param_grid=param_grid,
-        cv=splitter,
-        scoring=make_scorer(roc_auc_score, needs_proba=True),
-        n_jobs=-1,
-        verbose=1,
+            estimator=base,
+            param_grid=param_grid,
+            cv=splitter,
+            scoring="roc_auc",          # ← simple alias, no needs_proba
+            n_jobs=-1,
+            verbose=1,
     ).fit(X_train, y_train)
 
     logging.info("Best TS-CV params ⇒ %s", grid.best_params_)

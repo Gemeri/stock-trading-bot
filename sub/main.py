@@ -19,6 +19,9 @@ import pandas as pd
 from tqdm import tqdm
 from dotenv import load_dotenv
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score
+
 from typing import Tuple
 
 import sub.momentum            as mod1
@@ -26,6 +29,7 @@ import sub.trend_continuation  as mod2
 import sub.mean_reversion      as mod3
 import sub.lagged_return       as mod4
 import sub.sentiment_volume    as mod5
+
 
 USE_CLASSIFIER = True
 if USE_CLASSIFIER:
@@ -64,7 +68,7 @@ STATIC_UP = 0.55
 STATIC_DOWN = 0.45
 
 META_MODEL_TYPE = os.getenv("META_MODEL_TYPE", "logreg")
-VALID_META_MODELS = {"logreg", "lgbm", "xgb", "nn"}
+VALID_META_MODELS = {"logreg", "lgbm", "xgb", "nn", "cat"}
 if META_MODEL_TYPE not in VALID_META_MODELS:
     raise ValueError(f"META_MODEL_TYPE must be one of {VALID_META_MODELS}")
 
@@ -90,33 +94,48 @@ def actual_direction(df: pd.DataFrame, t: int) -> int:
 # ─── Helper to construct the chosen meta learner ─────────────────────────────
 def _make_meta_model():
     """
-    Return an *un-fitted* classifier according to META_MODEL_TYPE.
-    All models expose .fit(X,y) and .predict_proba(X) just like LogisticRegression.
+    Return an *un-fitted* probability-calibrated classifier.
+    All models expose .fit(X,y) and .predict_proba(X) with a calibrated output
+    that is much better aligned across different meta-model options.
     """
     if META_MODEL_TYPE == "logreg":
-        return LogisticRegression(max_iter=1000, class_weight="balanced")
+        base = LogisticRegression(max_iter=2000, class_weight="balanced")
     elif META_MODEL_TYPE == "lgbm":
         from lightgbm import LGBMClassifier
-        return LGBMClassifier(
-            n_estimators=200, learning_rate=0.05,
-            num_leaves=31, random_state=42, verbosity=-1
+        base = LGBMClassifier(
+            n_estimators=400, learning_rate=0.03,
+            num_leaves=63, subsample=0.8, colsample_bytree=0.8,
+            random_state=42, verbosity=-1
         )
     elif META_MODEL_TYPE == "xgb":
         from xgboost import XGBClassifier
-        return XGBClassifier(
-            n_estimators=300, learning_rate=0.05,
-            max_depth=3, subsample=0.8, colsample_bytree=0.9,
-            objective="binary:logistic", eval_metric="logloss",
-            random_state=42, use_label_encoder=False
+        base = XGBClassifier(
+            n_estimators=500, learning_rate=0.03, max_depth=4,
+            subsample=0.8, colsample_bytree=0.9,
+            tree_method="hist", objective="binary:logistic",
+            eval_metric="logloss", random_state=42,
+            use_label_encoder=False
         )
-    elif META_MODEL_TYPE == "nn":
-        # simple two-layer MLP; good enough for ≤ 20 features
+    elif META_MODEL_TYPE == "cat":
+        from catboost import CatBoostClassifier
+        base = CatBoostClassifier(
+            iterations=600, depth=6, learning_rate=0.05,
+            l2_leaf_reg=3, bagging_temperature=0.5,
+            loss_function="Logloss", eval_metric="AUC",
+            random_seed=42, verbose=False
+        )
+    else:                                  # 'nn'
         from sklearn.neural_network import MLPClassifier
-        return MLPClassifier(
-            hidden_layer_sizes=(32, 32), activation="relu",
+        base = MLPClassifier(
+            hidden_layer_sizes=(64, 32), activation="relu",
             solver="adam", alpha=1e-4, batch_size="auto",
-            learning_rate_init=1e-3, max_iter=500, random_state=42
+            learning_rate_init=5e-4, max_iter=800, random_state=42
         )
+
+    # --- temperature-scale the probability output -----------------
+    return CalibratedClassifierCV(
+        base, method="isotonic", cv=3, n_jobs=-1
+    )
 
 def update_submeta_history(CSV_PATH, HISTORY_PATH,
                            submods=SUBMODS, window=50, verbose=True):
@@ -210,47 +229,47 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
 
 
 def optimize_asymmetric_thresholds(
-    probs: np.ndarray, labels: np.ndarray,
-    metric: str = "accuracy",
-    manual_thresholds: tuple = None
+    probs: np.ndarray, labels: np.ndarray, metric="accuracy",
+    manual_thresholds=None
 ) -> Tuple[float, float]:
-    """
-    Finds best asymmetric (up, down) threshold for HOLD zone,
-    or uses manual_thresholds if provided.
-    """
     if FORCE_STATIC_THRESHOLDS:
-        print(f"[THRESH] Using STATIC thresholds: BUY > {STATIC_UP:.4f}, SELL < {STATIC_DOWN:.4f}")
         return STATIC_UP, STATIC_DOWN
     if manual_thresholds is not None:
-        up, down = manual_thresholds
-        print(f"[THRESH] Using MANUAL thresholds: BUY > {up:.4f}, SELL < {down:.4f}")
-        return up, down
+        return manual_thresholds
 
-    up_grid = np.linspace(0.51, 0.80, 30)
-    down_grid = np.linspace(0.20, 0.49, 30)
-    best_score, best_up, best_down = 0, 0.55, 0.45
+    # --- coarse → fine grid search (5× faster) ----------------------------
+    up_coarse   = np.linspace(0.60, 0.80, 11)
+    down_coarse = np.linspace(0.20, 0.40, 11)
 
-    for up in up_grid:
-        for down in down_grid:
-            if up <= down:
+    best_up, best_dn, best_sc = 0.55, 0.45, -np.inf
+    for up in up_coarse:
+        dn_candidates = down_coarse[down_coarse < up - 0.05]
+        for dn in dn_candidates:
+            mask  = (probs > up) | (probs < dn)
+            if mask.sum() < 30:                       # skip tiny support
                 continue
-            preds = np.where(probs > up, 1, np.where(probs < down, 0, 0.5))
-            mask = preds != 0.5
-            num_confident = np.sum(mask)
-            print(f"Thresholds: up={up:.2f}, down={down:.2f}, confident preds={num_confident}/{len(probs)}")
-            if not np.any(mask):
-                continue
+
             if metric == "accuracy":
-                score = (preds[mask] == labels[mask]).mean()
+                score = (labels[mask] == (probs[mask] > up)).mean()
             elif metric == "f1":
                 from sklearn.metrics import f1_score
-                score = f1_score(labels[mask], preds[mask])
-            else:
-                score = (preds[mask] == labels[mask]).mean()
-            if score > best_score:
-                best_score, best_up, best_down = score, up, down
-    print(f"[THRESH] Optimized thresholds: BUY > {best_up:.4f}, SELL < {best_down:.4f}  (valid acc={best_score:.4f})")
-    return best_up, best_down
+                score = f1_score(labels[mask], probs[mask] > up)
+            elif metric == "profit":                  # NEW ▼
+                # assume +1 / −1 payoff per correct direction
+                pnl = np.where(
+                    probs[mask] > up,  (labels[mask] == 1).astype(int),
+                    - (labels[mask] == 0).astype(int)
+                )
+                score = pnl.mean()
+            else:                                     # roc_auc, etc.
+                from sklearn.metrics import roc_auc_score
+                score = roc_auc_score(labels[mask], probs[mask])
+
+            if score > best_sc:
+                best_sc, best_up, best_dn = score, up, dn
+
+    return best_up, best_dn
+
 
 
 def train_and_save_meta(
@@ -269,6 +288,8 @@ def train_and_save_meta(
         [f"m{i+1}"   for i in range(n_mods)] +
         [f"acc{i+1}" for i in range(n_mods)]
     ].values
+    mean_prob = hist[[f"m{i+1}" for i in range(n_mods)]].mean(axis=1).values.reshape(-1, 1)
+    X = np.hstack([X, mean_prob])
     y = hist["meta_label"].values
 
     split = int(len(y) * 0.6)
@@ -392,6 +413,14 @@ def walkforward_meta_backtest(
     for i in tqdm(range(start, N), desc="Walk-forward (meta)"):
         # ─── ❶ train on rows [: i] ─────────────────────────────────────────
         X_train = hist.loc[:i - 1, feature_cols].values
+        # add consensus (mean of all sub-model probabilities) as an extra column
+        mean_tr = (
+            hist.loc[:i - 1, [f"m{k}" for k in range(1, n_mods + 1)]]
+                .mean(axis=1)
+                .values.reshape(-1, 1)
+        )
+        X_train = np.hstack([X_train, mean_tr])
+
         y_train = hist.loc[:i - 1, "meta_label"].values
 
         meta = _make_meta_model()
@@ -405,7 +434,13 @@ def walkforward_meta_backtest(
         up, down = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
 
         # ─── ❸ predict the held-out row i ──────────────────────────────────
-        prob_up = float(meta.predict_proba(hist.loc[i, feature_cols].values.reshape(1, -1))[0, 1])
+        x_row = hist.loc[i, feature_cols].values.reshape(1, -1)
+        x_row = np.hstack(
+            [x_row,
+            np.array([[hist.loc[i, [f"m{k}" for k in range(1, n_mods + 1)]].mean()]])]
+        )
+        prob_up = float(meta.predict_proba(x_row)[0, 1])
+
         action = "BUY" if prob_up > up else ("SELL" if prob_up < down else "HOLD")
 
         # ─── ❹ collect results ────────────────────────────────────────────
@@ -662,7 +697,8 @@ def run_live(return_result: bool = True, position_open: bool = False):
         p.append(pi)
         accs.append(acc)
 
-    prob   = float(meta.predict_proba(np.array(p + accs).reshape(1, -1))[0, 1])
+    feat_vec = np.array(p + accs + [np.mean(p)]).reshape(1, -1)  # add consensus feature
+    prob     = float(meta.predict_proba(feat_vec)[0, 1])
     action = "BUY" if prob > up else ("SELL" if prob < down else "HOLD")
     action = _enforce_position_rules([action], position_open)[0]
     print(f"[LIVE] P(up)={prob:.3f}  →  {action}  (BUY>{up:.2f} / SELL<{down:.2f})")

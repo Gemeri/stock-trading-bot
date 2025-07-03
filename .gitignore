@@ -3,3 +3,5 @@
 /__pycache__
 /logic/__pycache__
 /sub/__pycache__
+/catboost_info
+/*.csv

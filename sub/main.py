@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-main.py
-
-Orchestrates five sub-models in either “sub-vote” or “sub-meta” mode,
-and in either “live” or “backtest” execution—configured by environment variables.
-
-Features:
-- Asymmetric threshold optimization over validation set (for neutral "hold" zone)
-- Consistent close-to-close label alignment
-- Persisted model and thresholds as separate artifacts (robust for production)
-- Modular code and easy extensibility
-"""
-
 import os
 import pickle
 import numpy as np

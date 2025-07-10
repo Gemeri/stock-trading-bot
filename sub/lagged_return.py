@@ -126,7 +126,7 @@ def main():
     X_h, y_h = hyper[FEATURES], hyper['target']
 
     best_model = fit(X_h, y_h)
-    best_params = {k: v for k, v in best_model.get_params().items() if k in PARAM_DIST}
+    best_params = {k: v for k, v in best_model.get_params().items() if k in BEST_PARAMS}
     print("Best hyperparameters:", best_params)
 
     # 3) True i+1 walk‐forward backtest
@@ -198,4 +198,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

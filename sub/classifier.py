@@ -150,3 +150,4 @@ if __name__ == "__main__":
     auc = roc_auc_score(res["label"], res["prob"])
     print(f"Saved walk‑forward results to {args.output}")
     print(f"Accuracy  = {acc:.3f}\nROC‑AUC   = {auc:.3f}")
+    

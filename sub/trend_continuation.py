@@ -35,11 +35,11 @@ FEATURES = [
 ]
 
 PARAM_GRID = {
-    'iterations':      [400, 600],
-    'depth':           [4, 6, 8],
-    'learning_rate':   [0.03, 0.06],
-    'l2_leaf_reg':     [1, 3, 5],
-    'bagging_temperature':[0.1, 1.0]
+    'iterations':      [600],
+    'depth':           [6],
+    'learning_rate':   [0.06],
+    'l2_leaf_reg':     [3],
+    'bagging_temperature':[0.1]
 }
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────

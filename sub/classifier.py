@@ -86,7 +86,6 @@ def fit(X_train: np.ndarray, y_train: np.ndarray):
         X_tr,
         y_tr,
         eval_set=[(X_val, y_val)],
-        early_stopping_rounds=50,
         verbose=False,
     )
 

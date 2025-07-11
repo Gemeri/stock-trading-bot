@@ -78,7 +78,6 @@ def fit(X_train: pd.DataFrame, y_train: pd.Series) -> XGBRegressor:
         y_tr,
         eval_set=[(X_val, y_val)],
         verbose=False,
-        early_stopping_rounds=50,        # stops ~3-4× faster than full n_estimators
     )
     return model
 

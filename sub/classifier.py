@@ -1,13 +1,11 @@
-# ─── Imports ─────────────────────────────────────────────────────────────────
 import logging
 import numpy as np
 import pandas as pd
 
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from xgboost import XGBClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
-# Access helper from main.py (assumed importable) ---------------------------
 from sub.common import compute_meta_labels, USE_META_LABEL
 
 # ─── Feature Set ────────────────────────────────────────────────────────────
@@ -36,14 +34,16 @@ FEATURES = [
     "day_of_week", "days_since_high", "days_since_low"
 ]
 
-# ─── Hyper‑parameter Grid for XGBClassifier ────────────────────────────────
-PARAM_GRID = {
-    "n_estimators":     [300, 500],
-    "learning_rate":   [0.03, 0.1],
-    "max_depth":       [3, 6],
-    "subsample":       [0.8],
-    "colsample_bytree":[0.8],
-    "min_child_weight":[1, 5],
+BEST_XGB_PARAMS = {
+    "n_estimators":     700,
+    "learning_rate":    0.05,
+    "max_depth":        4,
+    "min_child_weight": 5,
+    "subsample":        0.80,
+    "colsample_bytree": 0.80,
+    "gamma":            0.0,
+    "reg_alpha":        0.0,
+    "reg_lambda":       1.0,
 }
 
 # ─── Label Construction ─────────────────────────────────────────────────────
@@ -59,43 +59,47 @@ def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
     # drop rows that still contain NaNs in feature set or label
     return df.dropna(subset=FEATURES + ["label"]).reset_index(drop=True)
 
-
-# ─── Fit & Predict for Meta‑Model Integration ───────────────────────────────
-
 def fit(X_train: np.ndarray, y_train: np.ndarray):
-    logging.info("Running FIT on all_features_xgboost (TS-aware, calibrated)")
+    """
+    Fast deterministic fit:
+      • fixed hyper-params (BEST_XGB_PARAMS) – no grid search
+      • early-stopping on the last 10 % of the training slice
+      • isotonic calibration for well-behaved probabilities
+    """
+    logging.info("Running FIT on all_features_xgboost – static params + early-stop")
 
-    tscv = TimeSeriesSplit(n_splits=5)
+    # 1) split last 10 % for early-stopping
+    val_size = max(200, int(0.1 * len(X_train)))
+    X_tr, X_val = X_train[:-val_size], X_train[-val_size:]
+    y_tr, y_val = y_train[:-val_size], y_train[-val_size:]
 
-    base = XGBClassifier(
+    core = XGBClassifier(
         objective="binary:logistic",
         eval_metric="logloss",
         random_state=42,
         n_jobs=-1,
         use_label_encoder=False,
+        **BEST_XGB_PARAMS,
     )
 
-    grid = GridSearchCV(
-        estimator=base,
-        param_grid=PARAM_GRID,
-        cv=tscv,
-        scoring="roc_auc",
-        n_jobs=-1,
-        verbose=1,
-    ).fit(X_train, y_train)
+    core.fit(
+        X_tr,
+        y_tr,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
 
-    best_xgb = grid.best_estimator_
-    logging.info("Best params ⇒ %s", grid.best_params_)
-
-    # ── Calibrate the best model on OOF probabilities (again TS-CV) ─────────
+    # 2) isotonic calibration with a *time-series aware* CV
     calib = CalibratedClassifierCV(
-        best_xgb, method="isotonic", cv=TimeSeriesSplit(n_splits=3)
+        core,
+        method="isotonic",
+        cv=TimeSeriesSplit(n_splits=3),
     ).fit(X_train, y_train)
 
-    # expose get_xgb_params so external code keeps working -------------------
-    calib.get_xgb_params = best_xgb.get_xgb_params
-
+    # expose raw XGB params so downstream code that clones works unchanged
+    calib.get_xgb_params = core.get_xgb_params
     return calib
+
 
 def predict(model, X: np.ndarray) -> np.ndarray:
     logging.info("Running PREDICT on all_features_xgboost (calibrated)")
@@ -145,3 +149,4 @@ if __name__ == "__main__":
     auc = roc_auc_score(res["label"], res["prob"])
     print(f"Saved walk‑forward results to {args.output}")
     print(f"Accuracy  = {acc:.3f}\nROC‑AUC   = {auc:.3f}")
+    

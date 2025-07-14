@@ -73,7 +73,20 @@ if META_MODEL_TYPE not in VALID_META_MODELS:
     raise ValueError(f"META_MODEL_TYPE must be one of {VALID_META_MODELS}")
 
 
-# ------------------------------------------------------------------------------
+def _build_meta_features(df: pd.DataFrame, n_mods: int) -> np.ndarray:
+    """Return a feature matrix for the meta learner."""
+    prob_cols = [f"m{i+1}"   for i in range(n_mods)]
+    acc_cols  = [f"acc{i+1}" for i in range(n_mods)]
+
+    P = df[prob_cols].values          # shape (N, n_mods)
+    A = df[acc_cols].values           # shape (N, n_mods)
+
+    mean_p   = P.mean(axis=1, keepdims=True)
+    var_p    = P.var(axis=1,  keepdims=True)
+    # accuracy-weighted ensemble probability
+    wavg_p   = (P * A).sum(axis=1, keepdims=True) / (A.sum(axis=1, keepdims=True) + 1e-6)
+
+    return np.hstack([P, A, mean_p, var_p, wavg_p])     # final shape (N, 2*n_mods + 3)
 
 
 def vote_from_prob(p: float, up: float, down: float) -> float:
@@ -113,9 +126,9 @@ def _make_meta_model():
             n_estimators=500, learning_rate=0.03, max_depth=4,
             subsample=0.8, colsample_bytree=0.9,
             tree_method="hist", objective="binary:logistic",
-            eval_metric="logloss", random_state=42,
-            use_label_encoder=False
+            eval_metric="logloss", random_state=42
         )
+        return base     
     elif META_MODEL_TYPE == "cat":
         from catboost import CatBoostClassifier
         base = CatBoostClassifier(
@@ -124,13 +137,14 @@ def _make_meta_model():
             loss_function="Logloss", eval_metric="AUC",
             random_seed=42, verbose=False
         )
-    else:                                  # 'nn'
+    else:  # "nn"
         from sklearn.neural_network import MLPClassifier
         base = MLPClassifier(
             hidden_layer_sizes=(64, 32), activation="relu",
-            solver="adam", alpha=1e-4, batch_size="auto",
+            solver="adam", alpha=1e-4,
             learning_rate_init=5e-4, max_iter=800, random_state=42
         )
+        return base
 
     # --- temperature-scale the probability output -----------------
     return CalibratedClassifierCV(
@@ -271,34 +285,25 @@ def optimize_asymmetric_thresholds(
     return best_up, best_dn
 
 
+def train_and_save_meta(cache_csv: str,
+                        model_pkl: str,
+                        threshold_pkl: str,
+                        metric: str = "accuracy",
+                        n_mods: int = N_SUBMODS):
 
-def train_and_save_meta(
-    cache_csv: str,
-    model_pkl: str,
-    threshold_pkl: str,
-    metric: str = "accuracy",
-    n_mods: int = N_SUBMODS,
-):
-    """
-    Train the chosen meta-model using sub-model history (m1..mN + acc1..accN).
-    Works for either 5 or 6 sub-models.
-    """
     hist = pd.read_csv(cache_csv)
-    X = hist[
-        [f"m{i+1}"   for i in range(n_mods)] +
-        [f"acc{i+1}" for i in range(n_mods)]
-    ].values
-    mean_prob = hist[[f"m{i+1}" for i in range(n_mods)]].mean(axis=1).values.reshape(-1, 1)
-    X = np.hstack([X, mean_prob])
+    X = _build_meta_features(hist, n_mods)
     y = hist["meta_label"].values
 
+    # 60 % train / 40 % val split
     split = int(len(y) * 0.6)
-    X_train, y_train = X[:split], y[:split]
-    X_val,   y_val   = X[split:], y[split:]
+    X_tr, y_tr = X[:split], y[:split]
+    X_val, y_val = X[split:], y[split:]
 
     meta = _make_meta_model()
-    meta.fit(X_train, y_train)
+    meta.fit(X_tr, y_tr)
 
+    # asymmetric threshold optimisation on the *held-out* slice
     probs_val = meta.predict_proba(X_val)[:, 1]
     up, down  = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
 
@@ -308,6 +313,7 @@ def train_and_save_meta(
         pickle.dump({"up": up, "down": down, "model_type": META_MODEL_TYPE}, f)
 
     return meta, up, down
+
 
 
 def backtest_submodels(
@@ -383,27 +389,13 @@ def backtest_submodels(
 
     return pd.DataFrame(rec).set_index("t")
 
-# ─── NEW: Walk-forward meta back-test ────────────────────────────────────────
-def walkforward_meta_backtest(
-    cache_csv: str,
-    n_mods: int = N_SUBMODS,
-    initial_frac: float = 0.6,
-    metric: str = "accuracy",
-):
-    """
-    Incremental (i+1) walk-forward evaluation:
+def walkforward_meta_backtest(cache_csv: str,
+                              n_mods: int = N_SUBMODS,
+                              initial_frac: float = 0.6,
+                              metric: str = "accuracy"):
 
-    • Train on the first ⌊initial_frac·N⌋ rows
-    • Predict row i
-    • Append row i to the training set
-    • Repeat until the end of the history file
-    """
     hist = pd.read_csv(cache_csv)
-    feature_cols = (
-        [f"m{k}"   for k in range(1, n_mods + 1)] +
-        [f"acc{k}" for k in range(1, n_mods + 1)]
-    )
-    N = len(hist)
+    N    = len(hist)
     start = int(N * initial_frac)
     if start < 10:
         raise ValueError("History too short for walk-forward meta test.")
@@ -411,49 +403,33 @@ def walkforward_meta_backtest(
     records = []
 
     for i in tqdm(range(start, N), desc="Walk-forward (meta)"):
-        # ─── ❶ train on rows [: i] ─────────────────────────────────────────
-        X_train = hist.loc[:i - 1, feature_cols].values
-        # add consensus (mean of all sub-model probabilities) as an extra column
-        mean_tr = (
-            hist.loc[:i - 1, [f"m{k}" for k in range(1, n_mods + 1)]]
-                .mean(axis=1)
-                .values.reshape(-1, 1)
-        )
-        X_train = np.hstack([X_train, mean_tr])
 
-        y_train = hist.loc[:i - 1, "meta_label"].values
+        X_train = _build_meta_features(hist.iloc[:i], n_mods)
+        y_train = hist.loc[:i-1, "meta_label"].values
 
-        meta = _make_meta_model()
-        meta.fit(X_train, y_train)
+        meta = _make_meta_model().fit(X_train, y_train)
 
-        # ─── ❷ choose asymmetric thresholds on an *internal* validation split
-        #      (20 % of the current training slice)
+        # choose thresholds on last 20 % of training slice
         split_val = max(1, int(len(y_train) * 0.2))
-        X_val, y_val = X_train[-split_val:], y_train[-split_val:]
-        probs_val = meta.predict_proba(X_val)[:, 1]
-        up, down = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
+        probs_val = meta.predict_proba(X_train[-split_val:])[:, 1]
+        up, down  = optimize_asymmetric_thresholds(
+                        probs_val, y_train[-split_val:], metric=metric)
 
-        # ─── ❸ predict the held-out row i ──────────────────────────────────
-        x_row = hist.loc[i, feature_cols].values.reshape(1, -1)
-        x_row = np.hstack(
-            [x_row,
-            np.array([[hist.loc[i, [f"m{k}" for k in range(1, n_mods + 1)]].mean()]])]
-        )
+        x_row   = _build_meta_features(hist.iloc[[i]], n_mods)
         prob_up = float(meta.predict_proba(x_row)[0, 1])
+        action  = "BUY" if prob_up > up else ("SELL" if prob_up < down else "HOLD")
 
-        action = "BUY" if prob_up > up else ("SELL" if prob_up < down else "HOLD")
-
-        # ─── ❹ collect results ────────────────────────────────────────────
         rec = {
-            "timestamp": hist["timestamp"].iloc[i],
-            "meta_prob": prob_up,
-            "action": action,
-            "up_thresh": up,
-            "down_thresh": down,
+            "timestamp":  hist.at[i, "timestamp"],
+            "meta_prob":  prob_up,
+            "action":     action,
+            "up_thresh":  up,
+            "down_thresh":down,
         }
-        for k in range(1, n_mods + 1):
-            rec[f"m{k}"]   = hist[f"m{k}"].iloc[i]
-            rec[f"acc{k}"] = hist[f"acc{k}"].iloc[i]
+        # keep the raw sub-model info for later analysis
+        for k in range(1, n_mods+1):
+            rec[f"m{k}"]   = hist.at[i, f"m{k}"]
+            rec[f"acc{k}"] = hist.at[i, f"acc{k}"]
         records.append(rec)
 
     return pd.DataFrame(records)
@@ -697,8 +673,11 @@ def run_live(return_result: bool = True, position_open: bool = False):
         p.append(pi)
         accs.append(acc)
 
-    feat_vec = np.array(p + accs + [np.mean(p)]).reshape(1, -1)  # add consensus feature
-    prob     = float(meta.predict_proba(feat_vec)[0, 1])
+    feat_vec = _build_meta_features(
+                  pd.DataFrame([p + accs], columns=[*range(len(p)+len(accs))]),
+                  n_mods
+              )
+    prob  = float(meta.predict_proba(feat_vec)[0, 1])
     action = "BUY" if prob > up else ("SELL" if prob < down else "HOLD")
     action = _enforce_position_rules([action], position_open)[0]
     print(f"[LIVE] P(up)={prob:.3f}  →  {action}  (BUY>{up:.2f} / SELL<{down:.2f})")
@@ -720,4 +699,3 @@ if __name__ == "__main__":
         run_live()
     else:
         run_backtest(return_df=args.return_df)
-

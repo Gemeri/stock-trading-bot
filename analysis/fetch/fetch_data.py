@@ -119,7 +119,7 @@ def fetch_candles_plus_features(
 
         df_sent_new = pd.DataFrame({
             "timestamp": df_candles_new['timestamp'],
-            "sentiment": [f"{s:.15f}" for s in sentiments]
+            "sentiment": sentiments
         })
         (pd.concat([df_sent_old, df_sent_new])
            .drop_duplicates(subset=['timestamp'])

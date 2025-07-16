@@ -36,6 +36,10 @@ def assign_sentiment_to_candles(df: pd.DataFrame, news_list: list):
             last_sentiment = sentiment
         else:
             sentiment = last_sentiment
+
+        # we convert to string and force 3 decimal digits
+        sentiment = f"{sentiment:.3f}"
+
         sentiments.append(sentiment)
     logging.info("Finished assigning sentiment to candles.")
     return sentiments

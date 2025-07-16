@@ -10,8 +10,24 @@ import json
 # Ignore future warnings from wrapping Gym environments
 # warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+TICKER = "AAPL"
+INTERVAL = "H4"
+
+optionList = [
+    #'128-20000',
+    #'128-250000',
+    '128-1000000',
+    #'256-20000',
+    #'256-250000',
+    '256-1000000',
+    #'512-20000',
+    #'512-250000',
+    '512-1000000',
+]
+
+
 # Load data
-df = pd.read_csv("../data/MSFT_H4.csv")
+df = pd.read_csv(f"../data/{TICKER}_{INTERVAL}.csv")
 df = df.dropna().reset_index(drop=True)
 
 class TradingEnv(gym.Env):
@@ -84,36 +100,47 @@ class TradingEnv(gym.Env):
 # Wrap the environment
 env = DummyVecEnv([lambda: TradingEnv(df)])
 
-# Train PPO
-model = PPO("MlpPolicy", env, verbose=1, device="cuda", n_steps=256)
-model.learn(total_timesteps=1_000_000)
 
-# Evaluation
-obs = env.reset()
-net_worths = []
+for option in optionList:
 
-for _ in range(len(df)-1):
-    action, _states = model.predict(obs)
-    obs, reward, done, info = env.step(action)
-    
-    net_worth = env.get_attr('get_net_worth')[0]()  
-    net_worths.append(net_worth)
+    n_steps = int(option.split('-')[0])
+    total_timesteps = int(option.split('-')[1])
 
-    if done[0]:
-        break
+    print(f"Attempting {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")
 
-print(f"net_worths: {net_worths}")
+    # Train PPO
+    model = PPO("MlpPolicy", env, verbose=0, n_steps=n_steps)
+    model.learn(total_timesteps=total_timesteps)
 
-with open("rl-training-results.json", "w") as f:
-    json.dump(net_worths, f, indent=3)
+    print(f"Completed {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")
 
-# Plotting
-plt.figure(figsize=(12, 6))
-plt.plot(net_worths, label="Net Worth")
-plt.title("PPO Agent Net Worth Over Time (Gymnasium Compatible)")
-plt.xlabel("Steps")
-plt.ylabel("Net Worth ($)")
-plt.legend()
-plt.grid()
-plt.tight_layout()
-plt.show()
+    # Evaluation
+    obs = env.reset()
+    net_worths = []
+
+    for _ in range(len(df)-1):
+        action, _states = model.predict(obs)
+        obs, reward, done, info = env.step(action)
+        
+        net_worth = env.get_attr('get_net_worth')[0]()  
+        net_worths.append(net_worth)
+
+        if done[0]:
+            break
+
+    # Plotting
+    plt.figure(figsize=(12, 6))
+    plt.plot(net_worths, label="Net Worth")
+    plt.title("PPO Agent Net Worth Over Time (Gymnasium Compatible)")
+    plt.xlabel("Steps")
+    plt.ylabel("Net Worth ($)")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+
+    # Save the figure to disk
+    plt.savefig(f"output/ppo_net_worth_{TICKER}_{INTERVAL}_{n_steps}_{total_timesteps}.png", dpi=300)  # You can also use .jpg, .pdf, etc.
+
+    print(f"Saved picture for {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")
+
+print("All completed")

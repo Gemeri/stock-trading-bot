@@ -13,12 +13,13 @@ import torch
 
 TICKER = "AAPL"
 INTERVAL = "H1"
-TRADING_TYPE = 'short'
+TRADING_TYPE = 'normal'
 
 optionList = [
     '256-100000',
     '256-250000',
     '256-500000',
+    '256-1000000',
 ]
 
 FEATURE_COLUMNS = [
@@ -61,7 +62,7 @@ for option in optionList:
                 gae_lambda=0.95,            # default value
                 gamma=0.95,
                 n_epochs=10,
-                ent_coef=0.005,             # Small entropy → some exploration
+                ent_coef=0.01,              # default 0.005
                 learning_rate=2.5e-4,       # default value
                 clip_range=0.2,             # default value
                 max_grad_norm=0.5,
@@ -74,22 +75,28 @@ for option in optionList:
     # Evaluation
     obs = env.reset()
     net_worths = []
+    actions = []
     stock_prices = []
+    balances = []
 
-    for step in range(len(df)-1):
+    for step in range(int(len(df)/2)):
         action, _states = model.predict(obs)
         obs, reward, done, info = env.step(action)
         
         net_worth = env.get_attr('get_net_worth')[0]()  
         net_worths.append(net_worth)
 
+        last_action = env.get_attr('get_last_action')[0]()
+        actions.append(last_action*1000)
+
+        balance = env.get_attr('get_balance')[0]()
+        balances.append(balance)
+
         stock_price = df['close'].iloc[step]
         stock_prices.append(float(stock_price))
 
         if done[0]:
             break
-
-    # print(stock_prices)
 
     # Plotting
     fig, ax1 = plt.subplots(figsize=(12, 6))
@@ -101,14 +108,31 @@ for option in optionList:
     ax1.tick_params(axis='y', labelcolor='blue')
     ax1.grid(True)
 
+    # 📊 Plot action bars on the same axis (behind the net worth)
+    bar_colors = ['green' if a > 0 else 'red' if a < 0 else 'gray' for a in actions]
+    ax1.bar(range(len(actions)), actions, color=bar_colors, alpha=0.5, label='Trades')
+
     # 📉 Create a second y-axis for Stock Price (right Y-axis)
     ax2 = ax1.twinx()
     ax2.plot(stock_prices, color='orange', label="Stock Price ($)")
     ax2.set_ylabel("Stock Price ($)", color='orange')
     ax2.tick_params(axis='y', labelcolor='orange')
 
-    # Title and legends
-    plt.title("PPO Agent Net Worth vs. Stock Price")
+    # 💰 Balance (third Y-axis on the far right)
+    ax3 = ax1.twinx()
+    ax3.spines['right'].set_position(('outward', 60))  # Move third axis 60 pts outward
+    ax3.plot(balances, color='purple', label='Balance ($)', linestyle='--')
+    ax3.set_ylabel("Balance ($)", color='purple')
+    ax3.tick_params(axis='y', labelcolor='purple')
+
+    # 🏷️ Title and combined legend
+    plt.title("PPO Agent: Net Worth, Stock Price, Balance & Trade Actions")
+    lines, labels = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    lines3, labels3 = ax3.get_legend_handles_labels()
+    ax1.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc="upper left")
+
+    
     fig.tight_layout()
     
 

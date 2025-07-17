@@ -41,24 +41,37 @@ class ShortTradingEnv(gym.Env):
         price = self.prices[self.current_step]
         reward = 0
 
-        # how much can we buy and sell
-        shares_to_buy = min(self.buy_sell_cap, math.floor(self.balance/price) * self.buy_sell_rate)
-        shares_to_sell = min(math.floor(self.buy_sell_rate*self.shares_held), self.buy_sell_cap)
-        shares_to_sell_shorts = min(math.floor(self.short_rate*self.short_position), self.buy_sell_cap)
+        # Calculate how much we can buy/sell
+        shares_affordable = math.floor(self.balance / price)
 
-        # Actions: 0 = Hold, 1 = Buy, 2 = Sell, 3 = Short Sell
+        # min between the cap and what we can buy X the rate
+        shares_to_buy = min(self.buy_sell_cap, math.floor(shares_affordable * self.buy_sell_rate))
+
+        # min between the cap and what we hold X the rate
+        shares_to_sell = min(self.buy_sell_cap, math.floor(self.shares_held * self.buy_sell_rate))
+        
+        # shorting: we buy a % of your net worth
+        shares_to_short = min(self.buy_sell_cap, math.floor(self.net_worth * self.short_rate))
+
+        # short covering: we sell 25% of our short position
+        shares_to_cover = min(self.buy_sell_cap, math.floor(self.short_position * 0.25))
+
+        # Actions
         if action == 1 and self.balance >= price:  # Buy
             self.shares_held += shares_to_buy
-            self.balance -= price * shares_to_buy
+            self.balance -= shares_to_buy * price
+
         elif action == 2 and self.shares_held > 0:  # Sell
             self.shares_held -= shares_to_sell
-            self.balance += price*shares_to_sell
-        elif action == 3:  # Short sell (borrow one share)
-            self.short_position += shares_to_buy
-            self.balance += price * shares_to_buy
-        elif action == 2 and self.short_position > 0:  # Cover short (buy to close)
-            self.short_position -= shares_to_sell_shorts
-            self.balance -= price*shares_to_sell_shorts
+            self.balance += shares_to_sell * price
+
+        elif action == 3 and self.balance >= price:  # Short Sell (open short position)
+            self.short_position += shares_to_short
+            self.balance += shares_to_short * price
+
+        elif action == 4 and self.short_position > 0:  # Cover Short (buy back shares)
+            self.short_position -= shares_to_cover
+            self.balance -= shares_to_cover * price
 
         self.current_step += 1
         done = self.current_step >= self.max_steps

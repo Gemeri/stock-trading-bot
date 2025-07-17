@@ -83,23 +83,34 @@ for option in optionList:
         net_worth = env.get_attr('get_net_worth')[0]()  
         net_worths.append(net_worth)
 
-        current_step = env.get_attr('current_step')[0]
-        stock_price = df['close'].iloc[current_step]
-        stock_prices.append(stock_price)
+        stock_price = df['close'].iloc[step]
+        stock_prices.append(float(stock_price))
 
         if done[0]:
             break
 
+    # print(stock_prices)
+
     # Plotting
-    plt.figure(figsize=(12, 6))
-    plt.plot(net_worths, label="Net Worth")
-    plt.plot(stock_prices, label="Stock Price ($)", linestyle="--")
-    plt.title("PPO Agent Net Worth Over Time (Gymnasium Compatible)")
-    plt.xlabel("Steps")
-    plt.ylabel("Net Worth ($)")
-    plt.legend()
-    plt.grid()
-    plt.tight_layout()
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    # 📈 Plot Net Worth (left Y-axis)
+    ax1.plot(net_worths, color='blue', label="Net Worth ($)")
+    ax1.set_xlabel("Steps")
+    ax1.set_ylabel("Net Worth ($)", color='blue')
+    ax1.tick_params(axis='y', labelcolor='blue')
+    ax1.grid(True)
+
+    # 📉 Create a second y-axis for Stock Price (right Y-axis)
+    ax2 = ax1.twinx()
+    ax2.plot(stock_prices, color='orange', label="Stock Price ($)")
+    ax2.set_ylabel("Stock Price ($)", color='orange')
+    ax2.tick_params(axis='y', labelcolor='orange')
+
+    # Title and legends
+    plt.title("PPO Agent Net Worth vs. Stock Price")
+    fig.tight_layout()
+    
 
     # Save the figure to disk
     plt.savefig(f"output/ppo_net_worth_{TICKER}_{INTERVAL}_{n_steps}_{total_timesteps}_{TRADING_TYPE}.png", dpi=300)  # You can also use .jpg, .pdf, etc.

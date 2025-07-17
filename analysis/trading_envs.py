@@ -4,7 +4,7 @@ import math
 from gymnasium import spaces
 
 class ShortTradingEnv(gym.Env):
-    def __init__(self, df, featureCols:list, buy_sell_rate:float = 0.01, short_rate:float = 0.001, buy_sell_cap=150000):
+    def __init__(self, df, featureCols:list, buy_sell_rate:float = 0.01, short_rate:float = 0.01):
         super().__init__()
         self.df = df
         self.features = df[featureCols].values
@@ -14,7 +14,6 @@ class ShortTradingEnv(gym.Env):
         self.initial_balance = 10000
 
         self.buy_sell_rate = buy_sell_rate
-        self.buy_sell_cap = buy_sell_cap
         self.short_rate = short_rate
 
         if self.buy_sell_rate > 1 or self.buy_sell_rate <= 0:
@@ -22,7 +21,7 @@ class ShortTradingEnv(gym.Env):
     
         self.reset()
 
-        self.action_space = spaces.Discrete(4)  # 0 = Hold, 1 = Buy, 2 = Sell, 3 = Short Sell
+        self.action_space = spaces.Discrete(5)  # 0 = Hold, 1 = Buy, 2 = Sell, 3 = Short Sell, 4 = Short Cover
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(featureCols),), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -44,17 +43,10 @@ class ShortTradingEnv(gym.Env):
         # Calculate how much we can buy/sell
         shares_affordable = math.floor(self.balance / price)
 
-        # min between the cap and what we can buy X the rate
-        shares_to_buy = min(self.buy_sell_cap, math.floor(shares_affordable * self.buy_sell_rate))
-
-        # min between the cap and what we hold X the rate
-        shares_to_sell = min(self.buy_sell_cap, math.floor(self.shares_held * self.buy_sell_rate))
-        
-        # shorting: we buy a % of your net worth
-        shares_to_short = min(self.buy_sell_cap, math.floor(self.net_worth * self.short_rate))
-
-        # short covering: we sell 25% of our short position
-        shares_to_cover = min(self.buy_sell_cap, math.floor(self.short_position * 0.25))
+        shares_to_buy = max(1, math.floor(shares_affordable * self.buy_sell_rate))
+        shares_to_sell = max(1, math.floor(self.shares_held * self.buy_sell_rate))
+        shares_to_short = max(1, math.floor(shares_affordable * self.short_rate))
+        shares_to_cover = max(1, math.floor(self.short_position * 0.25))
 
         # Actions
         if action == 1 and self.balance >= price:  # Buy
@@ -65,7 +57,7 @@ class ShortTradingEnv(gym.Env):
             self.shares_held -= shares_to_sell
             self.balance += shares_to_sell * price
 
-        elif action == 3 and self.balance >= price:  # Short Sell (open short position)
+        elif action == 3:  # Short Sell (open short position)
             self.short_position += shares_to_short
             self.balance += shares_to_short * price
 
@@ -73,13 +65,19 @@ class ShortTradingEnv(gym.Env):
             self.short_position -= shares_to_cover
             self.balance -= shares_to_cover * price
 
+        # Move to next step
         self.current_step += 1
         done = self.current_step >= self.max_steps
 
-        # Net worth calculation
-        current_value = self.shares_held * price - self.short_position * price
-        self.net_worth = self.balance + current_value
-        reward = self.net_worth - self.initial_balance
+        prev_worth = self.net_worth
+
+        # Net worth = cash + value of long positions - cost to cover shorts
+        long_value = self.shares_held * price
+        short_liability = self.short_position * price
+        self.net_worth = self.balance + long_value - short_liability
+
+        # reward as delta between
+        reward = self.net_worth - prev_worth
 
         return self._get_observation(), reward, done, False, {}
 

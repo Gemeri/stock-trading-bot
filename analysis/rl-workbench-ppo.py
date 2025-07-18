@@ -18,22 +18,25 @@ INTERVAL = "H1"
 TRADING_TYPE = 'normal'
 
 optionList = [
-    '256-180000',
-    '256-200000',
-    '256-220000',
-    '256-250000',
-    #'256-1000000',
-    #'256-2000000',
+    #'256-180000',
+    #'256-200000',
+    #'256-220000',
+    #'256-250000',
+    '256-500000',
+    '256-1000000',
+    '256-2000000',
 ]
 
 FEATURE_COLUMNS = [
-            'vwap','high', 'low', 'close', 'open', 'sentiment',
-            'macd_line', 'macd_signal', 'macd_histogram', 'rsi', 
-            'ema_9', 'ema_21', 'ema_50','ema_200',
-            'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10',
-            'momentum', 
-            'atr', 'volume_zscore', 'volume', 'days_since_high']
-
+    "price_change", "high_low_range", "gap_vs_prev",
+    "macd_line", "macd_signal", "macd_histogram", "macd_cross", "macd_hist_flip",
+    "rsi", "momentum", "roc", "atr",
+    "ema_9", "ema_21", "ema_50", "ema_200",
+    "volume_zscore", "atr_zscore", "rsi_zscore",
+    "adx", "adx_trend", "obv",
+    "candle_body_ratio", "wick_dominance",
+    "day_of_week", "days_since_high", "days_since_low"
+]
 # seed setting
 SEED = 42
 np.random.seed(SEED)
@@ -61,12 +64,12 @@ for option in optionList:
                 verbose=0,
                 n_steps=n_steps,
                 batch_size=64,
-                policy_kwargs=dict(net_arch=[32, 32]),
+                policy_kwargs=dict(net_arch={"pi": [128], "vf": [128, 128]}),
                 gae_lambda=0.95,            # default value
                 gamma=0.95,
                 n_epochs=4,
                 ent_coef=0.05,              # default 0.005
-                learning_rate=2.5e-4,       # 2.5e-4 is the default value
+                learning_rate=1e-4,       # 2.5e-4 is the default value
                 clip_range=0.2,             # default value
                 max_grad_norm=0.5,
                 vf_coef=0.5,

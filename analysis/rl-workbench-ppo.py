@@ -4,8 +4,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from gymnasium import spaces
 from stable_baselines3 import PPO, A2C
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from trading_envs import ShortTradingEnv, NormalTradingEnv
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import StopTrainingOnNoModelImprovement, EvalCallback
 import torch
 
 # Ignore future warnings from wrapping Gym environments
@@ -16,11 +18,12 @@ INTERVAL = "H1"
 TRADING_TYPE = 'normal'
 
 optionList = [
-    '2048-100000',
-    '2048-250000',
-    '2048-500000',
-    '2048-1000000',
-    '2048-5000000',
+    '256-180000',
+    '256-200000',
+    '256-220000',
+    '256-250000',
+    #'256-1000000',
+    #'256-2000000',
 ]
 
 FEATURE_COLUMNS = [
@@ -36,23 +39,29 @@ SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
+# max 8 threads
+torch.set_num_threads(8)
 
 # Load data
 df = pd.read_csv(f"../data/{TICKER}_{INTERVAL}.csv")
 df = df.dropna().reset_index(drop=True)
 
+# to prevent overfitting/collapsing
+early_stop = StopTrainingOnNoModelImprovement(
+    max_no_improvement_evals=10,
+    min_evals=5,
+    verbose=1
+)
 
-# Wrap your env creation in a function (unfinished)
-def make_env():
-    def _init():
-        return DummyVecEnv([lambda: NormalTradingEnv(df, FEATURE_COLUMNS)])
-    return _init
+env = DummyVecEnv([lambda: Monitor(NormalTradingEnv(df, FEATURE_COLUMNS))])
 
-# Wrap the environment
-if TRADING_TYPE == 'short':
-    env = DummyVecEnv([lambda: ShortTradingEnv(df, FEATURE_COLUMNS)])
-else:
-    env = DummyVecEnv([lambda: NormalTradingEnv(df, FEATURE_COLUMNS)])
+eval_callback = EvalCallback(
+    env,
+    eval_freq=10_000,
+    callback_after_eval=early_stop,
+    best_model_save_path="./logs/best_model",
+    log_path="./logs/"
+)
 
 for option in optionList:
 
@@ -62,23 +71,23 @@ for option in optionList:
     print(f"Attempting {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")
 
     # Train PPO
-    
     model = PPO("MlpPolicy", env, 
                 verbose=0,
                 n_steps=n_steps,
                 batch_size=64,
+                policy_kwargs=dict(net_arch=[32, 32]),
                 gae_lambda=0.95,            # default value
                 gamma=0.95,
-                n_epochs=10,
+                n_epochs=4,
                 ent_coef=0.05,              # default 0.005
-                learning_rate=2.5e-4,       # default value
+                learning_rate=2.5e-4,       # 2.5e-4 is the default value
                 clip_range=0.2,             # default value
                 max_grad_norm=0.5,
-                vf_coef=0.5, 
+                vf_coef=0.5,
+                tensorboard_log="./ppo_logs/",
                 )
     
-    # model = A2C("MlpPolicy", env, verbose=0)
-    model.learn(total_timesteps=total_timesteps)
+    model.learn(total_timesteps=total_timesteps, tb_log_name=f"PPO_{TICKER}", callback=eval_callback)
 
     print(f"Completed {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")
 

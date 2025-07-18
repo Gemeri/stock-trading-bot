@@ -1,5 +1,7 @@
 /venv
 .env
+*logs
+*output
 /__pycache__
 /logic/__pycache__
 /sub/__pycache__

@@ -41,8 +41,14 @@ torch.manual_seed(SEED)
 df = pd.read_csv(f"../data/{TICKER}_{INTERVAL}.csv")
 df = df.dropna().reset_index(drop=True)
 
-# Wrap the environment
 
+# Wrap your env creation in a function (unfinished)
+def make_env():
+    def _init():
+        return DummyVecEnv([lambda: NormalTradingEnv(df, FEATURE_COLUMNS)])
+    return _init
+
+# Wrap the environment
 if TRADING_TYPE == 'short':
     env = DummyVecEnv([lambda: ShortTradingEnv(df, FEATURE_COLUMNS)])
 else:
@@ -57,21 +63,21 @@ for option in optionList:
 
     # Train PPO
     
-    #model = PPO("MlpPolicy", env, 
-    #            verbose=0,
-    #            n_steps=n_steps,
-    #            batch_size=64,
-    #            gae_lambda=0.95,            # default value
-    #            gamma=0.95,
-    #            n_epochs=10,
-    #            ent_coef=0.05,              # default 0.005
-    #            learning_rate=2.5e-4,       # default value
-    #            clip_range=0.2,             # default value
-    #            max_grad_norm=0.5,
-    #            vf_coef=0.5, 
-    #            )
+    model = PPO("MlpPolicy", env, 
+                verbose=0,
+                n_steps=n_steps,
+                batch_size=64,
+                gae_lambda=0.95,            # default value
+                gamma=0.95,
+                n_epochs=10,
+                ent_coef=0.05,              # default 0.005
+                learning_rate=2.5e-4,       # default value
+                clip_range=0.2,             # default value
+                max_grad_norm=0.5,
+                vf_coef=0.5, 
+                )
     
-    model = A2C("MlpPolicy", env, verbose=0)
+    # model = A2C("MlpPolicy", env, verbose=0)
     model.learn(total_timesteps=total_timesteps)
 
     print(f"Completed {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")

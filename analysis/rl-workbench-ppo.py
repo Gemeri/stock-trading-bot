@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from gymnasium import spaces
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, A2C
 from stable_baselines3.common.vec_env import DummyVecEnv
 from trading_envs import ShortTradingEnv, NormalTradingEnv
 import torch
@@ -16,10 +16,11 @@ INTERVAL = "H1"
 TRADING_TYPE = 'normal'
 
 optionList = [
-    '256-100000',
-    '256-250000',
-    '256-500000',
-    '256-1000000',
+    '2048-100000',
+    '2048-250000',
+    '2048-500000',
+    '2048-1000000',
+    '2048-5000000',
 ]
 
 FEATURE_COLUMNS = [
@@ -55,19 +56,22 @@ for option in optionList:
     print(f"Attempting {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")
 
     # Train PPO
-    model = PPO("MlpPolicy", env, 
-                verbose=0, 
-                n_steps=n_steps,
-                batch_size=64,
-                gae_lambda=0.95,            # default value
-                gamma=0.95,
-                n_epochs=10,
-                ent_coef=0.01,              # default 0.005
-                learning_rate=2.5e-4,       # default value
-                clip_range=0.2,             # default value
-                max_grad_norm=0.5,
-                vf_coef=0.5, 
-                )
+    
+    #model = PPO("MlpPolicy", env, 
+    #            verbose=0,
+    #            n_steps=n_steps,
+    #            batch_size=64,
+    #            gae_lambda=0.95,            # default value
+    #            gamma=0.95,
+    #            n_epochs=10,
+    #            ent_coef=0.05,              # default 0.005
+    #            learning_rate=2.5e-4,       # default value
+    #            clip_range=0.2,             # default value
+    #            max_grad_norm=0.5,
+    #            vf_coef=0.5, 
+    #            )
+    
+    model = A2C("MlpPolicy", env, verbose=0)
     model.learn(total_timesteps=total_timesteps)
 
     print(f"Completed {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")

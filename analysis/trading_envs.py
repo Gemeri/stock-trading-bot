@@ -93,7 +93,7 @@ class NormalTradingEnv(gym.Env):
         self.df = df
         self.n_steps = len(df)
         self.current_step = 0
-        self.initial_balance = 10000
+        self.initial_balance = 100000
         self.balance = self.initial_balance
         self.position = 0
         self.total_shares = 0
@@ -101,6 +101,7 @@ class NormalTradingEnv(gym.Env):
         self.max_steps = len(df) - 1
         self.buy_sell_rate = buy_sell_rate
         self.last_action = 0 # nothing
+        self.returns_window = []
         
         if self.buy_sell_rate > 1 or self.buy_sell_rate <= 0:
             raise ValueError(f"buy/sell rate cannot be > 1 or <= 0: {self.buy_sell_rate} provided");
@@ -119,6 +120,9 @@ class NormalTradingEnv(gym.Env):
         self.total_shares = 0
         self.net_worth = self.initial_balance
         self.position = 0
+        self.last_action = 0
+        self.returns_window = []
+        
         obs = self._next_observation()
         info = {}
         return obs, info
@@ -129,30 +133,32 @@ class NormalTradingEnv(gym.Env):
     def step(self, action):
         price = self.df.loc[self.current_step, 'close']
 
+        shares_traded = 0
+
         if action == 1 and self.balance >= price:
 
             # max shares to buy
             shares_affordable = math.floor(self.balance/price)
 
             # we apply a percentage 
-            shares_to_buy = math.floor(self.buy_sell_rate*shares_affordable)
+            shares_traded = math.floor(self.buy_sell_rate*shares_affordable)
 
-            self.total_shares += shares_to_buy
-            self.balance -= price * shares_to_buy
+            self.total_shares += shares_traded
+            self.balance -= price * shares_traded
 
             # we save for plotting
-            self.last_action = shares_to_buy
+            self.last_action = shares_traded
 
         elif action == 2 and self.total_shares > 0:
 
             # we sell only a % of the shares we own + cap
-            shares_to_buy = math.floor(self.buy_sell_rate*self.total_shares)
+            shares_traded = math.floor(self.buy_sell_rate*self.total_shares)
 
-            self.balance += price * shares_to_buy
-            self.total_shares -= shares_to_buy
+            self.balance += price * shares_traded
+            self.total_shares -= shares_traded
 
             # we save for plotting
-            self.last_action = -shares_to_buy
+            self.last_action = -shares_traded
 
         else:
             # just hold
@@ -162,8 +168,11 @@ class NormalTradingEnv(gym.Env):
 
         self.net_worth = self.balance + self.total_shares * price
         
-        # reward as delta between
-        reward = self.net_worth - prev_worth
+        # this caused no trades no matter the number of steps
+        #trade_penalty = 0.00001 * price * shares_traded  # 0.1% cost to discourage excessive trading
+
+        self.returns_window.append(np.log(self.net_worth / prev_worth))
+        reward = np.mean(self.returns_window[-10:])
 
         self.current_step += 1
 

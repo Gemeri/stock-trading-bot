@@ -9,7 +9,7 @@ logging.basicConfig(
 logging.info("Getting data... ")
 
 # let's download 1 ticket
-data = fetch_candles_plus_features('AAPL', 3000, '2Hour') # ~ at 1hr / 7 candles/day = ~130 days / half a year
+data = fetch_candles_plus_features('AMZN', 3000, '1Hour') # ~ at 1hr / 7 candles/day = ~130 days / half a year
 
 logging.info("... done")
 

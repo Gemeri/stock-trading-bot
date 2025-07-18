@@ -13,7 +13,7 @@ import torch
 # Ignore future warnings from wrapping Gym environments
 # warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-TICKER = "AAPL"
+TICKER = "AMZN"
 INTERVAL = "H1"
 TRADING_TYPE = 'normal'
 
@@ -27,7 +27,7 @@ optionList = [
 ]
 
 FEATURE_COLUMNS = [
-            'vwap','high', 'low', 'close', 'open', 
+            'vwap','high', 'low', 'close', 'open', 'sentiment',
             'macd_line', 'macd_signal', 'macd_histogram', 'rsi', 
             'ema_9', 'ema_21', 'ema_50','ema_200',
             'lagged_close_1','lagged_close_2','lagged_close_3','lagged_close_5','lagged_close_10',
@@ -46,22 +46,8 @@ torch.set_num_threads(8)
 df = pd.read_csv(f"../data/{TICKER}_{INTERVAL}.csv")
 df = df.dropna().reset_index(drop=True)
 
-# to prevent overfitting/collapsing
-early_stop = StopTrainingOnNoModelImprovement(
-    max_no_improvement_evals=10,
-    min_evals=5,
-    verbose=1
-)
 
 env = DummyVecEnv([lambda: Monitor(NormalTradingEnv(df, FEATURE_COLUMNS))])
-
-eval_callback = EvalCallback(
-    env,
-    eval_freq=10_000,
-    callback_after_eval=early_stop,
-    best_model_save_path="./logs/best_model",
-    log_path="./logs/"
-)
 
 for option in optionList:
 
@@ -87,7 +73,7 @@ for option in optionList:
                 tensorboard_log="./ppo_logs/",
                 )
     
-    model.learn(total_timesteps=total_timesteps, tb_log_name=f"PPO_{TICKER}", callback=eval_callback)
+    model.learn(total_timesteps=total_timesteps, tb_log_name=f"PPO_{TICKER}")
 
     print(f"Completed {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")
 

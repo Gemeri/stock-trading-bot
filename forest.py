@@ -72,6 +72,7 @@ SENTIMENT_OFFSET_MINUTES= int(os.getenv("SENTIMENT_OFFSET_MINUTES", "20"))
 
 BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
 N_BARS        = int(os.getenv("N_BARS", "5000"))
+ROLLING_CANDLES = int(os.getenv("ROLLING_CANDLES", "0"))
 
 # discord / ai / news ------------------------------------------------------------------------
 DISCORD_MODE  = os.getenv("DISCORD_MODE", "off").lower().strip()
@@ -112,6 +113,25 @@ NY_TZ = pytz.timezone("America/New_York")
 
 NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()
 REWRITE = os.getenv("REWRITE", "off").strip().lower()
+
+
+def limit_df_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim DataFrame to last ROLLING_CANDLES rows if limit is set."""
+    if ROLLING_CANDLES > 0 and len(df) > ROLLING_CANDLES:
+        df = df.iloc[-ROLLING_CANDLES:].reset_index(drop=True)
+    return df
+
+
+def read_csv_limited(path: str) -> pd.DataFrame:
+    """Read a CSV and apply rolling candle limit."""
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        logging.error(f"Error reading CSV {path}: {e}")
+        return pd.DataFrame()
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    return limit_df_rows(df)
 
 
 # ----------------------------------------------------
@@ -556,14 +576,14 @@ def fetch_candles_plus_features_and_predclose(
     # ───── 1. load historical CSV (if present & not rewriting) ─────────────
     if rewrite_mode == "off" and os.path.exists(csv_filename):
         try:
-            df_existing = pd.read_csv(csv_filename, parse_dates=['timestamp'])
-            last_ts     = df_existing['timestamp'].max()
+            df_existing = read_csv_limited(csv_filename)
+            last_ts = df_existing['timestamp'].max()
             if pd.notna(last_ts) and last_ts.tzinfo is None:
                 last_ts = last_ts.tz_localize('UTC')
         except Exception as e:
             logging.error(f"[{ticker}] Problem loading old CSV: {e}")
             df_existing = pd.DataFrame()
-            last_ts     = None
+            last_ts = None
     else:
         df_existing = pd.DataFrame()
         last_ts     = None
@@ -706,7 +726,8 @@ def fetch_candles_plus_features_and_predclose(
                     logging.error(f"[{ticker}] predicted_close error idx={i}: {e}")
                     df_combined.at[i, 'predicted_close'] = np.nan
 
-    # ───── 8. save & return  ───────────────────────────────────────────────
+    # ───── 8. trim, save & return  ─────────────────────────────────────────
+    df_combined = limit_df_rows(df_combined)
     try:
         df_combined.to_csv(csv_filename, index=False)
         logging.info(f"[{ticker}] CSV updated – now {len(df_combined)} rows.")
@@ -1222,6 +1243,7 @@ def _predict_meta(models: dict[str, object],
 # 8. Enhanced Train & Predict Pipeline
 # -------------------------------
 def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | None = None):
+    df = limit_df_rows(df)
     if 'sentiment' in df.columns and df["sentiment"].dtype == object:
         try:
             df["sentiment"] = df["sentiment"].astype(float)
@@ -1744,7 +1766,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
         if skip_data:
             if not os.path.exists(csv_file):
                 continue
-            df = pd.read_csv(csv_file, parse_dates=["timestamp"])
+            df = read_csv_limited(csv_file)
             if df.empty:
                 continue
         else:
@@ -2285,7 +2307,7 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
             if not os.path.exists(csv_filename):
                 logging.error(f"[{ticker}] CSV file {csv_filename} does not exist. Cannot trade.")
                 continue
-            df = pd.read_csv(csv_filename)
+            df = read_csv_limited(csv_filename)
             if df.empty:
                 logging.error(f"[{ticker}] Existing CSV is empty. Skipping.")
                 continue
@@ -2503,7 +2525,7 @@ def console_listener():
                     if not os.path.exists(csv_filename):
                         logging.error(f"[{ticker}] CSV does not exist, skipping.")
                         continue
-                    df = pd.read_csv(csv_filename)
+                    df = read_csv_limited(csv_filename)
                     if df.empty:
                         logging.error(f"[{ticker}] CSV is empty, skipping.")
                         continue
@@ -2546,7 +2568,7 @@ def console_listener():
                     logging.error(f"[{ticker}] Candle CSV {candle_csv} not found, skipping merge.")
                     continue
                 try:
-                    df = pd.read_csv(candle_csv)
+                    df = read_csv_limited(candle_csv)
                 except Exception as e:
                     logging.error(f"[{ticker}] Error reading candle CSV: {e}")
                     continue
@@ -2640,7 +2662,7 @@ def console_listener():
                             if not os.path.exists(csv_filename):
                                 logging.error(f"[{ticker}] CSV file {csv_filename} does not exist, skipping.")
                                 continue
-                            df = pd.read_csv(csv_filename)
+                            df = read_csv_limited(csv_filename)
                             if df.empty:
                                 logging.error(f"[{ticker}] CSV is empty, skipping.")
                                 continue
@@ -3099,7 +3121,7 @@ def console_listener():
                     if not os.path.exists(csv_file):
                         logging.error(f"[{ticker}] CSV {csv_file} not found, skipping.")
                         continue
-                    df = pd.read_csv(csv_file)
+                    df = read_csv_limited(csv_file)
                     if df.empty:
                         logging.error(f"[{ticker}] CSV is empty, skipping.")
                         continue

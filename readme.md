@@ -85,6 +85,7 @@ TICKERS=TSLA, AAPL             # Comma‑separated list of tickers
 # e.g. `TICKERS=tickerlist,5` for the top 5
 BAR_TIMEFRAME=30Min            # 15Min, 30Min, 1Hour, 2Hour, 4Hour, etc.
 N_BARS=5000                    # Number of historical bars to fetch
+ROLLING_CANDLES=0              # If >0, keep only this many candles in CSV
 NEWS_MODE=on                   # on/off to enable news sentiment integration
 TRADE_LOGIC=1                  # Select logic script ID from `logic/` folder
 AI_TICKER_COUNT=0              # Number of tickers to generate via AI models (0=disabled)

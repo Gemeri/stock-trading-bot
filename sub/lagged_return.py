@@ -20,15 +20,15 @@ FEATURES = [
     'lagged_close_10', 'close'
 ]
 
-PARAM_DIST = {
-    'n_estimators':      [100, 250, 500],
-    'max_depth':         [15],
-    'learning_rate':     [0.01],
-    'subsample':         [0.7],
-    'colsample_bytree':  [1.0],
-    'reg_alpha':         [0, 0.5, 1.0],
-    'reg_lambda':        [0, 0.5, 1.0],
-    'min_child_weight':  [10]
+BEST_PARAMS = {
+    "n_estimators":     600,
+    "learning_rate":    0.03,
+    "max_depth":        6,
+    "subsample":        0.80,
+    "colsample_bytree": 0.80,
+    "min_child_weight": 20,
+    "reg_alpha":        0.0,
+    "reg_lambda":       1.0,
 }
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 

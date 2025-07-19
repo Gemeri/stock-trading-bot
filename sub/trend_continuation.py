@@ -53,7 +53,7 @@ def compute_labels(df, mode='momentum', n_ahead=2, thresh=0.002, quantile=0.4):
     df = df.copy()
     if USE_META_LABEL:
         return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
-    df['fwd_ret'] = (df['close'].shift(-n_ahead) - df['open']) / df['open']
+    df['fwd_ret'] = (df['close'].shift(-n_ahead) - df['close']) / df['close']
     if mode == 'momentum':
         df['label'] = (df['fwd_ret'] > thresh).astype(int)
     elif mode == 'quantile':

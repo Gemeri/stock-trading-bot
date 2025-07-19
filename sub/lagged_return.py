@@ -34,13 +34,13 @@ PARAM_DIST = {
 
 def compute_target(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add a column 'target' = next-bar open→open return.
+    Add a column 'target' = next-bar close→close return.
     """
     df = df.copy()
     if USE_META_LABEL:
         return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
-    df['open_t1'] = df['open'].shift(-1)
-    df['target']  = (df['open_t1'] - df['open']) / df['open']
+    df['close_t1'] = df['close'].shift(-1)
+    df['target']  = (df['close_t1'] - df['close']) / df['close']
     return df
 
 def sharpe(returns: np.ndarray) -> float:
@@ -71,11 +71,16 @@ def fit(X_train: pd.DataFrame, y_train: pd.Series) -> XGBRegressor:
         error_score='raise'
     )
     rand.fit(X_train, y_train)
-    return rand.best_estimator_
+    model = rand.best_estimator_
+    # scale parameter for logistic transform of returns
+    model.tau = float(np.std(y_train)) if np.std(y_train) > 0 else 1.0
+    return model
 
 def predict(model: XGBRegressor, X: pd.DataFrame) -> np.ndarray:
     logging.info("Ruinning PREDICT on lagged_return")
-    return model.predict(X)
+    ret = model.predict(X)
+    tau = getattr(model, "tau", 1.0)
+    return 1 / (1 + np.exp(-(ret / tau)))
 
 
 # ─── Main backtest (unchanged logic, now uses fit()/predict()) ─────────────────
@@ -139,7 +144,7 @@ def main():
 
         # predict return on bar t
         X_t     = df.loc[[t], FEATURES]
-        pred_ret = predict(model, X_t)[0]
+        pred_prob = predict(model, X_t)[0]
 
         # simulate PnL: entry at t+1 open, exit at t+2 open
         op1 = df.at[t+1, 'open']
@@ -153,7 +158,7 @@ def main():
 
         records.append({
             't':     t,
-            'pred':  pred_ret,
+            'prob':  pred_prob,
             'raw':   raw_ret,
             'net':   net_ret
         })
@@ -161,7 +166,7 @@ def main():
     back = pd.DataFrame(records).set_index('t')
 
     # 4) Metrics & equity curve
-    mse   = mean_squared_error(back['raw'], back['pred'])
+    brier = mean_squared_error((back['raw'] > 0).astype(int), back['prob'])
     rets  = back['net']
     equity = (1 + rets).cumprod()
     total  = equity.iloc[-1] - 1
@@ -173,7 +178,7 @@ def main():
     print(f"Total return       = {total*100:.2f}%")
     print(f"Sharpe (ann.)      = {sr:.2f}")
     print(f"Max drawdown       = {dd*100:.2f}%")
-    print(f"MSE                = {mse:.6f}")
+    print(f"Brier score        = {brier:.6f}")
 
     # 5) Save and plot
     os.makedirs(args.output_dir, exist_ok=True)

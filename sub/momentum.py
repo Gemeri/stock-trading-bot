@@ -59,8 +59,8 @@ def compute_labels(df):
     if USE_META_LABEL:
         return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
 
-    df['open_t1'] = df['open'].shift(-1)
-    df['label']   = (df['open_t1'] > df['open']).astype(int)
+    df['close_t1'] = df['close'].shift(-1)
+    df['label']   = (df['close_t1'] > df['close']).astype(int)
 
     # ensure training slice is clean
     return df.dropna(subset=FEATURES + ['label']).reset_index(drop=True)

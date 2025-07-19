@@ -2728,8 +2728,29 @@ def console_listener():
                                 train_df = df.iloc[:train_end]
                                 test_df  = df.iloc[train_end:]
                                 idx_list = list(test_df.index)
+
+                                feature_cols = [c for c in POSSIBLE_FEATURE_COLS if c in train_df.columns]
+                                X_train = train_df[feature_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                                y_train = train_df['target']
+
+                                model_stack = []
+                                for m in ml_models:
+                                    if m in ["forest", "rf", "randomforest"]:
+                                        mdl = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                                    elif m == "xgboost":
+                                        mdl = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                                    elif m in ["lightgbm", "lgbm"]:
+                                        mdl = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                                    else:
+                                        continue
+                                    mdl.fit(X_train, y_train)
+                                    model_stack.append(mdl)
+
+                                if not model_stack:
+                                    logging.error(f"[{ticker}] No supported model for simple backtest.")
+                                    continue
                             else: # complex
-                                idx_list = list(range(train_end, total_len))                        
+                                idx_list = list(range(train_end, total_len))               
                             if len(df.iloc[:train_end]) < 70:
                                 logging.error(f"[{ticker}] Not enough training rows for {approach} approach.")
                                 continue
@@ -2843,19 +2864,17 @@ def console_listener():
 
                                 for i_, row_idx in enumerate(idx_list):
 
-                                    # ───────────────────────────────────────────────────────────
-                                    # 1. TRAIN / PREDICT on an expanding window
-                                    # ───────────────────────────────────────────────────────────
                                     if approach == "simple":
-                                        sub_df = pd.concat(
-                                            [train_df, test_df.iloc[: i_ + 1]],
-                                            axis=0,
-                                            ignore_index=True,
-                                        )
+                                        if row_idx == 0:
+                                            continue
+                                        feat_row = df.loc[row_idx - 1, feature_cols]
+                                        X_pred = pd.DataFrame([feat_row], columns=feature_cols)
+                                        X_pred = X_pred.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                                        preds = [mdl.predict(X_pred)[0] for mdl in model_stack]
+                                        pred_close = float(np.mean(preds))
                                     else:
                                         sub_df = df.iloc[:row_idx]
-
-                                    pred_close = train_and_predict(sub_df, ticker=ticker)
+                                        pred_close = train_and_predict(sub_df, ticker=ticker)
                                     row_data   = df.loc[row_idx]
                                     real_close = row_data["close"]
 

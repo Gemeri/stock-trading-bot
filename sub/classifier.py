@@ -5,10 +5,12 @@ import pandas as pd
 from xgboost import XGBClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import TimeSeriesSplit
+import argparse
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, roc_auc_score
 
 from sub.common import compute_meta_labels, USE_META_LABEL
 
-# ─── Feature Set ────────────────────────────────────────────────────────────
 FEATURES = [
     # basic price/vol
     "open", "high", "low", "close", "volume", "vwap", "transactions",
@@ -46,29 +48,19 @@ BEST_XGB_PARAMS = {
     "reg_lambda":       1.0,
 }
 
-# ─── Label Construction ─────────────────────────────────────────────────────
 
 def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     if USE_META_LABEL:
-        # keep behavior identical to previous pipeline
         return compute_meta_labels(df).rename(columns={"meta_label": "label"})
 
     df["label"] = (df["close"].shift(-1) > df["close"]).astype(int)
-    # drop rows that still contain NaNs in feature set or label
     return df.dropna(subset=FEATURES + ["label"]).reset_index(drop=True)
 
 def fit(X_train: np.ndarray, y_train: np.ndarray):
-    """
-    Fast deterministic fit:
-      • fixed hyper-params (BEST_XGB_PARAMS) – no grid search
-      • early-stopping on the last 10 % of the training slice
-      • isotonic calibration for well-behaved probabilities
-    """
     logging.info("Running FIT on all_features_xgboost – static params + early-stop")
 
-    # 1) split last 10 % for early-stopping
     val_size = max(200, int(0.1 * len(X_train)))
     X_tr, X_val = X_train[:-val_size], X_train[-val_size:]
     y_tr, y_val = y_train[:-val_size], y_train[-val_size:]
@@ -89,14 +81,12 @@ def fit(X_train: np.ndarray, y_train: np.ndarray):
         verbose=False,
     )
 
-    # 2) isotonic calibration with a *time-series aware* CV
     calib = CalibratedClassifierCV(
         core,
         method="isotonic",
         cv=TimeSeriesSplit(n_splits=3),
     ).fit(X_train, y_train)
 
-    # expose raw XGB params so downstream code that clones works unchanged
     calib.get_xgb_params = core.get_xgb_params
     return calib
 
@@ -105,12 +95,7 @@ def predict(model, X: np.ndarray) -> np.ndarray:
     logging.info("Running PREDICT on all_features_xgboost (calibrated)")
     return model.predict_proba(X)[:, 1]
 
-# ─── Optional Stand‑Alone Test Harness ──────────────────────────────────────
 if __name__ == "__main__":
-    import argparse
-    from tqdm import tqdm
-    from sklearn.metrics import accuracy_score, roc_auc_score
-
     p = argparse.ArgumentParser()
     p.add_argument("input_csv", help="CSV containing raw bars + all features")
     p.add_argument("--output", default="xgb_backtest.csv", help="Where to dump simple walk‑forward results")
@@ -118,19 +103,16 @@ if __name__ == "__main__":
     p.add_argument("--window", type=int, default=500, help="Rolling window size for training each step")
     args = p.parse_args()
 
-    # 1) Load & label
     df = pd.read_csv(args.input_csv)
     df = compute_labels(df)
 
-    # 2) Hyper‑param tuning on all but last n_back
     df_tune = df.iloc[:-args.n_back]
     X_tune, y_tune = df_tune[FEATURES].values, df_tune["label"].values
     model = fit(X_tune, y_tune)
 
-    # 3) Simple i+1 walk‑forward probability evaluation on last n_back
     recs = []
     start = len(df) - args.n_back - 1
-    end   = len(df) - 2  # need *next* bar for label
+    end   = len(df) - 2
 
     for t in tqdm(range(start, end), desc="Walk‑forward"):
         train_slice = df.iloc[max(0, t - args.window): t]

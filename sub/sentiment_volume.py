@@ -62,9 +62,9 @@ def compute_labels(
             .reset_index(drop=True)
         )
 
-    # raw next-bar return
-    df["open_t1"] = df["open"].shift(-1)
-    df["raw_ret"] = (df["open_t1"] - df["open"]) / df["open"]
+    # raw next close-to-close return
+    df["close_t1"] = df["close"].shift(-1)
+    df["raw_ret"] = (df["close_t1"] - df["close"]) / df["close"]
 
     absrets = df["raw_ret"].abs()
     if min_return is None:

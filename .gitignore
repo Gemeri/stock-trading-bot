@@ -2,8 +2,16 @@
 .env
 *logs
 *output
-/__pycache__
-/logic/__pycache__
-/sub/__pycache__
 /catboost_info
 /*.csv
+*.png
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python Bytecode
+__pycache__/
+*.py[cod]
+*$py.class

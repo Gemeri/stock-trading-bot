@@ -167,12 +167,9 @@ class NormalTradingEnv(gym.Env):
         prev_worth = self.net_worth
 
         self.net_worth = self.balance + self.total_shares * price
-        
-        # this caused no trades no matter the number of steps
-        #trade_penalty = 0.00001 * price * shares_traded  # 0.1% cost to discourage excessive trading
 
-        self.returns_window.append(np.log(self.net_worth / prev_worth))
-        reward = np.mean(self.returns_window[-10:])
+        self.returns_window.append(self.net_worth / prev_worth)
+        reward = np.mean(self.returns_window[-5:])
 
         self.current_step += 1
 

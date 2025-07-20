@@ -18,7 +18,6 @@ ARTICLES_PER_DAY_MAPPING = {
     "30Min": 16,
     "15Min": 32
 }
-TICKER_LIST = ['AAPL', 'ADBE', 'TSLA', 'AMD', 'AMZN', 'BA', 'INTC', 'MSFT', 'NKE', 'NVDA', 'ORCL', 'PLTR', 'PYPL', 'SNOW', 'V']
 
 NY_TZ = pytz.timezone("America/New_York")
 
@@ -26,7 +25,8 @@ def fetch_candles_plus_features(
     ticker: str,
     bars: int,
     timeframe: str,
-    rewrite_mode: str = ""
+    rewrite_mode: str = "",
+    fetch_sentiment: bool = False
 ) -> pd.DataFrame:
 
     tf_code       = timeframe_to_code(timeframe)
@@ -85,48 +85,51 @@ def fetch_candles_plus_features(
     oldest_candle_ts = df_candles_new['timestamp'].min()
     days_ago = (datetime.now(NY_TZ) - oldest_candle_ts).days
 
-    # ───── 4. attach incremental sentiment to the new slice ──────────────
-    if last_ts is not None:
-        news_days = 1
-        start_dt  = last_ts
-    else:
-        news_days = days_ago
-        start_dt  = None
-
-    articles_per_day = ARTICLES_PER_DAY_MAPPING.get(timeframe, 1)
-    news_list = fetch_news(
-        ticker,
-        news_days,
-        articles_per_day,
-        start_dt=start_dt
-    )
-
-    # we add the sentiment for each piece of news
-    for news_item in news_list:
-        combined = f"{news_item['headline']} {news_item['summary']}"
-        _, _, sentiment_score = predict_fin_sentiment(combined)
-        news_item['sentiment'] = sentiment_score
-
-
-    sentiments = assign_sentiment_to_candles(df_candles_new, news_list)
-    df_candles_new['sentiment'] = sentiments
-
-    try:
-        if os.path.exists(sentiment_csv):
-            df_sent_old = pd.read_csv(sentiment_csv, parse_dates=['timestamp'])
+    if fetch_sentiment is True:
+    
+        # ───── 4. attach incremental sentiment to the new slice ──────────────
+        if last_ts is not None:
+            news_days = 1
+            start_dt  = last_ts
         else:
-            df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment'])
+            news_days = days_ago
+            start_dt  = None
 
-        df_sent_new = pd.DataFrame({
-            "timestamp": df_candles_new['timestamp'],
-            "sentiment": sentiments
-        })
-        (pd.concat([df_sent_old, df_sent_new])
-           .drop_duplicates(subset=['timestamp'])
-           .sort_values('timestamp')
-           .to_csv(sentiment_csv, index=False))
-    except Exception as e:
-        logging.error(f"[{ticker}] Unable to update sentiment CSV: {e}")
+        articles_per_day = ARTICLES_PER_DAY_MAPPING.get(timeframe, 1)
+        news_list = fetch_news(
+            ticker,
+            news_days,
+            articles_per_day,
+            start_dt=start_dt
+        )
+
+        # we add the sentiment for each piece of news
+        for news_item in news_list:
+            combined = f"{news_item['headline']} {news_item['summary']}"
+            _, _, sentiment_score = predict_fin_sentiment(combined)
+            news_item['sentiment'] = sentiment_score
+
+
+        sentiments = assign_sentiment_to_candles(df_candles_new, news_list)
+        df_candles_new['sentiment'] = sentiments
+
+        try:
+            if os.path.exists(sentiment_csv):
+                df_sent_old = pd.read_csv(sentiment_csv, parse_dates=['timestamp'])
+            else:
+                df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment'])
+
+            df_sent_new = pd.DataFrame({
+                "timestamp": df_candles_new['timestamp'],
+                "sentiment": sentiments
+            })
+            (pd.concat([df_sent_old, df_sent_new])
+            .drop_duplicates(subset=['timestamp'])
+            .sort_values('timestamp')
+            .to_csv(sentiment_csv, index=False))
+        except Exception as e:
+            logging.error(f"[{ticker}] Unable to update sentiment CSV: {e}")
+        
 
     # ───── 5. combine old + new *before* engineering features ──────────────
     df_combined = (pd.concat([df_existing, df_candles_new], ignore_index=True)

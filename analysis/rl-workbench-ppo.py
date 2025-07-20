@@ -1,6 +1,8 @@
 import gymnasium as gym
 import numpy as np
 import pandas as pd
+import os
+import shutil
 import matplotlib.pyplot as plt
 from gymnasium import spaces
 from stable_baselines3 import PPO, A2C
@@ -18,17 +20,15 @@ INTERVAL = "H1"
 TRADING_TYPE = 'normal'
 
 optionList = [
-    #'256-180000',
-    #'256-200000',
-    #'256-220000',
-    #'256-250000',
+    '256-180000',
+    '256-200000',
+    '256-220000',
+    '256-250000',
     '256-500000',
-    '256-1000000',
-    '256-2000000',
 ]
 
 FEATURE_COLUMNS = [
-    "price_change", "high_low_range", "gap_vs_prev",
+    "close", "price_change", "high_low_range", "gap_vs_prev",
     "macd_line", "macd_signal", "macd_histogram", "macd_cross", "macd_hist_flip",
     "rsi", "momentum", "roc", "atr",
     "ema_9", "ema_21", "ema_50", "ema_200",
@@ -44,6 +44,20 @@ torch.manual_seed(SEED)
 
 # max 8 threads
 torch.set_num_threads(8)
+
+folders_to_clean = ["graphs", "ppo_logs", "logs"]
+
+for folder in folders_to_clean:
+    if os.path.exists(folder):
+        for item in os.listdir(folder):
+            item_path = os.path.join(folder, item)
+            print(f"Removing: {item_path}")
+            if os.path.isfile(item_path) or os.path.islink(item_path):
+                os.remove(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+    else:
+        print(f"Folder '{folder}' does not exist.")
 
 # Load data
 df = pd.read_csv(f"../data/{TICKER}_{INTERVAL}.csv")
@@ -69,7 +83,7 @@ for option in optionList:
                 gamma=0.95,
                 n_epochs=4,
                 ent_coef=0.05,              # default 0.005
-                learning_rate=1e-4,       # 2.5e-4 is the default value
+                learning_rate=2.5e-4,       # 2.5e-4 is the default value
                 clip_range=0.2,             # default value
                 max_grad_norm=0.5,
                 vf_coef=0.5,
@@ -87,7 +101,7 @@ for option in optionList:
     stock_prices = []
     balances = []
 
-    for step in range(int(len(df)/2)):
+    for step in range(int(len(df)/4)):
         action, _states = model.predict(obs)
         obs, reward, done, info = env.step(action)
         
@@ -145,7 +159,7 @@ for option in optionList:
     
 
     # Save the figure to disk
-    plt.savefig(f"output/ppo_net_worth_{TICKER}_{INTERVAL}_{n_steps}_{total_timesteps}_{TRADING_TYPE}.png", dpi=300)  # You can also use .jpg, .pdf, etc.
+    plt.savefig(f"graphs/ppo_net_worth_{TICKER}_{INTERVAL}_{n_steps}_{total_timesteps}_{TRADING_TYPE}.png", dpi=300)  # You can also use .jpg, .pdf, etc.
 
     print(f"Saved picture for {TICKER} -> n_steps={n_steps} / total_timesteps={total_timesteps}")
 

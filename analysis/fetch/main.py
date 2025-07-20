@@ -8,11 +8,17 @@ logging.basicConfig(
 
 logging.info("Getting data... ")
 
-# let's download 1 ticket
-data = fetch_candles_plus_features('AMZN', 3000, '1Hour') # ~ at 1hr / 7 candles/day = ~130 days / half a year
+TICKER_LIST = ['AAPL', 'ADBE', 'TSLA', 'AMD', 'AMZN', 'BA', 'INTC', 'MSFT', 'NKE', 'NVDA', 'ORCL', 'PLTR', 'PYPL', 'SNOW', 'V']
 
-logging.info("... done")
+for ticker in TICKER_LIST:
+    
+    logging.info(f"Collecting data for {ticker}")
 
-print(data.head())
+    # let's download 1 ticket
+    data = fetch_candles_plus_features(ticker, 5000, '1Hour') # ~ at 1hr / 7 candles/day = ~130 days / half a year
+
+    print(data.head())
+
+    logging.info(f"Data for {ticker} collected")
 
 logging.info("closing down")

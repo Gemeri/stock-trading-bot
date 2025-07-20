@@ -11,6 +11,18 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         df['high_low_range'] = df['high'] - df['low']
     if 'volume' in df.columns:
         df['log_volume'] = np.log1p(df['volume'])
+
+    df['returns_1'] = df['close'].pct_change()
+    df['returns_3'] = df['close'].pct_change(3)
+    df['returns_5'] = df['close'].pct_change(5)
+    df['ma_3'] = df['close'].rolling(3).mean()
+    df['ma_5'] = df['close'].rolling(5).mean()
+    df['ma_10'] = df['close'].rolling(10).mean()
+    df['std_5'] = df['close'].rolling(5).std()
+    df['std_10'] = df['close'].rolling(10).std()
+    df['high_low_range'] = df['high'] - df['low']
+    df['open_close_diff'] = df['open'] - df['close']
+    df['volume_change'] = df['volume'].pct_change()
     return df
 
 def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:

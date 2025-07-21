@@ -1525,7 +1525,16 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         out_names.append("lstm_pred")
 
     if "xgboost" in ml_models:
-        xgb_model = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=114, 
+            max_depth=9, 
+            learning_rate=0.14264252588219034,
+            subsample=0.5524803023252148,
+            colsample_bytree=0.7687841723045249,
+            gamma=0.5856035407199236,
+            reg_alpha=0.5063880221467401,
+            reg_lambda=0.0728996118523866,
+        )
         xgb_model.fit(X, y)
         xgb_pred = xgb_model.predict(last_row_df)[0]
         out_preds.append(xgb_pred)
@@ -2738,7 +2747,16 @@ def console_listener():
                                     if m in ["forest", "rf", "randomforest"]:
                                         mdl = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
                                     elif m == "xgboost":
-                                        mdl = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                                        mdl = xgb.XGBRegressor(
+                                            n_estimators=114, 
+                                            max_depth=9, 
+                                            learning_rate=0.14264252588219034,
+                                            subsample=0.5524803023252148,
+                                            colsample_bytree=0.7687841723045249,
+                                            gamma=0.5856035407199236,
+                                            reg_alpha=0.5063880221467401,
+                                            reg_lambda=0.0728996118523866,
+                                        )
                                     elif m in ["lightgbm", "lgbm"]:
                                         mdl = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
                                     else:

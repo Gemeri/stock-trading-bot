@@ -1,164 +1,214 @@
 """
-TSLA 4-Hour PPO trading agent
-────────────────────────────
-• Uses 42 000 PPO timesteps with n_steps = 1024
-• Rolling 6-12 month window built into the env
-• Three actions: HOLD(0) | BUY(1) | SELL(2)
-• Reward = price-move * trade_dir   (BUY/COVER=+1, SELL/SHORT=-1)
-• –0.1 penalty for idleness
-• Retrains from scratch every 30 candles (checkpointed)
-• Starts with USD 1 000
-• Reads data/TSLA_H4.csv and *only* the allowed feature columns
+================================================================================
+PPO-LSTM TRADING AGENT  –  TSLA 4-hour candles
+--------------------------------------------------------------------------------
+• Uses sb3-contrib RecurrentPPO with an LSTM policy exactly as configured below.
+• Custom Gym environment implements the 3-action logic (BUY, SELL, HOLD/NONE),
+  portfolio bookkeeping (cash, shares) and the **reward rule** you supplied.
+• Loads **only** the whitelisted feature columns from `data/TSLA_H4.csv`
+  (drops `predicted_close` if it is present).
+
+Training cadence
+----------------
+* A fresh model is fit every **30 candles**.
+* The live/check-pointed model is stored in `ppo_lstm_tsla.zip`.
+* A simple text file `retrain_counter.txt` keeps the remaining-candles counter.
+
+Public API  (called externally)
+-------------------------------
+1. `run_logic(current_price, predicted_price, ticker)`
+      • For live trading.  Re-trains on **all** available candles whenever
+        the counter hits 0, then decrements the counter and places trades
+        with the broker helper in `forest`.
+
+2. `run_backtest(current_timestamp, position_qty)`
+      • Used by your back-tester, once per candle.
+      • Ensures the model **never** sees data newer than `current_timestamp`.
+      • Same 30-candle retrain cadence, counter shared with run_logic.
+      • Returns the string **"BUY" | "SELL" | "NONE"**.
+
+Both functions respect the “max-buy / sell-all / default-to-HOLD” rules.
+
+Dependencies
+------------
+pip install pandas numpy gym sb3-contrib stable-baselines3==2.3.0
+================================================================================
 """
 
-from __future__ import annotations
-import json, logging, os, sys
-from pathlib import Path
-from typing import List, Optional, Tuple
+import os
+import logging
+import pathlib
+from datetime import datetime
 
-import gymnasium as gym
+import gym
 import numpy as np
 import pandas as pd
-from gymnasium import spaces
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from gym import spaces
+from sb3_contrib import RecurrentPPO
+from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 
-# ──────────────────────────────────────────────────────────────────────────
-# Config & constants
-# ──────────────────────────────────────────────────────────────────────────
-DATA_PATH      = Path("data/TSLA_H4.csv")
-MODEL_PATH     = Path("ppo_tsla_h4.zip")
-CTR_PATH       = Path("ppo_counter.json")      # stores {"left": <int>}
-CHECKPOINT_EVERY = 30                          # candles between full retrains
-INITIAL_CASH   = 1_000.0                       # USD
-FEATURE_COLS: List[str] = [
-    "timestamp","open","high","low","close","volume","vwap","transactions",
-    "sentiment","price_change","high_low_range","log_volume","macd_line",
-    "macd_signal","macd_histogram","rsi","momentum","roc","atr","ema_9",
-    "ema_21","ema_50","ema_200","adx","obv","bollinger_upper",
-    "bollinger_lower","lagged_close_1","lagged_close_2","lagged_close_3",
-    "lagged_close_5","lagged_close_10","candle_body_ratio","wick_dominance",
-    "gap_vs_prev","volume_zscore","atr_zscore","rsi_zscore","adx_trend",
-    "macd_cross","macd_hist_flip","day_of_week","days_since_high",
-    "days_since_low"
-]                                                  # exactly as requested
-# Remove timestamp from obs later; keep for slicing.
-OBS_FEATURES = [c for c in FEATURE_COLS if c != "timestamp"]
+# -----------------------------------------------------------------------------#
+# Configuration constants
+# -----------------------------------------------------------------------------#
+DATA_PATH = pathlib.Path("data/TSLA_H4.csv")
+CHECKPOINT_PATH = pathlib.Path("ppo_lstm_tsla.zip")
+COUNTER_PATH = pathlib.Path("retrain_counter.txt")
+RETRAIN_EVERY = 30           # candles
+STARTING_CASH = 1_000.0      # USD for the environment
 
-# ──────────────────────────────────────────────────────────────────────────
+FEATURE_COLS = [
+    "timestamp", "open", "high", "low", "close", "volume", "vwap",
+    "transactions", "sentiment", "price_change", "high_low_range",
+    "log_volume", "macd_line", "macd_signal", "macd_histogram", "rsi",
+    "momentum", "roc", "atr", "ema_9", "ema_21", "ema_50", "ema_200",
+    "adx", "obv", "bollinger_upper", "bollinger_lower", "lagged_close_1",
+    "lagged_close_2", "lagged_close_3", "lagged_close_5", "lagged_close_10",
+    "candle_body_ratio", "wick_dominance", "gap_vs_prev", "volume_zscore",
+    "atr_zscore", "rsi_zscore", "adx_trend", "macd_cross", "macd_hist_flip",
+    "day_of_week", "days_since_high", "days_since_low",
+]
+
+NUMERICAL_FEATURES = [c for c in FEATURE_COLS if c != "timestamp"]
+
+ACTION_HOLD, ACTION_BUY, ACTION_SELL = 0, 1, 2
+ACTION_MAP = {ACTION_HOLD: "NONE", ACTION_BUY: "BUY", ACTION_SELL: "SELL"}
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("PPO-LSTM-TSLA")
+
+
+# -----------------------------------------------------------------------------#
 # Utility helpers
-# ──────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------#
 def _load_counter() -> int:
-    if CTR_PATH.exists():
+    if COUNTER_PATH.exists():
         try:
-            return json.loads(CTR_PATH.read_text())["left"]
-        except Exception:
+            return int(COUNTER_PATH.read_text().strip())
+        except ValueError:
             pass
-    return 0
+    return RETRAIN_EVERY
 
-def _save_counter(val: int) -> None:
-    CTR_PATH.write_text(json.dumps({"left": val}))
 
-def _load_df(full: bool = True,
-             cutoff_ts: Optional[pd.Timestamp] = None) -> pd.DataFrame:
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(f"{DATA_PATH} not found")
-    df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
-    # ensure required cols only
-    cols_present = [c for c in FEATURE_COLS if c in df.columns]
-    df = df[cols_present]
-    # drop predicted_close if it somehow slipped in
+def _save_counter(value: int) -> None:
+    COUNTER_PATH.write_text(str(value))
+
+
+def _load_csv(until_ts: datetime | None = None) -> pd.DataFrame:
+    df = pd.read_csv(DATA_PATH)
+    # Parse and filter timestamp
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    if until_ts is not None:
+        df = df[df["timestamp"] <= until_ts]
+    # Drop any rogue columns
+    cols_to_use = [c for c in FEATURE_COLS if c in df.columns]
+    df = df[cols_to_use]
+    # Ensure NO predicted_close
     df = df[[c for c in df.columns if c != "predicted_close"]]
     df.sort_values("timestamp", inplace=True)
-    if cutoff_ts is not None:
-        df = df[df["timestamp"] <= cutoff_ts]
-    # forward/back fill & drop remaining NaNs
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df[OBS_FEATURES] = df[OBS_FEATURES].ffill().bfill()
-    df.dropna(subset=OBS_FEATURES, inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
 
-# ──────────────────────────────────────────────────────────────────────────
-# Gym Environment
-# ──────────────────────────────────────────────────────────────────────────
-class TradingEnv(gym.Env):
-    metadata = {"render.modes": []}
+
+# -----------------------------------------------------------------------------#
+# Custom Gym environment
+# -----------------------------------------------------------------------------#
+class TslaTradingEnv(gym.Env):
+    """
+    4-hour-candle TSLA trading environment
+    """
+
+    metadata = {"render.modes": ["human"]}
 
     def __init__(self, df: pd.DataFrame):
         super().__init__()
-        self.df = df.reset_index(drop=True)
-        self.n_steps_total = len(df)
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(len(OBS_FEATURES)+2,), dtype=np.float32
-        )
-        self.action_space = spaces.Discrete(3)  # 0 hold, 1 buy, 2 sell
-        self.reset()
+        assert {"close", "timestamp"}.issubset(df.columns)
+        self.df = df.copy().reset_index(drop=True)
+        self.n_features = len(NUMERICAL_FEATURES) + 2  # cash & position_qty
 
-    # ------------------------------------------------------------------
-    def reset(self, *, seed: int | None = None, options=None):
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.n_features,), dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(3)
+
+        self.current_step = 1  # start at 1 so we always have a previous row
+        self.cash = STARTING_CASH
+        self.position_qty = 0.0
+        self.previous_close = float(self.df.iloc[0]["close"])
+
+    # --------------------------------------------------------------------- #
+    def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.idx = 0
-        self.cash = INITIAL_CASH
-        self.position = 0  # shares held
+        self.current_step = 1
+        self.cash = STARTING_CASH
+        self.position_qty = 0.0
+        self.previous_close = float(self.df.iloc[0]["close"])
         return self._get_obs(), {}
 
-    # ------------------------------------------------------------------
-    def _get_obs(self) -> np.ndarray:
-        feat = self.df.loc[self.idx, OBS_FEATURES].astype(np.float32).values
-        return np.concatenate([feat, [self.cash, self.position]], dtype=np.float32)
+    # --------------------------------------------------------------------- #
+    def step(self, action: int):
+        row = self.df.iloc[self.current_step]
+        current_price = float(row["close"])
 
-    # ------------------------------------------------------------------
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, dict]:
-        cur_price = float(self.df.loc[self.idx, "close"])
-        # previous close
-        prev_close = cur_price if self.idx == 0 else float(
-            self.df.loc[self.idx-1, "close"]
-        )
+        # Default values
+        reward = -0.1
+        trade_dir = 0
 
-        # Map invalid trades to HOLD
-        if action == 1 and self.position > 0:
-            action = 0
-        if action == 2 and self.position == 0:
-            action = 0
-
-        # Execute trade
-        if action == 1:  # BUY
-            self.position = int(self.cash // cur_price)
-            self.cash -= self.position * cur_price
-        elif action == 2:  # SELL
-            self.cash += self.position * cur_price
-            self.position = 0
+        # Execute action subject to inventory rules
+        if action == ACTION_BUY:
+            if self.position_qty == 0:
+                max_shares = int(self.cash // current_price)
+                if max_shares > 0:
+                    self.position_qty = max_shares
+                    self.cash -= max_shares * current_price
+                    trade_dir = 1
+                else:
+                    action = ACTION_HOLD  # insufficient cash
+            else:
+                action = ACTION_HOLD  # already long
+        elif action == ACTION_SELL:
+            if self.position_qty > 0:
+                self.cash += self.position_qty * current_price
+                self.position_qty = 0
+                trade_dir = -1
+            else:
+                action = ACTION_HOLD  # nothing to sell
 
         # Reward logic
-        if action == 0:
-            reward = -0.1  # penalty for idleness
-        else:
-            trade_dir = 1 if action == 1 else -1
-            reward = (cur_price - prev_close) * trade_dir
+        if action != ACTION_HOLD:
+            reward = (current_price - self.previous_close) * trade_dir
+        # otherwise reward already = -0.1
 
-        # Advance
-        self.idx += 1
-        done = self.idx >= self.n_steps_total
-        if done and self.position > 0:
-            # liquidate at final price
-            self.cash += self.position * cur_price
-            self.position = 0
+        # Prepare for next step
+        self.previous_close = current_price
+        self.current_step += 1
+        done = self.current_step >= len(self.df) - 1
+        info = {}
 
-        obs = self._get_obs() if not done else np.zeros_like(self._get_obs())
-        return obs, reward, done, False, {}
+        return self._get_obs(), reward, done, False, info
 
-# ──────────────────────────────────────────────────────────────────────────
-# Model helpers
-# ──────────────────────────────────────────────────────────────────────────
-def _train_agent(df: pd.DataFrame) -> PPO:
-    env = DummyVecEnv([lambda: TradingEnv(df)])
-    model = PPO(
-        policy="MlpPolicy",
+    # --------------------------------------------------------------------- #
+    def _get_obs(self):
+        row = self.df.iloc[self.current_step]
+        features = row[NUMERICAL_FEATURES].astype(np.float32).to_numpy()
+        obs = np.concatenate(
+            [features, np.array([self.cash], dtype=np.float32), np.array([self.position_qty], dtype=np.float32)]
+        )
+        return obs
+
+
+# -----------------------------------------------------------------------------#
+# Model (re-)training
+# -----------------------------------------------------------------------------#
+def _train_model(df: pd.DataFrame) -> RecurrentPPO:
+    env = TslaTradingEnv(df)
+    model = RecurrentPPO(
+        policy=RecurrentActorCriticPolicy,
         env=env,
-        n_steps=1024,
+        verbose=1,
+        seed=42,
+        n_steps=1_024,
         batch_size=128,
-        n_epochs=10,
+        n_epochs=8,
         learning_rate=2.5e-4,
         gamma=0.97,
         gae_lambda=0.92,
@@ -167,104 +217,131 @@ def _train_agent(df: pd.DataFrame) -> PPO:
         vf_coef=0.5,
         max_grad_norm=0.5,
         normalize_advantage=True,
-        policy_kwargs=dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])]),
-        verbose=0,
+        policy_kwargs=dict(
+            lstm_hidden_size=256,
+            net_arch=dict(pi=[128], vf=[128]),
+        ),
     )
-    # SB3 expects .learn(...) call
-    model.learn(total_timesteps=42_000, progress_bar=False)
-    model.save(MODEL_PATH)
-    _save_counter(CHECKPOINT_EVERY)  # reset counter
+    model.learn(total_timesteps=42_000, progress_bar=True)
+    model.save(CHECKPOINT_PATH)
+    _save_counter(RETRAIN_EVERY)
+    logger.info("Model trained & checkpointed.")
     return model
 
-def _get_or_train(df: pd.DataFrame) -> PPO:
-    counter = _load_counter()
-    if MODEL_PATH.exists() and counter > 0:
-        try:
-            model = PPO.load(MODEL_PATH, device="cpu")
-            _save_counter(counter - 1)
-            return model
-        except Exception:
-            MODEL_PATH.unlink(missing_ok=True)
-    # (re)train from scratch
-    return _train_agent(df)
 
-# ──────────────────────────────────────────────────────────────────────────
-# Public entry-points
-# ──────────────────────────────────────────────────────────────────────────
+def _load_model() -> RecurrentPPO | None:
+    if CHECKPOINT_PATH.exists():
+        return RecurrentPPO.load(CHECKPOINT_PATH, print_system_info=False)
+    return None
+
+
+def _maybe_retrain(train_df: pd.DataFrame, force_retrain: bool = False) -> RecurrentPPO:
+    counter = _load_counter()
+    model = _load_model()
+
+    if counter <= 0 or model is None or force_retrain:
+        logger.info("Retraining model (counter reset).")
+        model = _train_model(train_df)
+        counter = RETRAIN_EVERY
+    else:
+        counter -= 1
+        _save_counter(counter)
+        logger.info("Using existing model – %d candles until next retrain.", counter)
+    return model
+
+
+# -----------------------------------------------------------------------------#
+# === PUBLIC FUNCTIONS ========================================================#
+# -----------------------------------------------------------------------------#
 def run_logic(current_price: float, predicted_price: float, ticker: str):
     """
-    Live trading hook — trains on the full CSV every `CHECKPOINT_EVERY` calls
-    then uses the PPO policy to decide BUY / SELL / HOLD.
+    Live-trading entry-point.
+    • Re-trains on the *full* CSV every 30 calls.
+    • Executes trades through `forest.buy_shares` / `forest.sell_shares`.
     """
-    import logging
-    from forest import api, buy_shares, sell_shares
-    logger = logging.getLogger(__name__)
+    from forest import api, buy_shares, sell_shares  # type: ignore
 
-    # brokerage context
+    # Ensure up-to-date model (full data)
+    full_df = _load_csv()
+    model = _maybe_retrain(full_df)
+
+    # Build observation from the *last* row in the CSV
+    last_row = full_df.iloc[-1]
+    obs_features = last_row[NUMERICAL_FEATURES].astype(np.float32).to_numpy()
+    # Fetch portfolio state
+    account = api.get_account()
+    cash = float(account.cash)
     try:
-        account = api.get_account(); cash = float(account.cash)
-    except Exception as e:
-        logger.error(f"[{ticker}] Account error: {e}"); return
-    try:
-        pos = api.get_position(ticker); position_qty = float(pos.qty)
+        pos = api.get_position(ticker)
+        position_qty = float(pos.qty)
     except Exception:
         position_qty = 0.0
 
-    df = _load_df(full=True)                        # full history
-    model = _get_or_train(df)                       # load / train PPO
-    # build observation from most-recent candle
-    latest = df.iloc[-1][OBS_FEATURES].astype(np.float32).values
-    obs = np.concatenate([latest, [cash, position_qty]], dtype=np.float32)
-    action, _ = model.predict(obs, deterministic=True)
+    obs = np.concatenate(
+        [obs_features, np.array([cash], dtype=np.float32), np.array([position_qty], dtype=np.float32)]
+    )
 
-    # Map to execution logic
-    if action == 1 and position_qty == 0:
-        qty = int(cash // current_price)
-        if qty:
-            logger.info(f"[{ticker}] BUY {qty} @ {current_price}")
-            buy_shares(ticker, qty, current_price, predicted_price)
-    elif action == 2 and position_qty > 0:
-        logger.info(f"[{ticker}] SELL {position_qty} @ {current_price}")
+    action, _ = model.predict(obs, deterministic=True)
+    action = int(action)
+
+    logger.info(
+        "[%s] Live — model action: %s | Price: %.2f | Cash: %.2f | Pos: %.0f | PredProb: %.2f",
+        ticker,
+        ACTION_MAP[action],
+        current_price,
+        cash,
+        position_qty,
+        predicted_price,
+    )
+
+    if action == ACTION_BUY and position_qty == 0:
+        max_shares = int(cash // current_price)
+        if max_shares > 0:
+            buy_shares(ticker, max_shares, current_price, predicted_price)
+    elif action == ACTION_SELL and position_qty > 0:
         sell_shares(ticker, position_qty, current_price, predicted_price)
     else:
-        logger.info(f"[{ticker}] HOLD (action={action})")
+        logger.info("[%s] No trade executed.", ticker)
 
-# -------------------------------------------------------------------------
-def run_backtest(current_price: float,
-                 predicted_price: float,
-                 position_qty: float,
-                 current_timestamp: str,
-                 candles) -> str:
+
+def run_backtest(current_timestamp: str, position_qty: float) -> str:
     """
-    Called externally per candle.
-    Ensures **zero future leakage** by slicing the CSV up to `current_timestamp`
-    and retraining (or loading) the PPO every `CHECKPOINT_EVERY` candles.
+    Back-tester entry-point.  
+    • `current_timestamp` is the MOST RECENT candle available to the agent.  
+    • The model is *never* trained on data newer than that timestamp.  
+    • Returns "BUY", "SELL" or "NONE".
     """
-    cutoff = pd.to_datetime(current_timestamp, utc=True)
-    df_train = _load_df(full=False, cutoff_ts=cutoff)
-    if df_train.empty:
+    ts = pd.to_datetime(current_timestamp, utc=True)
+    df_upto_now = _load_csv(until_ts=ts)
+
+    if len(df_upto_now) < 50:  # safeguard: need enough data to learn
         return "NONE"
-    model = _get_or_train(df_train)
 
-    latest = df_train.iloc[-1][OBS_FEATURES].astype(np.float32).values
-    cash = 0.0 if position_qty > 0 else INITIAL_CASH
-    obs = np.concatenate([latest, [cash, position_qty]], dtype=np.float32)
+    model = _maybe_retrain(df_upto_now)
+
+    last_row = df_upto_now.iloc[-1]
+    obs_features = last_row[NUMERICAL_FEATURES].astype(np.float32).to_numpy()
+    cash_dummy = STARTING_CASH if position_qty == 0 else 0.0  # placeholder cash
+    obs = np.concatenate(
+        [obs_features, np.array([cash_dummy], dtype=np.float32), np.array([position_qty], dtype=np.float32)]
+    )
+
     action, _ = model.predict(obs, deterministic=True)
+    action = int(action)
 
-    if action == 1 and position_qty == 0:
-        return "BUY"
-    if action == 2 and position_qty > 0:
-        return "SELL"
-    return "NONE"
+    # Enforce inventory rules
+    if action == ACTION_BUY and position_qty > 0:
+        action = ACTION_HOLD
+    if action == ACTION_SELL and position_qty == 0:
+        action = ACTION_HOLD
+
+    return ACTION_MAP[action]
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Optional CLI usage for quick sanity check
-# ──────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------#
+# Main-guard (optional quick smoke-test)
+# -----------------------------------------------------------------------------#
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-    df_ = _load_df()
-    print("Loaded", len(df_), "candles")
-    # quick demo train (will save model + counter)
-    _train_agent(df_)
-    print("Model trained & saved →", MODEL_PATH)
+    df_full = _load_csv()
+    _train_model(df_full)
+    print("Initial model trained.  Counter reset to", _load_counter())

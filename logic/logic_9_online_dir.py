@@ -33,7 +33,7 @@ from typing import Any, Dict, Tuple
 import gymnasium as gym
 import numpy as np
 import pandas as pd
-from stable_baselines3 import RecurrentPPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.torch_layers import RecurrentActorCriticPolicy

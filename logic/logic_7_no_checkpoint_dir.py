@@ -18,8 +18,8 @@ from typing import List, Tuple, Dict, Any
 import gymnasium as gym
 import numpy as np
 import pandas as pd
-from stable_baselines3 import RecurrentPPO
-from stable_baselines3.common.policies import RecurrentActorCriticPolicy
+from sb3_contrib import RecurrentPPO
+from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 # ──────────────────────────────────────────────────────────────────────────────

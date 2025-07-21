@@ -50,18 +50,33 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(asctime)s — %(levelname)s — %(message)s",
                     level=logging.INFO)
 
-
 def _load_data() -> pd.DataFrame:
-    """Load the CSV, enforce the feature list, drop `predicted_close` if present."""
+    """
+    Load TSLA_H4.csv, enforce the exact feature list, drop `predicted_close`
+    if it shows up, sort chronologically, and scrub all NaN/Inf values so the
+    agent never receives invalid observations.
+    """
+    # Read raw CSV
     df = pd.read_csv(DATA_PATH)
+
+    # Strip out the unwanted column if it exists
     if "predicted_close" in df.columns:
         df = df.drop(columns=["predicted_close"])
-    # keep only the requested columns (plus timestamp for integrity)
-    df = df[[c for c in df.columns if c in FEATURES]].copy()
+
+    # Keep only the approved feature set (plus timestamp for ordering)
+    df = df[[col for col in df.columns if col in FEATURES]].copy()
+
+    # Ensure timestamp is datetime and properly ordered
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df.sort_values("timestamp", inplace=True, ignore_index=True)
-    return df
 
+    # ── CLEANSE: replace infinities, ffill / bfill NaNs, final zero-fill ──
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.fillna(method="ffill", inplace=True)
+    df.fillna(method="bfill", inplace=True)
+    df.fillna(0.0, inplace=True)  # catch any remaining edge cases
+
+    return df
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CUSTOM TRADING ENVIRONMENT

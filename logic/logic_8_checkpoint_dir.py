@@ -304,7 +304,7 @@ def run_logic(current_price: float, predicted_price: float, ticker: str):
         logger.info("[%s] No trade executed.", ticker)
 
 
-def run_backtest(current_timestamp: str, position_qty: float) -> str:
+def run_backtest(current_price, predicted_price, current_timestamp: str, position_qty: float, candles) -> str:
     """
     Back-tester entry-point.  
     • `current_timestamp` is the MOST RECENT candle available to the agent.  

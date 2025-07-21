@@ -36,7 +36,7 @@ import pandas as pd
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.torch_layers import RecurrentActorCriticPolicy
+from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -91,7 +91,7 @@ FEATURES: Tuple[str, ...] = (
 INITIAL_BALANCE: float = 1_000.0
 CHECKPOINT_INTERVAL: int = 30  # candles between full retrains
 ROLLING_WINDOW: int = 1_400    # candles in rolling training window
-DATA_PATH = Path(__file__).with_suffix("").parent / "data" / "TSLA_H4.csv"
+DATA_PATH = "data/TSLA_H4.csv"
 MODEL_DIR = Path(__file__).with_suffix("").parent / "models"
 MODEL_DIR.mkdir(exist_ok=True, parents=True)
 COUNTER_FILE = MODEL_DIR / "counter.txt"
@@ -123,22 +123,45 @@ def _write_counter(value: int) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_full_dataframe() -> pd.DataFrame:
-    """Load the *entire* CSV, enforce feature schema, drop forbidden columns."""
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(f"CSV not found at {DATA_PATH}")
+    """
+    Load the entire CSV, keep only whitelisted columns, convert the
+    timestamp column to POSIX seconds (float-compatible), and ensure
+    everything is numeric so NumPy can cast to float32 without errors.
+    """
+    from pathlib import Path
 
-    df = pd.read_csv(DATA_PATH)
+    data_path = Path(DATA_PATH)  # normalize to Path
+    if not data_path.exists():
+        raise FileNotFoundError(f"CSV not found at {data_path.resolve()}")
 
-    # Drop any column not explicitly allowed (incl. predicted_close)
+    # Read
+    df = pd.read_csv(data_path)
+
+    # Keep only allowed columns (drop predicted_close, etc.)
     allowed = set(FEATURES)
     df = df[[c for c in df.columns if c in allowed]].copy()
 
-    # Ensure chronological order
+    # ── timestamp → numeric ───────────────────────────────────────────────
+    # If it's already numeric this is a no-op; if it's a string/ISO8601 it gets
+    # parsed to UTC then converted to int seconds since epoch.
+    if not np.issubdtype(df["timestamp"].dtype, np.number):
+        df["timestamp"] = (
+            pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            .astype("int64") // 1_000_000_000  # nanoseconds → seconds
+        )
+
+    # Drop any rows where timestamp couldn't be parsed
+    df.dropna(subset=["timestamp"], inplace=True)
+
+    # ── force remaining cols numeric (coerce bad strings to NaN then drop) ──
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df.dropna(inplace=True)
+
+    # Chronological order
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
     return df
-
 
 def slice_rolling_window(df: pd.DataFrame) -> pd.DataFrame:
     """Return the *last* `ROLLING_WINDOW` rows for training."""

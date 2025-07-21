@@ -3,11 +3,9 @@
   "2": "logic_2_ga_1",
   "3": "logic_3_ga_2",
   "4": "logic_4_ga_3",
-  "5": "logic_5_rl_1",
-  "6": "logic_6_rl_2",
-  "7": "logic_7_rl_3",
-  "8": "logic_8_rl_4",
-  "9": "logic_9_rl_5",
+  "7": "logic_7_no_checkpoint_dir",
+  "8": "logic_8_checkpoint_dir",
+  "9": "logic_9_online_dir",
   "10": "logic_10_rl_6",
   "11": "logic_11_rl_7",
   "12": "logic_12_nn_1",
@@ -27,6 +25,5 @@
   "26": "logic_26_ppo_2",
   "27": "logic_27_ppo_3",
   "28": "logic_28_gl_2",
-  "29": "logic_29_evo",
-  "30": "logic_30_main"
+  "29": "logic_29_evo"
 }

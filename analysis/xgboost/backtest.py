@@ -26,6 +26,12 @@ shares = 0
 portfolio_values = []
 last_predicted_price = 0
 
+# for plotting
+timestamps = []
+actions = []
+stock_prices = []
+balances = []
+
 # Backtest from candle end-1200 to now
 for i in range(len(df)-1200, len(df)-1):
 
@@ -55,14 +61,8 @@ for i in range(len(df)-1200, len(df)-1):
         X_test = test_data[features]
         
         model = xgb.XGBRegressor(
-            n_estimators=114, 
-            max_depth=9, 
-            learning_rate=0.14264252588219034,
-            subsample=0.5524803023252148,
-            colsample_bytree=0.7687841723045249,
-            gamma=0.5856035407199236,
-            reg_alpha=0.5063880221467401,
-            reg_lambda=0.0728996118523866,
+            n_estimators=100, 
+            max_depth=5
         )
 
         model.fit(X_train, y_train)
@@ -85,7 +85,9 @@ for i in range(len(df)-1200, len(df)-1):
     projected_change = (chosen_price - current_price) / current_price
 
     print(f"projected change: {projected_change}")
-    
+
+    last_action = 0
+
     # Strategy
     if projected_change > 0.01:
         # Go long: invest 30% of current cash
@@ -94,23 +96,82 @@ for i in range(len(df)-1200, len(df)-1):
         if num_shares > 0:
             cash -= num_shares * current_price
             shares += num_shares
+            last_action = +num_shares
     elif projected_change < -0.01:
         # Go short (sell all)
         cash += shares * current_price
         shares = 0
+        last_action = -shares
     
     # Track portfolio value
     portfolio_value = cash + shares * current_price
+    
+    # we record info for plotting
+    actions.append(last_action*1000)
+    stock_prices.append(current_price)
     portfolio_values.append(portfolio_value)
+    balances.append(cash)
+    timestamps.append(test_data['timestamp'].values[0])
 
     print(f"portfolio updated: {portfolio_value}")
 
 
 print("plotting")
 
+# ⏱ Prepare timestamp index
+timestamps = pd.to_datetime(df['timestamp'].iloc[:len(net_worths)])  # Adjust column name if needed
+
+# 📈 Create plot
+fig, ax1 = plt.subplots(figsize=(12, 6))
+
+# dates formatting
+ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+fig.autofmt_xdate()
+
+# 📉 Plot Net Worth (left Y-axis)
+ax1.plot(timestamps, net_worths, color='blue', label="Net Worth ($)")
+ax1.set_xlabel("Time")
+ax1.set_ylabel("Net Worth ($)", color='blue')
+ax1.tick_params(axis='y', labelcolor='blue')
+ax1.grid(True)
+
+# 📊 Plot action bars (on same axis)
+bar_colors = ['green' if a > 0 else 'red' if a < 0 else 'gray' for a in actions]
+ax1.bar(timestamps, actions, color=bar_colors, alpha=0.5, label='Trades')
+
+# 📈 Plot Stock Price (right Y-axis)
+ax2 = ax1.twinx()
+ax2.plot(timestamps, stock_prices, color='orange', label="Stock Price ($)")
+ax2.set_ylabel("Stock Price ($)", color='orange')
+ax2.tick_params(axis='y', labelcolor='orange')
+
+# 💰 Plot Balance (third Y-axis)
+ax3 = ax1.twinx()
+ax3.spines['right'].set_position(('outward', 60))  # Offset third axis
+ax3.plot(timestamps, balances, color='purple', label='Balance ($)', linestyle='--')
+ax3.set_ylabel("Balance ($)", color='purple')
+ax3.tick_params(axis='y', labelcolor='purple')
+
+# 🏷️ Format X-axis as dates
+import matplotlib.dates as mdates
+ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+fig.autofmt_xdate()
+
+# 🧾 Title and combined legend
+plt.title("PPO Agent: Net Worth, Stock Price, Balance & Trade Actions")
+lines, labels = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+lines3, labels3 = ax3.get_legend_handles_labels()
+ax1.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc="upper left")
+
+# Save figure
+fig.tight_layout()    
+
 # Step 6: Plot results
 plt.figure(figsize=(12, 6))
-plt.plot(range(len(df)-1200, len(df)-1), portfolio_values, label='Portfolio Value')
+plt.plot(timestamps, portfolio_values, label='Portfolio Value')
 plt.title('Backtest Portfolio Value over Time')
 plt.xlabel('Candle Index')
 plt.ylabel('Portfolio Value ($)')
@@ -118,3 +179,5 @@ plt.grid(True)
 plt.legend()
 plt.tight_layout()
 plt.show()
+
+

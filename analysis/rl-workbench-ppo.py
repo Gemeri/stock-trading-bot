@@ -120,43 +120,56 @@ for option in optionList:
         if done[0]:
             break
 
-    # Plotting
+    # ⏱ Prepare timestamp index
+    timestamps = pd.to_datetime(df['timestamp'].iloc[:len(net_worths)])  # Adjust column name if needed
+
+    # 📈 Create plot
     fig, ax1 = plt.subplots(figsize=(12, 6))
 
-    # 📈 Plot Net Worth (left Y-axis)
-    ax1.plot(net_worths, color='blue', label="Net Worth ($)")
-    ax1.set_xlabel("Steps")
+    # dates formatting
+    ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+    fig.autofmt_xdate()
+
+    # 📉 Plot Net Worth (left Y-axis)
+    ax1.plot(timestamps, net_worths, color='blue', label="Net Worth ($)")
+    ax1.set_xlabel("Time")
     ax1.set_ylabel("Net Worth ($)", color='blue')
     ax1.tick_params(axis='y', labelcolor='blue')
     ax1.grid(True)
 
-    # 📊 Plot action bars on the same axis (behind the net worth)
+    # 📊 Plot action bars (on same axis)
     bar_colors = ['green' if a > 0 else 'red' if a < 0 else 'gray' for a in actions]
-    ax1.bar(range(len(actions)), actions, color=bar_colors, alpha=0.5, label='Trades')
+    ax1.bar(timestamps, actions, color=bar_colors, alpha=0.5, label='Trades')
 
-    # 📉 Create a second y-axis for Stock Price (right Y-axis)
+    # 📈 Plot Stock Price (right Y-axis)
     ax2 = ax1.twinx()
-    ax2.plot(stock_prices, color='orange', label="Stock Price ($)")
+    ax2.plot(timestamps, stock_prices, color='orange', label="Stock Price ($)")
     ax2.set_ylabel("Stock Price ($)", color='orange')
     ax2.tick_params(axis='y', labelcolor='orange')
 
-    # 💰 Balance (third Y-axis on the far right)
+    # 💰 Plot Balance (third Y-axis)
     ax3 = ax1.twinx()
-    ax3.spines['right'].set_position(('outward', 60))  # Move third axis 60 pts outward
-    ax3.plot(balances, color='purple', label='Balance ($)', linestyle='--')
+    ax3.spines['right'].set_position(('outward', 60))  # Offset third axis
+    ax3.plot(timestamps, balances, color='purple', label='Balance ($)', linestyle='--')
     ax3.set_ylabel("Balance ($)", color='purple')
     ax3.tick_params(axis='y', labelcolor='purple')
 
-    # 🏷️ Title and combined legend
+    # 🏷️ Format X-axis as dates
+    import matplotlib.dates as mdates
+    ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+    fig.autofmt_xdate()
+
+    # 🧾 Title and combined legend
     plt.title("PPO Agent: Net Worth, Stock Price, Balance & Trade Actions")
     lines, labels = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     lines3, labels3 = ax3.get_legend_handles_labels()
     ax1.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc="upper left")
 
-    
-    fig.tight_layout()
-    
+    # Save figure
+    fig.tight_layout()    
 
     # Save the figure to disk
     plt.savefig(f"graphs/ppo_net_worth_{TICKER}_{INTERVAL}_{n_steps}_{total_timesteps}_{TRADING_TYPE}.png", dpi=300)  # You can also use .jpg, .pdf, etc.

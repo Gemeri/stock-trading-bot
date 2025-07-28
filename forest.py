@@ -69,6 +69,7 @@ SUBMETA_USE_ACTION = os.getenv("SUBMETA_USE_ACTION", "false").strip().lower() ==
 # scheduling & run‑mode ----------------------------------------------------------------------
 RUN_SCHEDULE            = os.getenv("RUN_SCHEDULE", "on").lower().strip()
 SENTIMENT_OFFSET_MINUTES= int(os.getenv("SENTIMENT_OFFSET_MINUTES", "20"))
+BACKTEST_TICKER =  os.getenv("BACKTEST_TICKER", "TSLA")
 
 BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
 N_BARS        = int(os.getenv("N_BARS", "5000"))
@@ -2551,7 +2552,7 @@ def console_listener():
                 logging.info(f"[{ticker}] Saved candle data + advanced features (minus disabled) to {csv_filename}.")
 
         elif cmd == "predict-next":
-            for ticker in TICKERS:
+            for ticker in BACKTEST_TICKER:
                 tf_code = timeframe_to_code(BAR_TIMEFRAME)
                 csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
                 if skip_data:
@@ -2659,7 +2660,7 @@ def console_listener():
                     with open(json_path, "r") as f:
                         LOGIC_MODULE_MAP = json.load(f) if os.path.getsize(json_path) else {}
 
-                    ml_models = get_ml_models_for_ticker(ticker)
+                    ml_models = get_ml_models_for_ticker(BACKTEST_TICKER)
                     if {"forest_cls", "xgboost_cls", "lightgbm_cls",
                     "transformer_cls", "sub-vote", "sub_meta",
                     "sub-meta", "sub_vote"} & set(ml_models):
@@ -2688,7 +2689,7 @@ def console_listener():
                     os.makedirs(results_dir, exist_ok=True)
 
 
-                    for ticker in TICKERS:
+                    for ticker in BACKTEST_TICKER:
                         tf_code = timeframe_to_code(timeframe_for_backtest)
                         csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
                         if skip_data:
@@ -3165,7 +3166,7 @@ def console_listener():
             else:
                 logging.info("feature-importance: Will fetch fresh data for each ticker, then compute importance.")
 
-            for ticker in TICKERS:
+            for ticker in BACKTEST_TICKER:
                 tf_code  = timeframe_to_code(BAR_TIMEFRAME)
                 csv_file = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
 
@@ -3404,3 +3405,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

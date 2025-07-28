@@ -1,16 +1,27 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+import platform
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
+import matplotlib
+
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from utils import load_and_engineer_features
 
 
 # Load training data
 df = load_and_engineer_features('../../data/AMZN_H1.csv')
 
-LOOKAHEAD_LIST = [1, 2, 3, 5]
+# some time engineering
+df['timestamp'] = pd.to_datetime(df['timestamp'])
+df['hour'] = df['timestamp'].dt.hour
+df['day'] = df['timestamp'].dt.day
+df['weekday'] = df['timestamp'].dt.weekday
+df['month'] = df['timestamp'].dt.month
+
+LOOKAHEAD_LIST = [3, 5, 8]
 
 # Shift 'close' to predict the next candle's close
 
@@ -32,12 +43,12 @@ actions = []
 stock_prices = []
 balances = []
 
-# Backtest from candle end-1200 to now
-for i in range(len(df)-1200, len(df)-1):
+# Backtest from candle end-1200 to now -> 18mo circa
+for i in range(len(df)-800, len(df)-1):
 
     print(f"Loading candles from {i-800} to {i}")
 
-    # Train model on previous 6 months (approx. 400 candles)
+    # Train model on previous 12 months (approx. 800 candles)
     train_data = df.iloc[i-800:i]
     test_data = df.iloc[i:i+1]
     
@@ -119,7 +130,7 @@ for i in range(len(df)-1200, len(df)-1):
 print("plotting")
 
 # ⏱ Prepare timestamp index
-timestamps = pd.to_datetime(df['timestamp'].iloc[:len(net_worths)])  # Adjust column name if needed
+timestamps = pd.to_datetime(df['timestamp'].iloc[:len(balances)])  # Adjust column name if needed
 
 # 📈 Create plot
 fig, ax1 = plt.subplots(figsize=(12, 6))
@@ -130,7 +141,7 @@ ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
 fig.autofmt_xdate()
 
 # 📉 Plot Net Worth (left Y-axis)
-ax1.plot(timestamps, net_worths, color='blue', label="Net Worth ($)")
+ax1.plot(timestamps, balances, color='blue', label="Net Worth ($)")
 ax1.set_xlabel("Time")
 ax1.set_ylabel("Net Worth ($)", color='blue')
 ax1.tick_params(axis='y', labelcolor='blue')
@@ -169,15 +180,11 @@ ax1.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc="upper left"
 # Save figure
 fig.tight_layout()    
 
-# Step 6: Plot results
-plt.figure(figsize=(12, 6))
-plt.plot(timestamps, portfolio_values, label='Portfolio Value')
-plt.title('Backtest Portfolio Value over Time')
-plt.xlabel('Candle Index')
-plt.ylabel('Portfolio Value ($)')
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
+
+# Only use TkAgg if NOT on macOS
+if platform.system() != "Darwin":
+    plt.savefig("backtest-plot.png")
+else:
+    plt.show()
 
 

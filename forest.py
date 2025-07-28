@@ -93,16 +93,44 @@ BEST_TICKERS_CACHE = os.path.join(DATA_DIR, "best_tickers_cache.json")
 
 USE_FULL_SHARES = os.getenv("USE_FULL_SHARES", "true").strip().lower() == "true"
 
-tickers_env = os.getenv("TICKERS", "TSLA")
-TICKERLIST_MODE = tickers_env.lower().startswith("tickerlist")
 TICKERLIST_TOP_N = 1
-if TICKERLIST_MODE:
-    parts = [p.strip() for p in tickers_env.split(",")]
-    if len(parts) > 1 and parts[1].isdigit():
-        TICKERLIST_TOP_N = int(parts[1])
-    TICKERS: list[str] = []
-else:
-    TICKERS = [t.strip().upper() for t in tickers_env.split(",") if t.strip()]
+TICKERS: list[str] = []
+TICKER_ML_OVERRIDES: dict[str, str] = {}
+SELECTION_MODEL: str | None = None
+
+def load_tickerlist() -> list[str]:
+    """Load tickers and per-ticker ML overrides from tickerlist.txt."""
+    global TICKERS, TICKER_ML_OVERRIDES, SELECTION_MODEL
+    TICKER_ML_OVERRIDES = {}
+    SELECTION_MODEL = None
+    tickers: list[str] = []
+
+    if not os.path.exists(TICKERLIST_PATH):
+        logging.error(f"Ticker list file not found: {TICKERLIST_PATH}")
+        TICKERS = []
+        return []
+
+    with open(TICKERLIST_PATH) as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            if "=" in ln:
+                key, val = ln.split("=", 1)
+                if key.strip().lower() == "selection_model":
+                    SELECTION_MODEL = val.strip()
+                continue
+            parts = [p.strip() for p in ln.split(",")]
+            ticker = parts[0].upper()
+            tickers.append(ticker)
+            if len(parts) > 1 and parts[1]:
+                TICKER_ML_OVERRIDES[ticker] = parts[1].strip()
+
+    TICKERS = tickers
+    return tickers
+
+# load tickers at startup
+load_tickerlist()
 
 TRADE_LOG_FILENAME = os.path.join(DATA_DIR, "trade_log.csv")
 
@@ -206,8 +234,8 @@ if DISCORD_MODE == "on":
 # ------------------------------------------------------------------
 # ❶  parse_ml_models – now understands *_cls models and all_cls
 # ------------------------------------------------------------------
-def parse_ml_models() -> list[str]:
-    ml_raw = os.getenv("ML_MODEL", ML_MODEL)
+def parse_ml_models(override: str | None = None) -> list[str]:
+    ml_raw = override if override is not None else os.getenv("ML_MODEL", ML_MODEL)
     raw = [m.strip().lower() for m in ml_raw.split(",") if m.strip()]
 
     if "all" in raw:
@@ -240,6 +268,15 @@ def parse_ml_models() -> list[str]:
 
     logging.debug("[parse_ml_models] ML_MODEL=%s  ➜  %s", ML_MODEL, out)
     return out
+
+
+def get_ml_models_for_ticker(ticker: str | None = None, for_selection: bool = False) -> list[str]:
+    """Return ML models considering per-ticker and selection overrides."""
+    if for_selection and SELECTION_MODEL:
+        return parse_ml_models(SELECTION_MODEL)
+    if ticker and ticker in TICKER_ML_OVERRIDES:
+        return parse_ml_models(TICKER_ML_OVERRIDES[ticker])
+    return parse_ml_models()
 
 
 def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=60):
@@ -671,7 +708,7 @@ def fetch_candles_plus_features_and_predclose(
             df_combined[col] = pd.to_numeric(df_combined[col], errors='coerce')
 
     # ───── 7. regenerate predicted_close only for the new rows ──────────────
-    ml_models     = parse_ml_models()
+    ml_models     = get_ml_models_for_ticker(ticker)
     has_regressor = any(m in ["xgboost", "forest", "rf", "randomforest",
                               "lstm", "transformer"] for m in ml_models)
 
@@ -1242,7 +1279,7 @@ def _predict_meta(models: dict[str, object],
 # -------------------------------
 # 8. Enhanced Train & Predict Pipeline
 # -------------------------------
-def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | None = None):
+def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | None = None, for_selection: bool = False):
     df = limit_df_rows(df)
     if 'sentiment' in df.columns and df["sentiment"].dtype == object:
         try:
@@ -1292,7 +1329,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
     last_row_df       = pd.DataFrame([last_row_features], columns=available_cols)
     last_X_np         = np.array(last_row_df)
 
-    ml_models = parse_ml_models()
+    ml_models = get_ml_models_for_ticker(ticker if not for_selection else None, for_selection=for_selection)
 
     if "sub-vote" in ml_models or "sub-meta" in ml_models:
         mode    = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
@@ -1751,20 +1788,14 @@ def cash_below_minimum() -> bool:
 
 
 def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> list[str]:
-    if not TICKERLIST_MODE and top_n is None:
-        return TICKERS
-
     if top_n is None:
         top_n = TICKERLIST_TOP_N
 
-    if not os.path.exists(TICKERLIST_PATH):
-        logging.error(f"Ticker list file not found: {TICKERLIST_PATH}")
+    tickers = load_tickerlist()
+    if not tickers:
         return []
 
-    with open(TICKERLIST_PATH) as f:
-        tickers = [ln.strip().upper() for ln in f if ln.strip()]
-
-    ml_models      = parse_ml_models()
+    ml_models      = get_ml_models_for_ticker(for_selection=True)
     classifier_set = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
     results: list[tuple[float, str]] = []
 
@@ -1786,7 +1817,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
 
         allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
         df      = df.loc[:, [c for c in df.columns if c in allowed]]
-        pred    = train_and_predict(df, ticker=tck)
+        pred    = train_and_predict(df, ticker=tck, for_selection=True)
         if pred is None:
             continue
 
@@ -1847,9 +1878,6 @@ def save_best_ticker_cache(tickers: list[str]) -> None:
 def compute_and_cache_best_tickers() -> list[str]:
     global TICKERS
 
-    if not TICKERLIST_MODE:
-        return TICKERS
-
     if cash_below_minimum() or max_tickers_reached():
         owned = list(get_owned_tickers())
         TICKERS = owned
@@ -1867,8 +1895,6 @@ def maybe_update_best_tickers(scheduled_time_ny: str | None = None):
     • `scheduled_time_ny` – "%H:%M" string from TIMEFRAME_SCHEDULE, or
       None when called at script start-up.
     """
-    if not TICKERLIST_MODE:
-        return
 
     try:
         clock = api.get_clock()
@@ -2222,7 +2248,7 @@ def get_current_price() -> float:
 # -------------------------------
 def trade_logic(current_price: float, predicted_price: float, ticker: str):
     try:
-        ml_models = parse_ml_models()
+        ml_models = get_ml_models_for_ticker(ticker)
         classifier_stack = {"forest_cls", "xgboost_cls", "lightgbm_cls",
                             "transformer_cls", "sub-vote", "sub_meta",
                             "sub-meta", "sub_vote"}
@@ -2439,12 +2465,11 @@ def run_job(scheduled_time_ny: str):
                 return
 
     global TICKERS
-    if TICKERLIST_MODE:
-        cached, _ = load_best_ticker_cache()
-        if cached:
-            TICKERS = cached
-        else:
-            TICKERS = compute_and_cache_best_tickers()
+    cached, _ = load_best_ticker_cache()
+    if cached:
+        TICKERS = cached
+    else:
+        TICKERS = compute_and_cache_best_tickers()
 
     _perform_trading_job(skip_data=False, scheduled_time_ny=scheduled_time_ny)
 
@@ -2634,7 +2659,7 @@ def console_listener():
                     with open(json_path, "r") as f:
                         LOGIC_MODULE_MAP = json.load(f) if os.path.getsize(json_path) else {}
 
-                    ml_models = parse_ml_models()
+                    ml_models = get_ml_models_for_ticker(ticker)
                     if {"forest_cls", "xgboost_cls", "lightgbm_cls",
                     "transformer_cls", "sub-vote", "sub_meta",
                     "sub-meta", "sub_vote"} & set(ml_models):
@@ -2732,7 +2757,7 @@ def console_listener():
                                 return csh
 
                         if approach in ["simple", "complex"]:
-                            ml_models = parse_ml_models()
+                            ml_models = get_ml_models_for_ticker(ticker)
                             if approach == "simple":
                                 train_df = df.iloc[:train_end]
                                 test_df  = df.iloc[train_end:]
@@ -3229,7 +3254,6 @@ def console_listener():
             logging.info("  backtest <N> [simple|complex] [timeframe?] [-r?]")
             logging.info("  get-best-tickers <N> [-r]")
             logging.info("  feature-importance [-r]")
-            logging.info("  set-tickers (tickers)")
             logging.info("  set-timeframe (timeframe)")
             logging.info("  set-nbars (Number of candles)")
             logging.info("  set-news (on/off)")
@@ -3238,15 +3262,6 @@ def console_listener():
             logging.info("  ai-tickers")
             logging.info("  create-script (name)")
             logging.info("  commands")
-
-        elif cmd == "set-tickers":
-            if len(parts) < 2:
-                logging.info("Usage: set-tickers TICKER1,TICKER2,...")
-                continue
-            new_tick_str = parts[1]
-            update_env_variable("TICKERS", new_tick_str)
-            TICKERS = [s.strip() for s in new_tick_str.split(",") if s.strip()]
-            logging.info(f"Updated TICKERS in memory to {TICKERS}")
 
         elif cmd == "set-timeframe":
             if len(parts) < 2:
@@ -3369,15 +3384,14 @@ def console_listener():
 
 def main():
     _update_logic_json()
-    if RUN_SCHEDULE == "on" and TICKERLIST_MODE:
+    if RUN_SCHEDULE == "on":
         compute_and_cache_best_tickers()
     setup_schedule_for_timeframe(BAR_TIMEFRAME)
-    if TICKERLIST_MODE: 
-        maybe_update_best_tickers()
+    maybe_update_best_tickers()
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-tickers, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name)")
+    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name)")
 
     while not SHUTDOWN:
         try:

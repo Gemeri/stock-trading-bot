@@ -1881,16 +1881,21 @@ def save_best_ticker_cache(tickers: list[str]) -> None:
 def compute_and_cache_best_tickers() -> list[str]:
     global TICKERS
 
+    owned = list(get_owned_tickers())
+
     if cash_below_minimum() or max_tickers_reached():
-        owned = list(get_owned_tickers())
         TICKERS = owned
         save_best_ticker_cache(owned)
         return owned
 
     selected = select_best_tickers()
-    TICKERS = selected
+    combined = sorted({*selected, *owned})
+
+    TICKERS = combined
     save_best_ticker_cache(selected)
-    return selected
+
+    return combined
+
 
 def maybe_update_best_tickers(scheduled_time_ny: str | None = None):
     """Re-compute best tickers when the cache predates the reference time.
@@ -2319,7 +2324,10 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
         selected = select_best_tickers(top_n=TICKERLIST_TOP_N,
                                     skip_data=skip_data)
     _ensure_ai_tickers()
-    tickers_run = selected
+    owned = list(get_owned_tickers())
+    tickers_run = sorted(set(selected + AI_TICKERS + owned))
+    global TICKERS
+    TICKERS = tickers_run    
     for ticker in tickers_run:
         tf_code = timeframe_to_code(BAR_TIMEFRAME)
         csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
@@ -3398,7 +3406,16 @@ def main():
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
     logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name)")
-
+    try:
+        account = api.get_account()
+        positions = api.list_positions()
+        if positions:
+            for pos in positions:
+                logging.info(f"{pos.symbol}: {pos.qty} shares @ {pos.avg_entry_price}")
+        else:
+            logging.info("No shares owned.")
+    except Exception as e:
+        logging.error(f"Alpaca API test failed: {e}")
     while not SHUTDOWN:
         try:
             schedule.run_pending()

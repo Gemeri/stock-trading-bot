@@ -27,3 +27,4 @@ pysr
 tqdm
 lightgbm
 catboost
+sb3_contrib

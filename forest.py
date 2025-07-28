@@ -70,6 +70,7 @@ SUBMETA_USE_ACTION = os.getenv("SUBMETA_USE_ACTION", "false").strip().lower() ==
 RUN_SCHEDULE            = os.getenv("RUN_SCHEDULE", "on").lower().strip()
 SENTIMENT_OFFSET_MINUTES= int(os.getenv("SENTIMENT_OFFSET_MINUTES", "20"))
 BACKTEST_TICKER =  os.getenv("BACKTEST_TICKER", "TSLA")
+DISABLE_PRED_CLOSE = os.getenv("DISABLE_PRED_CLOSE", "True")
 
 BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
 N_BARS        = int(os.getenv("N_BARS", "5000"))
@@ -713,7 +714,7 @@ def fetch_candles_plus_features_and_predclose(
     has_regressor = any(m in ["xgboost", "forest", "rf", "randomforest",
                               "lstm", "transformer"] for m in ml_models)
 
-    if has_regressor:
+    if has_regressor and DISABLE_PRED_CLOSE == False:
         if 'predicted_close' not in df_combined.columns:
             df_combined['predicted_close'] = np.nan
 

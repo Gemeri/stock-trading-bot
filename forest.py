@@ -95,7 +95,7 @@ BEST_TICKERS_CACHE = os.path.join(DATA_DIR, "best_tickers_cache.json")
 
 USE_FULL_SHARES = os.getenv("USE_FULL_SHARES", "true").strip().lower() == "true"
 
-TICKERLIST_TOP_N = 1
+TICKERLIST_TOP_N = 3
 TICKERS: list[str] = []
 TICKER_ML_OVERRIDES: dict[str, str] = {}
 SELECTION_MODEL: str | None = None
@@ -603,7 +603,6 @@ def fetch_candles_plus_features_and_predclose(
     timeframe: str,
     rewrite_mode: str
 ) -> pd.DataFrame:
-
     tf_code       = timeframe_to_code(timeframe)
     csv_filename  = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
     sentiment_csv = os.path.join(DATA_DIR, f"{ticker}_sentiment_{tf_code}.csv")
@@ -611,6 +610,7 @@ def fetch_candles_plus_features_and_predclose(
     def get_features(df: pd.DataFrame):
         exclude = {'predicted_close'}
         return [c for c in POSSIBLE_FEATURE_COLS if c in df.columns and c not in exclude]
+    
 
     # ───── 1. load historical CSV (if present & not rewriting) ─────────────
     if rewrite_mode == "off" and os.path.exists(csv_filename):
@@ -639,6 +639,7 @@ def fetch_candles_plus_features_and_predclose(
     if bars_needed == 0:
         logging.info(f"[{ticker}] Data already up-to-date – no new candles.")
         return df_existing.copy()
+
 
     # ───── 3. fetch ONLY the missing candles ───────────────────────────────
     df_candles_new = fetch_candles(
@@ -2313,8 +2314,12 @@ def check_latest_candle_condition(df: pd.DataFrame, timeframe: str, scheduled_ti
 
 
 def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
+    selected, check = load_best_ticker_cache()
+    if check == None:
+        selected = select_best_tickers(top_n=TICKERLIST_TOP_N,
+                                    skip_data=skip_data)
     _ensure_ai_tickers()
-    tickers_run = sorted(set(TICKERS + AI_TICKERS))
+    tickers_run = selected
     for ticker in tickers_run:
         tf_code = timeframe_to_code(BAR_TIMEFRAME)
         csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
@@ -2621,7 +2626,6 @@ def console_listener():
         elif cmd == "force-run":
             logging.info("Force-running job now (ignoring market open check).")
             if not skip_data:
-                run_sentiment_job(skip_data=False)
                 _perform_trading_job(skip_data=False)
             else:
                 logging.info("force-run -r: skipping data fetch, using existing CSV + skipping new sentiment fetch.")

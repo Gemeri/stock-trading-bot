@@ -892,32 +892,6 @@ def save_news_to_csv(ticker: str, news_list: list):
     df_news.to_csv(csv_filename, index=False)
     logging.info(f"[{ticker}] Saved articles with sentiment to {csv_filename}")
 
-def run_sentiment_job(skip_data=False):
-    for ticker in TICKERS:
-        if NEWS_MODE == "off":
-            logging.info(f"[{ticker}] NEWS_MODE=off, skipping news sentiment update.")
-            continue
-
-        df = fetch_candles(ticker, bars=N_BARS, timeframe=BAR_TIMEFRAME)
-        if df.empty:
-            logging.error(f"[{ticker}] Unable to fetch candle data for sentiment update.")
-            continue
-
-        news_num_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650)
-        articles_per_day = ARTICLES_PER_DAY_MAPPING.get(BAR_TIMEFRAME, 1)
-        news_list = fetch_news_sentiments(ticker, news_num_days, articles_per_day)
-        save_news_to_csv(ticker, news_list)
-
-        sentiments = assign_sentiment_to_candles(df, news_list)
-
-        df_sentiment = df[['timestamp']].copy()
-        df_sentiment['sentiment'] = sentiments
-        df_sentiment['sentiment'] = df_sentiment['sentiment'].apply(lambda x: f"{x:.15f}")
-        tf_code = timeframe_to_code(BAR_TIMEFRAME)
-        sentiment_csv_filename = os.path.join(DATA_DIR, f"{ticker}_sentiment_{tf_code}.csv")
-        df_sentiment.to_csv(sentiment_csv_filename, index=False)
-        logging.info(f"[{ticker}] Updated sentiment CSV: {sentiment_csv_filename}")
-
 def merge_sentiment_from_csv(df, ticker):
     tf_code = timeframe_to_code(BAR_TIMEFRAME)
     sentiment_csv_filename = os.path.join(DATA_DIR, f"{ticker}_sentiment_{tf_code}.csv")
@@ -2437,21 +2411,7 @@ def setup_schedule_for_timeframe(timeframe: str) -> None:
         schedule.every().day.at(t).do(lambda t=t: run_job(t))
         schedule.every().day.at(t).do(lambda t=t: maybe_update_best_tickers(t))
 
-        if NEWS_MODE == "on":
-            try:
-                base_time      = datetime.strptime(t, "%H:%M")
-                offset_minutes = SENTIMENT_OFFSET_MINUTES
-                sentiment_time = (base_time - timedelta(minutes=offset_minutes)).strftime("%H:%M")
-                schedule.every().day.at(sentiment_time).do(run_sentiment_job)
-                logging.info(f"Scheduled sentiment update {sentiment_time} NY & trade {t} NY.")
-            except Exception as e:
-                logging.error(f"Error scheduling sentiment lead‑in for {t}: {e}")
-        else:
-            logging.info(f"NEWS_MODE={NEWS_MODE}. Sentiment run skipped before {t}.")
-
     logging.info(f"Scheduling prepared for {timeframe}: {times_list}")
-
-
 
 def run_job(scheduled_time_ny: str):
     logging.info(f"Starting scheduled trading job at NY time {scheduled_time_ny}...")
@@ -2606,30 +2566,6 @@ def console_listener():
                 logging.info(
                     f"[{ticker}] Current Price={current_price:.2f}, Predicted Next Close={pred_val:.2f}"
                 )
-
-        elif cmd == "run-sentiment":
-            logging.info("Running sentiment update job...")
-            run_sentiment_job(skip_data=skip_data)
-            for ticker in TICKERS:
-                tf_code = timeframe_to_code(BAR_TIMEFRAME)
-                candle_csv = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
-                if not os.path.exists(candle_csv):
-                    logging.error(f"[{ticker}] Candle CSV {candle_csv} not found, skipping merge.")
-                    continue
-                try:
-                    df = read_csv_limited(candle_csv)
-                except Exception as e:
-                    logging.error(f"[{ticker}] Error reading candle CSV: {e}")
-                    continue
-
-                df_updated = merge_sentiment_from_csv(df, ticker)
-                try:
-                    df_updated.to_csv(candle_csv, index=False)
-                    logging.info(f"[{ticker}] Updated unified candle CSV with sentiment: {candle_csv}")
-                except Exception as e:
-                    logging.error(f"[{ticker}] Error saving unified candle CSV: {e}")
-            logging.info("Sentiment update job completed.")
-
 
         elif cmd == "force-run":
             logging.info("Force-running job now (ignoring market open check).")
@@ -3263,7 +3199,6 @@ def console_listener():
             logging.info("  api-test")
             logging.info("  get-data [timeframe]")
             logging.info("  predict-next [-r]")
-            logging.info("  run-sentiment [-r]")
             logging.info("  force-run [-r]")
             logging.info("  backtest <N> [simple|complex] [timeframe?] [-r?]")
             logging.info("  get-best-tickers <N> [-r]")
@@ -3448,7 +3383,7 @@ def main():
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name), buy (ticker) <N>, sell (ticker) <N>")
+    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name), buy (ticker) <N>, sell (ticker) <N>")
     try:
         account = api.get_account()
         positions = api.list_positions()

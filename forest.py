@@ -1944,7 +1944,7 @@ def send_discord_order_message(action, ticker, price, predicted_price, extra_inf
         logging.info("Discord mode is off or DISCORD_USER_ID not set.")
 
 def buy_shares(ticker, qty, buy_price, predicted_price):
-    logging.info("BUY: ", {ticker})
+    logging.info("BUY: %s", ticker)
     if qty <= 0:
         return
     try:
@@ -2026,7 +2026,7 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
         logging.error(f"[{ticker}] Buy order failed: {e}")
 
 def sell_shares(ticker, qty, sell_price, predicted_price):
-    logging.info("SELL: ", {ticker})
+    logging.info("SELL: %s", ticker)
     if qty <= 0:
         return
     try:
@@ -2082,7 +2082,7 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
         logging.error(f"[{ticker}] Sell order failed: {e}")
 
 def short_shares(ticker, qty, short_price, predicted_price):
-    logging.info("SHORT: ", {ticker})
+    logging.info("SHORT: %s", ticker)
     if qty <= 0:
         return
     try:
@@ -2160,7 +2160,7 @@ def short_shares(ticker, qty, short_price, predicted_price):
         logging.error(f"[{ticker}] Short order failed: {e}")
 
 def close_short(ticker, qty, cover_price):
-    logging.info("COVER: ", {ticker})
+    logging.info("COVER: %s", ticker)
     if qty <= 0:
         return
     try:
@@ -2244,7 +2244,7 @@ def get_current_price(ticker) -> float:
     api = REST(key, secret, link, api_version="v2")
 
     try:
-        quote: QuoteV2 = api.get_latest_quote({ticker})
+        quote: QuoteV2 = api.get_latest_quote(ticker)
     except APIError as e:
         print(f"API error fetching quote: {e}", file=sys.stderr)
         sys.exit(2)

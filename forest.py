@@ -2233,7 +2233,7 @@ def log_trade(action, ticker, qty, current_price, predicted_price, profit_loss):
         df.to_csv(TRADE_LOG_FILENAME, index=False, mode='a', header=False)
 
 
-def get_current_price() -> float:
+def get_current_price(ticker) -> float:
     key    = API_KEY
     secret = API_SECRET
     link   = API_BASE_URL
@@ -2244,7 +2244,7 @@ def get_current_price() -> float:
     api = REST(key, secret, link, api_version="v2")
 
     try:
-        quote: QuoteV2 = api.get_latest_quote("TSLA")
+        quote: QuoteV2 = api.get_latest_quote({ticker})
     except APIError as e:
         print(f"API error fetching quote: {e}", file=sys.stderr)
         sys.exit(2)
@@ -2271,7 +2271,7 @@ def trade_logic(current_price: float, predicted_price: float, ticker: str):
         module_path   = f"{logic_dir}.{logic_module_name}"
         logic_module  = importlib.import_module(module_path)
 
-        real_current  = get_current_price()
+        real_current  = get_current_price(ticker)
         logic_module.run_logic(real_current, predicted_price, ticker)
 
     except Exception as e:
@@ -2372,7 +2372,7 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
         raw_pred = train_and_predict(df, ticker=ticker)
         if isinstance(raw_pred, str) and raw_pred.upper() in {"BUY", "SELL", "HOLD", "NONE"}:
             action_str    = raw_pred.upper()
-            live_price    = get_current_price()
+            live_price    = get_current_price(ticker)
 
             if action_str == "BUY":
                 account  = api.get_account()
@@ -3393,6 +3393,49 @@ def console_listener():
             _update_logic_json()
             logging.info("Updated logic_scripts.json to include the newly created script.")
 
+        elif cmd == "buy":
+            if len(parts) < 2:
+                logging.info("Usage: buy <intValue> [ticker]")
+                continue
+            try:
+                amount = int(parts[1])
+            except ValueError:
+                logging.warning("Amount must be an integer.")
+                continue
+
+            ticker_use = parts[2].upper()
+            live_price = get_current_price(ticker_use)
+            buy_shares(ticker_use, amount, live_price, live_price)
+            logging.info(f"Attempted to buy {amount}×{ticker_use} @ {live_price}")
+
+        elif cmd == "sell":
+            if len(parts) < 2:
+                logging.info("Usage: sell <intValue> [ticker]")
+                continue
+            try:
+                amount = int(parts[1])
+            except ValueError:
+                logging.warning("Amount must be an integer.")
+                continue
+
+            ticker_use = parts[2].upper()
+
+            try:
+                position = api.get_position(ticker_use)
+                owned_qty = int(float(position.qty))
+            except Exception:
+                logging.info(f"You don’t own any shares of {ticker_use}.")
+                continue
+
+            if amount > owned_qty:
+                logging.info(
+                    f"Not enough shares to sell: requested {amount}, "
+                    f"but you own only {owned_qty} of {ticker_use}."
+                )
+                continue
+            live_price = get_current_price(ticker_use)
+            sell_shares(ticker_use, amount, live_price, live_price)
+            logging.info(f"Attempted to sell {amount}×{ticker_use} @ {live_price}")
         else:
             logging.warning(f"Unrecognized command: {cmd_line}")
 

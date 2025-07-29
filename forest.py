@@ -3275,6 +3275,8 @@ def console_listener():
             logging.info("  set-ntickers (Number)")
             logging.info("  ai-tickers")
             logging.info("  create-script (name)")
+            logging.info("  buy (ticker) <amount>")
+            logging.info("  sell (ticker) <amount>")
             logging.info("  commands")
 
         elif cmd == "set-timeframe":
@@ -3398,12 +3400,12 @@ def console_listener():
                 logging.info("Usage: buy <intValue> [ticker]")
                 continue
             try:
-                amount = int(parts[1])
+                amount = int(parts[2])
             except ValueError:
                 logging.warning("Amount must be an integer.")
                 continue
 
-            ticker_use = parts[2].upper()
+            ticker_use = parts[1].upper()
             live_price = get_current_price(ticker_use)
             buy_shares(ticker_use, amount, live_price, live_price)
             logging.info(f"Attempted to buy {amount}×{ticker_use} @ {live_price}")
@@ -3413,12 +3415,12 @@ def console_listener():
                 logging.info("Usage: sell <intValue> [ticker]")
                 continue
             try:
-                amount = int(parts[1])
+                amount = int(parts[2])
             except ValueError:
                 logging.warning("Amount must be an integer.")
                 continue
 
-            ticker_use = parts[2].upper()
+            ticker_use = parts[1].upper()
 
             try:
                 position = api.get_position(ticker_use)
@@ -3446,7 +3448,7 @@ def main():
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name)")
+    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], run-sentiment [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name), buy (ticker) <N>, sell (ticker) <N>")
     try:
         account = api.get_account()
         positions = api.list_positions()

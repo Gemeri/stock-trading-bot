@@ -1944,7 +1944,7 @@ def send_discord_order_message(action, ticker, price, predicted_price, extra_inf
         logging.info("Discord mode is off or DISCORD_USER_ID not set.")
 
 def buy_shares(ticker, qty, buy_price, predicted_price):
-    logging.info("BUY: ", ticker)
+    logging.info("BUY: ", {ticker})
     if qty <= 0:
         return
     try:
@@ -2026,7 +2026,7 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
         logging.error(f"[{ticker}] Buy order failed: {e}")
 
 def sell_shares(ticker, qty, sell_price, predicted_price):
-    logging.info("SELL: ", ticker)
+    logging.info("SELL: ", {ticker})
     if qty <= 0:
         return
     try:
@@ -2082,7 +2082,7 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
         logging.error(f"[{ticker}] Sell order failed: {e}")
 
 def short_shares(ticker, qty, short_price, predicted_price):
-    logging.info("SHORT: ", ticker)
+    logging.info("SHORT: ", {ticker})
     if qty <= 0:
         return
     try:
@@ -2160,7 +2160,7 @@ def short_shares(ticker, qty, short_price, predicted_price):
         logging.error(f"[{ticker}] Short order failed: {e}")
 
 def close_short(ticker, qty, cover_price):
-    logging.info("COVER: ", ticker)
+    logging.info("COVER: ", {ticker})
     if qty <= 0:
         return
     try:
@@ -3398,8 +3398,6 @@ def console_listener():
 
 def main():
     _update_logic_json()
-    if RUN_SCHEDULE == "on":
-        compute_and_cache_best_tickers()
     setup_schedule_for_timeframe(BAR_TIMEFRAME)
     maybe_update_best_tickers()
     listener_thread = threading.Thread(target=console_listener, daemon=True)

@@ -18,7 +18,7 @@ from tensorflow.keras.optimizers import Adam
 # Load .env variables
 load_dotenv()
 BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "1Hour")
-TICKERS = os.getenv("TICKERS", "TSLA,AAPL").split(",")
+BACKTEST_TICKER = os.getenv("TICKERS", "TSLA,AAPL").split(",")
 DISABLED_FEATURES = os.getenv("DISABLED_FEATURES", "")
 if DISABLED_FEATURES:
     DISABLED_FEATURES = [f.strip() for f in DISABLED_FEATURES.split(",")]
@@ -62,7 +62,7 @@ def get_enabled_features():
     return [feat for feat in ALL_FEATURES if feat not in DISABLED_FEATURES]
 
 def get_csv_filename(ticker: str) -> str:
-    return f"{ticker}_{CONVERTED_TIMEFRAME}.csv"
+    return f"data/{ticker}_{CONVERTED_TIMEFRAME}.csv"
 
 def load_csv_data(ticker: str) -> pd.DataFrame:
     filename = get_csv_filename(ticker)
@@ -305,8 +305,7 @@ def run_logic(current_price: float, predicted_price: float, ticker: str):
     agent.replay()
     agent.update_target_model()
 
-def run_backtest(current_price: float, predicted_price: float, position_qty: float, current_timestamp, candles) -> str:
-    ticker = TICKERS[0]
+def run_backtest(current_price: float, predicted_price: float, position_qty: float, current_timestamp, candles, ticker) -> str:
     try:
         df = load_csv_data(ticker)
         # Only consider the last 500 candles for backtesting

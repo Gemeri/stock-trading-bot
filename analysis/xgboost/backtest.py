@@ -4,7 +4,7 @@ import xgboost as xgb
 import platform
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
-import matplotlib
+from linear import stock_price_direction
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -16,10 +16,71 @@ df = load_and_engineer_features('../../data/AMZN_H1.csv')
 
 # some time engineering
 df['timestamp'] = pd.to_datetime(df['timestamp'])
-df['hour'] = df['timestamp'].dt.hour
-df['day'] = df['timestamp'].dt.day
-df['weekday'] = df['timestamp'].dt.weekday
-df['month'] = df['timestamp'].dt.month
+df.set_index('timestamp', inplace=True)
+
+# Feature Engineering on Timestamp
+df['hour'] = df.index.hour
+df['day_of_week'] = df.index.dayofweek  # Monday=0, Sunday=6
+df['day_of_month'] = df.index.day
+df['month'] = df.index.month
+df['quarter'] = df.index.quarter
+df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+df['is_month_start'] = (df.index.is_month_start).astype(int)
+df['is_month_end'] = (df.index.is_month_end).astype(int)
+
+# Create cyclical features for hour and day of week
+df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+
+# Price-based features
+df['price_change_pct'] = df['price_change'] / df['open']
+df['high_low_range_pct'] = df['high_low_range'] / df['open']
+df['body_size'] = abs(df['close'] - df['open'])
+df['body_to_range_ratio'] = df['body_size'] / df['high_low_range']
+
+# Volume-based features
+df['volume_change_pct'] = df['volume_change'] / df['volume'].shift(1).fillna(1)
+df['volume_zscore'] = (df['volume'] - df['volume'].mean()) / df['volume'].std()
+df['vwap_diff'] = df['vwap'] - df['open']
+df['volume_price_interaction'] = df['volume'] * df['close']
+
+# Technical indicators
+# Moving averages
+df['ma_3'] = df['close'].rolling(window=3).mean()
+df['ma_5'] = df['close'].rolling(window=5).mean()
+df['ma_10'] = df['close'].rolling(window=10).mean()
+
+# RSI smoothing
+df['rsi_smoothed'] = df['rsi'].rolling(window=3).mean()
+
+# MACD features
+df['macd_signal'] = df['macd_signal'].fillna(method='bfill')
+df['macd_hist_smoothed'] = df['macd_histogram'].rolling(window=3).mean()
+
+# ATR features
+df['atr_smoothed'] = df['atr'].rolling(window=3).mean()
+
+# Bollinger Bands
+df['bb_mid'] = df['ma_20']  # Using ma_20 from the data
+df['bb_upper'] = df['bollinger_upper']
+df['bb_lower'] = df['bollinger_lower']
+df['bb_width'] = df['bb_upper'] - df['bb_lower']
+df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+
+# Momentum and ROC
+df['momentum_1'] = df['close'].diff(1)
+df['roc_1'] = df['close'].pct_change(1)
+
+# ADX trend strength
+df['adx_trend_strength'] = df['adx'] / 100
+
+# Lagged features
+for lag in [1, 2, 3, 5, 10]:
+    df[f'close_lag_{lag}'] = df['close'].shift(lag)
+    df[f'volume_lag_{lag}'] = df['volume'].shift(lag)
+    df[f'returns_1_lag_{lag}'] = df['returns_1'].shift(lag)
 
 LOOKAHEAD_LIST = [3, 5, 8]
 
@@ -33,9 +94,10 @@ df.dropna(inplace=True)  # Remove last row, which now has a NaN target
 # Portfolio and tracking
 initial_cash = 100000
 cash = initial_cash
-shares = 0
+position = 0
 portfolio_values = []
 last_predicted_price = 0
+last_trade_date = False
 
 # for plotting
 timestamps = []
@@ -53,23 +115,33 @@ for i in range(len(df)-800, len(df)-1):
     test_data = df.iloc[i:i+1]
     
     # Use simple features (you can expand)
-    features = [
-        'returns_1', 'returns_3', 'returns_5',
-        'ma_3', 'ma_5', 'ma_10',
-        'std_5', 'std_10',
-        'high_low_range', 'open_close_diff',
-        'volume_change'
-    ]
+    feature_columns = [
+        'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions',
+        'price_change', 'high_low_range', 'log_volume', 'returns_1', 'returns_3', 
+        'returns_5', 'ma_3', 'ma_5', 'ma_10', 'std_5', 'std_10', 'open_close_diff',
+        'volume_change', 'macd_line', 'macd_signal', 'macd_histogram', 'rsi',
+        'momentum', 'roc', 'atr', 'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx',
+        'obv', 'bollinger_upper', 'bollinger_lower', 'hour', 'day_of_week',
+        'day_of_month', 'month', 'quarter', 'is_weekend', 'is_month_start',
+        'is_month_end', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
+        'price_change_pct', 'high_low_range_pct', 'body_size', 'body_to_range_ratio',
+        'volume_change_pct', 'volume_zscore', 'vwap_diff', 'volume_price_interaction',
+        'ma_3', 'ma_5', 'ma_10', 'rsi_smoothed', 'macd_hist_smoothed', 'atr_smoothed',
+        'bb_width', 'bb_position', 'momentum_1', 'roc_1', 'adx_trend_strength'
+        ]
 
+    # Add lagged features to feature list
+    for lag in [1, 2, 3, 5, 10]:
+        feature_columns.extend([f'close_lag_{lag}', f'volume_lag_{lag}', f'returns_1_lag_{lag}'])
 
     predicted_prices = []
 
     for lookahead in LOOKAHEAD_LIST:
         
-        X_train = train_data[features]
+        X_train = train_data[feature_columns]
         y_train = train_data[f"target_{lookahead}"]
 
-        X_test = test_data[features]
+        X_test = test_data[feature_columns]
         
         model = xgb.XGBRegressor(
             n_estimators=100, 
@@ -85,37 +157,103 @@ for i in range(len(df)-800, len(df)-1):
     
     current_price = test_data['close'].values[0]
 
-    max_predicted = max(predicted_prices)
-    min_predicted = min(predicted_prices)
+    direction = stock_price_direction([0] + LOOKAHEAD_LIST, [current_price] + predicted_prices)
 
-    print(f"min price: {min_predicted} - max price {max_predicted} - current price {current_price}")
-
-    # we chose the price with the highest swing
-    chosen_price = max_predicted if abs(current_price - max_predicted) > abs(current_price - min_predicted) else min_predicted
-    
-    projected_change = (chosen_price - current_price) / current_price
-
-    print(f"projected change: {projected_change}")
+    # direction is between +90 and - 90
+    # let's consider 0 to 30 and 30+
+    # also 0 to -30 and less then -30
+    print(f"projected direction: {direction:.2f}")
 
     last_action = 0
+    
+    # extract the date
+    date = pd.to_datetime(test_data["timestamp"].values[0]).date()
 
-    # Strategy
-    if projected_change > 0.01:
-        # Go long: invest 30% of current cash
-        to_invest = 0.3 * cash
+    # Skip if a trade was already made today (simulate T+1 rule)
+    # if date == last_trade_date:
+    #     print(f"Skipping trade because last_trade_date = {last_trade_date}")
+    #     portfolio_value = cash + position * current_price
+    #     continue
+
+    # moderate LONG ENTRY
+    if direction > 0 and direction < 30:
+
+        # exit half our shorts first
+        if position < 0:
+            shorts_to_close = abs(position // 2)
+            cash -= shorts_to_close * current_price
+            position += shorts_to_close
+
+        # buy shares moderately if we can
+        to_invest = 0.1 * cash
         num_shares = to_invest // current_price
         if num_shares > 0:
+
+            print(f"** BOUGHT {num_shares} at {current_price} = {num_shares * current_price}")
             cash -= num_shares * current_price
-            shares += num_shares
-            last_action = +num_shares
-    elif projected_change < -0.01:
-        # Go short (sell all)
-        cash += shares * current_price
-        shares = 0
-        last_action = -shares
+            position += num_shares
+            entry_price = current_price
+            last_trade_date = date
+
+    # strong LONG entry
+    elif direction > 30:
+
+        # exit ALL short first
+        if position < 0:
+            cash -= abs(position) * current_price
+            position = 0
+
+        # buy shares more aggressively if we can
+        to_invest = 0.2 * cash
+        num_shares = to_invest // current_price
+        if num_shares > 0:
+
+            print(f"** BOUGHT {num_shares} at {current_price} = {num_shares * current_price}")
+            cash -= num_shares * current_price
+            position += num_shares
+            entry_price = current_price
+            last_trade_date = date
+
+    # moderate short
+    elif direction < 0 and direction > -30:
+        
+        # we sell 50% of our shares
+        if position > 0:
+
+            to_sell = position // 2 
+            
+            print(f"** SOLD {to_sell} at {current_price} = {to_sell * current_price}")
+            cash += to_sell * current_price
+            position -= to_sell
+            last_trade_date = date
+
     
+    # strong short
+    elif direction < -30:
+        
+        # we sell 100% of our shares
+        if position > 0:
+
+            to_sell = position
+
+            print(f"** SOLD {to_sell} at {current_price} = {to_sell * current_price}")
+            cash += to_sell * current_price
+            position -= to_sell
+            last_trade_date = date
+
+        # then we go short (20% of cash)
+        to_short = 0.2 * cash
+        num_shorts = to_short // current_price
+        if num_shorts > 0:
+            cash += num_shorts * current_price
+            position -= num_shorts  # Negative value = short position
+            entry_price = current_price
+            last_trade_date = date
+
     # Track portfolio value
-    portfolio_value = cash + shares * current_price
+    portfolio_value = cash + position * current_price
+
+    print(f"-> current position: {position} / portfolio_value {portfolio_value}")
     
     # we record info for plotting
     actions.append(last_action*1000)
@@ -124,7 +262,9 @@ for i in range(len(df)-800, len(df)-1):
     balances.append(cash)
     timestamps.append(test_data['timestamp'].values[0])
 
-    print(f"portfolio updated: {portfolio_value}")
+    # we stop if we made a trade
+    # if last_trade_date == date:
+    #     input()
 
 
 print("plotting")
@@ -171,7 +311,7 @@ ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
 fig.autofmt_xdate()
 
 # 🧾 Title and combined legend
-plt.title("PPO Agent: Net Worth, Stock Price, Balance & Trade Actions")
+plt.title("XGboost prediction: Net Worth, Stock Price, Balance & Trade Actions")
 lines, labels = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
 lines3, labels3 = ax3.get_legend_handles_labels()

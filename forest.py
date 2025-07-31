@@ -123,7 +123,7 @@ def load_tickerlist() -> list[str]:
                     val = val.strip()
                     # Allow direct trade logic scripts via selection_model
                     if val.lower().endswith('.py'):
-                        SELECTION_MODEL = "trade_logic"
+                        SELECTION_MODEL = val
                         TRADE_LOGIC = val
                     else:
                         SELECTION_MODEL = val
@@ -1785,6 +1785,16 @@ def cash_below_minimum() -> bool:
 
 
 def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> list[str]:
+    """
+    Rank and return a list of the best tickers.
+
+    • Default ─ ranks by ML-model prediction quality.
+    • If `SELECTION_MODEL` starts with “trade_logic”, the user’s trade-logic
+      script is imported and its `run_backtest` function is executed ONCE on
+      the **entire** candle history for each symbol.  
+      The numeric value returned by `run_backtest` (or one of the common keys
+      in a returned dict) is used as the ranking metric.
+    """
     if top_n is None:
         top_n = TICKERLIST_TOP_N
 
@@ -1792,11 +1802,88 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
     if not tickers:
         return []
 
-    # If selection_model specifies trade_logic (or a specific script), skip
-    # model-based ranking and simply return all tickers for processing.
+    # ────────────────────────────────────────────────────────────────────
+    # 1. Trade-logic branch ─ use run_backtest for scoring
+    # ────────────────────────────────────────────────────────────────────
     if SELECTION_MODEL and SELECTION_MODEL.lower().startswith("trade_logic"):
-        return tickers
+        # Dynamically load the trade-logic module (from module path or file)
+        try:
+            logic_module = importlib.import_module(SELECTION_MODEL)
+        except ModuleNotFoundError:
+            spec = importlib.util.spec_from_file_location("trade_logic_module", SELECTION_MODEL)
+            if spec is None or spec.loader is None:
+                logging.error("Unable to find trade-logic script: %s", SELECTION_MODEL)
+                return []
+            logic_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(logic_module)
 
+        results: list[str] = []
+
+        for tck in tickers:
+            tf_code  = timeframe_to_code(BAR_TIMEFRAME)
+            csv_file = os.path.join(DATA_DIR, f"{tck}_{tf_code}.csv")
+
+            # ── Load or refresh candles + features ────────────────────────
+            if skip_data:
+                if not os.path.exists(csv_file):
+                    continue
+                df = pd.read_csv(csv_file)
+                if df.empty:
+                    continue
+            else:
+                df = fetch_candles_plus_features_and_predclose(
+                    tck, bars=N_BARS, timeframe=BAR_TIMEFRAME, rewrite_mode=REWRITE
+                )
+                df.to_csv(csv_file, index=False)
+
+            allowed_cols = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+            df = df.loc[:, [c for c in df.columns if c in allowed_cols]]
+
+            # ── Fresh prediction for latest row ───────────────────────────
+            pred_close = train_and_predict(df, ticker=tck, for_selection=True)
+            if isinstance(pred_close, dict):
+                pred_close = list(pred_close.values())[-1]
+            try:
+                pred_close = float(np.asarray(pred_close).flatten()[-1])
+            except (TypeError, ValueError):
+                pred_close = np.nan
+
+            if "predicted_close" not in df.columns:
+                df["predicted_close"] = np.nan
+            df["predicted_close"] = df["predicted_close"].astype(float)
+            df.at[df.index[-1], "predicted_close"] = pred_close
+
+            # ── Run back-test once on full data ───────────────────────────
+            try:
+                action = logic_module.run_backtest(
+                    current_price     = get_current_price(tck),
+                    predicted_price   = pred_close,
+                    position_qty      = 0,
+                    current_timestamp = df.iloc[-1]["timestamp"],
+                    candles           = df.copy(),
+                )
+            except Exception as exc:
+                logging.exception("Back-test failed for %s: %s", tck, exc)
+                continue
+
+            # Normalise action to upper-case string
+            action_str = str(action).strip().upper()
+            print(tck, ": ", action_str)
+
+            # Keep tickers with a BUY signal
+            if action_str == "BUY":
+                results.append(tck)
+
+        if not results:
+            logging.info("No tickers produced a BUY signal.")
+            return []
+
+        # Preserve discovery order but cap at top_n
+        return results[:max(1, top_n)]
+
+    # ────────────────────────────────────────────────────────────────────
+    # 2. ML-ranking branch (unchanged from original)
+    # ────────────────────────────────────────────────────────────────────
     ml_models      = get_ml_models_for_ticker(for_selection=True)
     classifier_set = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
     results: list[tuple[float, str]] = []
@@ -1808,7 +1895,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
         if skip_data:
             if not os.path.exists(csv_file):
                 continue
-            df = read_csv_limited(csv_file)
+            df = pd.read_csv(csv_file)
             if df.empty:
                 continue
         else:
@@ -1836,7 +1923,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
         print(tck, ": ", metric)
         results.append((metric, tck))
 
-    # ─── thresholds ────────────────────────────────────────────────────────
+    # ── Apply thresholds ────────────────────────────────────────────────
     if set(ml_models) & classifier_set:
         results = [(m, t) for m, t in results if m >= 0.55]
     else:
@@ -2923,6 +3010,7 @@ def console_listener():
                                         position_qty      = position_qty,
                                         current_timestamp = row_data["timestamp"],
                                         candles           = candles_bt,
+                                        ticker            = BACKTEST_TICKER
                                     )
 
                                     # ───────────────────────────────────────────────────────────

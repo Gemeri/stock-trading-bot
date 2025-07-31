@@ -5,6 +5,10 @@
 /catboost_info
 /*.csv
 *.png
+/lib
+/lib64
+/bin
+pyvenv.cfg
 
 # macOS
 .DS_Store

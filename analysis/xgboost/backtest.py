@@ -14,73 +14,23 @@ from utils import load_and_engineer_features
 # Load training data
 df = load_and_engineer_features('../../data/AMZN_H1.csv')
 
-# some time engineering
-df['timestamp'] = pd.to_datetime(df['timestamp'])
-df.set_index('timestamp', inplace=True)
-
-# Feature Engineering on Timestamp
-df['hour'] = df.index.hour
-df['day_of_week'] = df.index.dayofweek  # Monday=0, Sunday=6
-df['day_of_month'] = df.index.day
-df['month'] = df.index.month
-df['quarter'] = df.index.quarter
+# ----------------------------
+# 2. Feature Engineering on Timestamp
+# ----------------------------
+df['hour'] = df['timestamp'].dt.hour
+df['day_of_week'] = df['timestamp'].dt.dayofweek  # 0=Monday, 6=Sunday
 df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-df['is_month_start'] = (df.index.is_month_start).astype(int)
-df['is_month_end'] = (df.index.is_month_end).astype(int)
+df['month'] = df['timestamp'].dt.month
+df['quarter'] = df['timestamp'].dt.quarter
 
-# Create cyclical features for hour and day of week
+# Optional: Cyclical encoding for hour and day_of_week
 df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
 df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+df['day_of_week_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
 
-# Price-based features
-df['price_change_pct'] = df['price_change'] / df['open']
-df['high_low_range_pct'] = df['high_low_range'] / df['open']
-df['body_size'] = abs(df['close'] - df['open'])
-df['body_to_range_ratio'] = df['body_size'] / df['high_low_range']
-
-# Volume-based features
-df['volume_change_pct'] = df['volume_change'] / df['volume'].shift(1).fillna(1)
-df['volume_zscore'] = (df['volume'] - df['volume'].mean()) / df['volume'].std()
-df['vwap_diff'] = df['vwap'] - df['open']
-df['volume_price_interaction'] = df['volume'] * df['close']
-
-# Technical indicators
-# Moving averages
-df['ma_3'] = df['close'].rolling(window=3).mean()
-df['ma_5'] = df['close'].rolling(window=5).mean()
-df['ma_10'] = df['close'].rolling(window=10).mean()
-
-# RSI smoothing
-df['rsi_smoothed'] = df['rsi'].rolling(window=3).mean()
-
-# MACD features
-df['macd_signal'] = df['macd_signal'].fillna(method='bfill')
-df['macd_hist_smoothed'] = df['macd_histogram'].rolling(window=3).mean()
-
-# ATR features
-df['atr_smoothed'] = df['atr'].rolling(window=3).mean()
-
-# Bollinger Bands
-df['bb_mid'] = df['ma_20']  # Using ma_20 from the data
-df['bb_upper'] = df['bollinger_upper']
-df['bb_lower'] = df['bollinger_lower']
-df['bb_width'] = df['bb_upper'] - df['bb_lower']
-df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-
-# Momentum and ROC
-df['momentum_1'] = df['close'].diff(1)
-df['roc_1'] = df['close'].pct_change(1)
-
-# ADX trend strength
-df['adx_trend_strength'] = df['adx'] / 100
-
-# Lagged features
-for lag in [1, 2, 3, 5, 10]:
-    df[f'close_lag_{lag}'] = df['close'].shift(lag)
-    df[f'volume_lag_{lag}'] = df['volume'].shift(lag)
-    df[f'returns_1_lag_{lag}'] = df['returns_1'].shift(lag)
+# Drop original timestamp and non-numeric columns if any
+# df = df.drop(['hour', 'day_of_week', 'month', 'quarter'], axis=1)
 
 LOOKAHEAD_LIST = [3, 5, 8]
 
@@ -117,22 +67,21 @@ for i in range(len(df)-800, len(df)-1):
     # Use simple features (you can expand)
     feature_columns = [
         'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions',
-        'price_change', 'high_low_range', 'log_volume', 'returns_1', 'returns_3', 
-        'returns_5', 'ma_3', 'ma_5', 'ma_10', 'std_5', 'std_10', 'open_close_diff',
-        'volume_change', 'macd_line', 'macd_signal', 'macd_histogram', 'rsi',
-        'momentum', 'roc', 'atr', 'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx',
-        'obv', 'bollinger_upper', 'bollinger_lower', 'hour', 'day_of_week',
-        'day_of_month', 'month', 'quarter', 'is_weekend', 'is_month_start',
-        'is_month_end', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
-        'price_change_pct', 'high_low_range_pct', 'body_size', 'body_to_range_ratio',
-        'volume_change_pct', 'volume_zscore', 'vwap_diff', 'volume_price_interaction',
-        'ma_3', 'ma_5', 'ma_10', 'rsi_smoothed', 'macd_hist_smoothed', 'atr_smoothed',
-        'bb_width', 'bb_position', 'momentum_1', 'roc_1', 'adx_trend_strength'
+        'price_change', 'high_low_range', 'log_volume', 'returns_1',
+        'returns_3', 'returns_5', 'ma_3', 'ma_5', 'ma_10', 'std_5', 'std_10',
+        'open_close_diff', 'volume_change', 'macd_line', 'macd_signal',
+        'macd_histogram', 'rsi', 'momentum', 'roc', 'atr', 'ema_9', 'ema_21',
+        'ema_50', 'ema_200', 'adx', 'obv', 'bollinger_upper', 'bollinger_lower',
+        'lagged_close_1', 'lagged_close_2', 'lagged_close_3', 'lagged_close_5',
+        'lagged_close_10', 'candle_body_ratio', 'wick_dominance', 'gap_vs_prev',
+        'volume_zscore', 'atr_zscore', 'rsi_zscore', 'adx_trend', 'macd_cross',
+        'macd_hist_flip', 'days_since_high', 'days_since_low',
+        # Time-based engineered features
+        'hour_sin', 'hour_cos', 'day_of_week_sin', 'day_of_week_cos', 'is_weekend'
         ]
 
-    # Add lagged features to feature list
-    for lag in [1, 2, 3, 5, 10]:
-        feature_columns.extend([f'close_lag_{lag}', f'volume_lag_{lag}', f'returns_1_lag_{lag}'])
+    # Ensure all feature columns exist
+    feature_columns = [col for col in feature_columns if col in df.columns]
 
     predicted_prices = []
 
@@ -145,7 +94,11 @@ for i in range(len(df)-800, len(df)-1):
         
         model = xgb.XGBRegressor(
             n_estimators=100, 
-            max_depth=5
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42
         )
 
         model.fit(X_train, y_train)

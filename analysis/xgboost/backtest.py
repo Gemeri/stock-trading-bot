@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 import platform
+from datetime import datetime
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from linear import stock_price_direction
@@ -10,9 +11,16 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from utils import load_and_engineer_features
 
+STOCK_TICKER = "AAPL"
+LOOKAHEAD_LIST = [3, 5, 8]
+ENABLE_MODERATE = False
+ENABLE_INTRADAY = False
+WEAK_STRONG_THRESHOLD = 20
+SHORT_RATE = 0.2
+BUY_RATE = 0.2
 
 # Load training data
-df = load_and_engineer_features('../../data/AMZN_H1.csv')
+df = load_and_engineer_features(f"../fetch/data/{STOCK_TICKER}_H1.csv")
 
 # ----------------------------
 # 2. Feature Engineering on Timestamp
@@ -31,8 +39,6 @@ df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
 
 # Drop original timestamp and non-numeric columns if any
 # df = df.drop(['hour', 'day_of_week', 'month', 'quarter'], axis=1)
-
-LOOKAHEAD_LIST = [3, 5, 8]
 
 # Shift 'close' to predict the next candle's close
 
@@ -54,11 +60,12 @@ timestamps = []
 actions = []
 stock_prices = []
 balances = []
+position_values = []
 
 # Backtest from candle end-1200 to now -> 18mo circa
 for i in range(len(df)-800, len(df)-1):
 
-    print(f"Loading candles from {i-800} to {i}")
+    print(f"Loading candles for {STOCK_TICKER} from {i-800} to {i}")
 
     # Train model on previous 12 months (approx. 800 candles)
     train_data = df.iloc[i-800:i]
@@ -123,19 +130,20 @@ for i in range(len(df)-800, len(df)-1):
     date = pd.to_datetime(test_data["timestamp"].values[0]).date()
 
     # Skip if a trade was already made today (simulate T+1 rule)
-    # if date == last_trade_date:
-    #     print(f"Skipping trade because last_trade_date = {last_trade_date}")
-    #     portfolio_value = cash + position * current_price
-    #     continue
+    if not ENABLE_INTRADAY and date == last_trade_date:
+        print(f"Skipping trade because last_trade_date = {last_trade_date}")
+        portfolio_value = cash + position * current_price
+        continue
 
     # moderate LONG ENTRY
-    if direction > 0 and direction < 30:
+    if direction > 0 and direction < WEAK_STRONG_THRESHOLD and ENABLE_MODERATE:
 
         # exit half our shorts first
         if position < 0:
             shorts_to_close = abs(position // 2)
             cash -= shorts_to_close * current_price
             position += shorts_to_close
+            last_trade_date = date
 
         # buy shares moderately if we can
         to_invest = 0.1 * cash
@@ -149,15 +157,16 @@ for i in range(len(df)-800, len(df)-1):
             last_trade_date = date
 
     # strong LONG entry
-    elif direction > 30:
+    elif direction > WEAK_STRONG_THRESHOLD:
 
         # exit ALL short first
         if position < 0:
             cash -= abs(position) * current_price
             position = 0
+            last_trade_date = date
 
         # buy shares more aggressively if we can
-        to_invest = 0.2 * cash
+        to_invest = BUY_RATE * cash
         num_shares = to_invest // current_price
         if num_shares > 0:
 
@@ -168,7 +177,7 @@ for i in range(len(df)-800, len(df)-1):
             last_trade_date = date
 
     # moderate short
-    elif direction < 0 and direction > -30:
+    elif direction < 0 and direction > -WEAK_STRONG_THRESHOLD and ENABLE_MODERATE:
         
         # we sell 50% of our shares
         if position > 0:
@@ -182,7 +191,7 @@ for i in range(len(df)-800, len(df)-1):
 
     
     # strong short
-    elif direction < -30:
+    elif direction < -WEAK_STRONG_THRESHOLD:
         
         # we sell 100% of our shares
         if position > 0:
@@ -194,8 +203,8 @@ for i in range(len(df)-800, len(df)-1):
             position -= to_sell
             last_trade_date = date
 
-        # then we go short (20% of cash)
-        to_short = 0.2 * cash
+        # then we go short (SHORT_RATE% of cash)
+        to_short = SHORT_RATE * cash
         num_shorts = to_short // current_price
         if num_shorts > 0:
             cash += num_shorts * current_price
@@ -212,6 +221,7 @@ for i in range(len(df)-800, len(df)-1):
     actions.append(last_action*1000)
     stock_prices.append(current_price)
     portfolio_values.append(portfolio_value)
+    position_values.append(position)
     balances.append(cash)
     timestamps.append(test_data['timestamp'].values[0])
 
@@ -250,12 +260,12 @@ ax2.plot(timestamps, stock_prices, color='orange', label="Stock Price ($)")
 ax2.set_ylabel("Stock Price ($)", color='orange')
 ax2.tick_params(axis='y', labelcolor='orange')
 
-# 💰 Plot Balance (third Y-axis)
+# 💰 Plot Cacsh (third Y-axis)
 ax3 = ax1.twinx()
 ax3.spines['right'].set_position(('outward', 60))  # Offset third axis
-ax3.plot(timestamps, balances, color='purple', label='Balance ($)', linestyle='--')
-ax3.set_ylabel("Balance ($)", color='purple')
-ax3.tick_params(axis='y', labelcolor='purple')
+ax3.plot(timestamps, balances, color='red', label='Cash ($)', linestyle=':')
+ax3.set_ylabel("Cash ($)", color='red')
+ax3.tick_params(axis='y', labelcolor='red')
 
 # 🏷️ Format X-axis as dates
 import matplotlib.dates as mdates
@@ -264,7 +274,7 @@ ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
 fig.autofmt_xdate()
 
 # 🧾 Title and combined legend
-plt.title("XGboost prediction: Net Worth, Stock Price, Balance & Trade Actions")
+plt.title(f"XGboost prediction {STOCK_TICKER}: Net Worth, Stock Price, Balance & Trade Actions")
 lines, labels = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
 lines3, labels3 = ax3.get_legend_handles_labels()
@@ -273,11 +283,24 @@ ax1.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc="upper left"
 # Save figure
 fig.tight_layout()    
 
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+plt.savefig(f"pred/backtest-graph-{STOCK_TICKER}-{timestamp}.png")
+
+plot_df = pd.DataFrame({
+    'timestamp': timestamps,
+    'cash': balances,
+    'portfolio_value': portfolio_values,
+    'position': position_values,
+    'stock_price': stock_prices,
+    'action': actions
+})
+
+# Save as CSV
+plot_df.to_csv(f"pred/backtest-data-{STOCK_TICKER}-{timestamp}.csv", index=True)
 
 # Only use TkAgg if NOT on macOS
-if platform.system() != "Darwin":
-    plt.savefig("backtest-plot.png")
-else:
+if platform.system() == "Darwin":
     plt.show()
 
 

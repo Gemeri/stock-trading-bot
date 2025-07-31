@@ -102,7 +102,7 @@ SELECTION_MODEL: str | None = None
 
 def load_tickerlist() -> list[str]:
     """Load tickers and per-ticker ML overrides from tickerlist.txt."""
-    global TICKERS, TICKER_ML_OVERRIDES, SELECTION_MODEL
+    global TICKERS, TICKER_ML_OVERRIDES, SELECTION_MODEL, TRADE_LOGIC
     TICKER_ML_OVERRIDES = {}
     SELECTION_MODEL = None
     tickers: list[str] = []
@@ -120,7 +120,13 @@ def load_tickerlist() -> list[str]:
             if "=" in ln:
                 key, val = ln.split("=", 1)
                 if key.strip().lower() == "selection_model":
-                    SELECTION_MODEL = val.strip()
+                    val = val.strip()
+                    # Allow direct trade logic scripts via selection_model
+                    if val.lower().endswith('.py'):
+                        SELECTION_MODEL = "trade_logic"
+                        TRADE_LOGIC = val
+                    else:
+                        SELECTION_MODEL = val
                 continue
             parts = [p.strip() for p in ln.split(",")]
             ticker = parts[0].upper()
@@ -462,17 +468,31 @@ def _update_logic_json():
         json.dump(final_dict, f, indent=2)
 
 def _get_logic_script_name(logic_id: str) -> str:
+    """Resolve a logic identifier to a module name.
+
+    Supports numeric IDs (mapped via ``logic_scripts.json``) as well as
+    direct script filenames such as ``logic_1_forecast_driven.py`` or
+    ``logic_1_forecast_driven``.
+    """
     logic_dir, json_path = get_logic_dir_and_json()
+
+    # If the user provided a direct filename, strip the extension and use it.
+    if logic_id.lower().endswith('.py'):
+        return logic_id[:-3]
+
+    # If the user provided a script base (e.g. ``logic_1_forecast_driven``),
+    # make sure it exists and return directly.
+    candidate_path = os.path.join(logic_dir, f"{logic_id}.py")
+    if logic_id.startswith('logic_') and os.path.isfile(candidate_path):
+        return logic_id
+
     if not os.path.isfile(json_path):
         _update_logic_json()
     if not os.path.isfile(json_path):
         return "logic_15_forecast_driven"
     with open(json_path, "r") as f:
         data = json.load(f)
-        if logic_id in data:
-            return data[logic_id]
-        else:
-            return "logic_15_forecast_driven"
+    return data.get(logic_id, "logic_15_forecast_driven")
 
 _CANONICAL_TF = {
     "15min":  "15Min",
@@ -1772,6 +1792,11 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
     if not tickers:
         return []
 
+    # If selection_model specifies trade_logic (or a specific script), skip
+    # model-based ranking and simply return all tickers for processing.
+    if SELECTION_MODEL and SELECTION_MODEL.lower().startswith("trade_logic"):
+        return tickers
+
     ml_models      = get_ml_models_for_ticker(for_selection=True)
     classifier_set = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
     results: list[tuple[float, str]] = []
@@ -2484,7 +2509,7 @@ def update_env_variable(key: str, value: str):
 # 13. Additional Commands & Console
 # -------------------------------
 def console_listener():
-    global SHUTDOWN, TICKERS, BAR_TIMEFRAME, N_BARS, NEWS_MODE, TRADE_LOGIC, AI_TICKER_COUNT, AI_TICKERS
+    global SHUTDOWN, TICKERS, BAR_TIMEFRAME, N_BARS, NEWS_MODE, TRADE_LOGIC, AI_TICKER_COUNT, AI_TICKERS, USE_FULL_SHARES
     while not SHUTDOWN:
         cmd_line = sys.stdin.readline().strip()
         if not cmd_line:
@@ -2615,7 +2640,7 @@ def console_listener():
                     "sub-meta", "sub_vote"} & set(ml_models):
                         logic_module_name = "classifier"
                     else:
-                        logic_module_name = LOGIC_MODULE_MAP.get(TRADE_LOGIC, "logic_15_forecast_driven")
+                        logic_module_name = _get_logic_script_name(TRADE_LOGIC)
 
                     logging.info("Trading logic: " + logic_module_name)
                     try:
@@ -3210,8 +3235,8 @@ def console_listener():
             logging.info("  set-ntickers (Number)")
             logging.info("  ai-tickers")
             logging.info("  create-script (name)")
-            logging.info("  buy (ticker) <amount>")
-            logging.info("  sell (ticker) <amount>")
+            logging.info("  buy (ticker) <amount|$dollars>")
+            logging.info("  sell (ticker) <amount|$dollars>")
             logging.info("  commands")
 
         elif cmd == "set-timeframe":
@@ -3331,48 +3356,93 @@ def console_listener():
             logging.info("Updated logic_scripts.json to include the newly created script.")
 
         elif cmd == "buy":
-            if len(parts) < 2:
-                logging.info("Usage: buy <intValue> [ticker]")
-                continue
-            try:
-                amount = int(parts[2])
-            except ValueError:
-                logging.warning("Amount must be an integer.")
+            if len(parts) < 3:
+                logging.info("Usage: buy <ticker> <amount|$dollars>")
                 continue
 
             ticker_use = parts[1].upper()
+            amount_str = parts[2]
             live_price = get_current_price(ticker_use)
-            buy_shares(ticker_use, amount, live_price, live_price)
-            logging.info(f"Attempted to buy {amount}×{ticker_use} @ {live_price}")
+
+            if amount_str.startswith("$"):
+                try:
+                    dollars = float(amount_str[1:])
+                except ValueError:
+                    logging.warning("Dollar amount must be numeric.")
+                    continue
+                qty = dollars / live_price if live_price > 0 else 0
+                if qty <= 0:
+                    logging.warning("Dollar amount too small to buy.")
+                    continue
+                old_full = USE_FULL_SHARES
+                USE_FULL_SHARES = False
+                buy_shares(ticker_use, qty, live_price, live_price)
+                USE_FULL_SHARES = old_full
+                logging.info(f"Attempted to buy ${dollars} of {ticker_use} @ {live_price}")
+            else:
+                try:
+                    amount = int(amount_str)
+                except ValueError:
+                    logging.warning("Amount must be an integer or $dollar value.")
+                    continue
+                buy_shares(ticker_use, amount, live_price, live_price)
+                logging.info(f"Attempted to buy {amount}×{ticker_use} @ {live_price}")
 
         elif cmd == "sell":
-            if len(parts) < 2:
-                logging.info("Usage: sell <intValue> [ticker]")
-                continue
-            try:
-                amount = int(parts[2])
-            except ValueError:
-                logging.warning("Amount must be an integer.")
+            if len(parts) < 3:
+                logging.info("Usage: sell <ticker> <amount|$dollars>")
                 continue
 
             ticker_use = parts[1].upper()
-
-            try:
-                position = api.get_position(ticker_use)
-                owned_qty = int(float(position.qty))
-            except Exception:
-                logging.info(f"You don’t own any shares of {ticker_use}.")
-                continue
-
-            if amount > owned_qty:
-                logging.info(
-                    f"Not enough shares to sell: requested {amount}, "
-                    f"but you own only {owned_qty} of {ticker_use}."
-                )
-                continue
+            amount_str = parts[2]
             live_price = get_current_price(ticker_use)
-            sell_shares(ticker_use, amount, live_price, live_price)
-            logging.info(f"Attempted to sell {amount}×{ticker_use} @ {live_price}")
+
+            if amount_str.startswith("$"):
+                try:
+                    dollars = float(amount_str[1:])
+                except ValueError:
+                    logging.warning("Dollar amount must be numeric.")
+                    continue
+                qty = dollars / live_price if live_price > 0 else 0
+                try:
+                    position = api.get_position(ticker_use)
+                    owned_qty = float(position.qty)
+                except Exception:
+                    logging.info(f"You don’t own any shares of {ticker_use}.")
+                    continue
+                if qty > owned_qty:
+                    logging.info(
+                        f"Not enough shares to sell: requested ${dollars}, "
+                        f"which is {qty:.4f} shares, but you own only {owned_qty} of {ticker_use}."
+                    )
+                    continue
+                old_full = USE_FULL_SHARES
+                USE_FULL_SHARES = False
+                sell_shares(ticker_use, qty, live_price, live_price)
+                USE_FULL_SHARES = old_full
+                logging.info(f"Attempted to sell ${dollars} of {ticker_use} @ {live_price}")
+            else:
+                try:
+                    amount = int(amount_str)
+                except ValueError:
+                    logging.warning("Amount must be an integer or $dollar value.")
+                    continue
+
+                try:
+                    position = api.get_position(ticker_use)
+                    owned_qty = int(float(position.qty))
+                except Exception:
+                    logging.info(f"You don’t own any shares of {ticker_use}.")
+                    continue
+
+                if amount > owned_qty:
+                    logging.info(
+                        f"Not enough shares to sell: requested {amount}, "
+                        f"but you own only {owned_qty} of {ticker_use}."
+                    )
+                    continue
+                sell_shares(ticker_use, amount, live_price, live_price)
+                logging.info(f"Attempted to sell {amount}×{ticker_use} @ {live_price}")
         else:
             logging.warning(f"Unrecognized command: {cmd_line}")
 
@@ -3383,7 +3453,7 @@ def main():
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name), buy (ticker) <N>, sell (ticker) <N>")
+    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name), buy (ticker) <N|$dollars>, sell (ticker) <N|$dollars>")
     try:
         account = api.get_account()
         positions = api.list_positions()

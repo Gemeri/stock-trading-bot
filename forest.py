@@ -123,7 +123,7 @@ def load_tickerlist() -> list[str]:
                     val = val.strip()
                     # Allow direct trade logic scripts via selection_model
                     if val.lower().endswith('.py'):
-                        SELECTION_MODEL = val
+                        SELECTION_MODEL = f"logic\\{val}"
                         TRADE_LOGIC = val
                     else:
                         SELECTION_MODEL = val
@@ -1801,11 +1801,11 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
     tickers = load_tickerlist()
     if not tickers:
         return []
-
+    print(SELECTION_MODEL)
     # ────────────────────────────────────────────────────────────────────
     # 1. Trade-logic branch ─ use run_backtest for scoring
     # ────────────────────────────────────────────────────────────────────
-    if SELECTION_MODEL and SELECTION_MODEL.lower().startswith("trade_logic"):
+    if SELECTION_MODEL.endswith('.py'):
         # Dynamically load the trade-logic module (from module path or file)
         try:
             logic_module = importlib.import_module(SELECTION_MODEL)
@@ -1861,14 +1861,15 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
                     position_qty      = 0,
                     current_timestamp = df.iloc[-1]["timestamp"],
                     candles           = df.copy(),
+                    ticker            = tck
                 )
             except Exception as exc:
                 logging.exception("Back-test failed for %s: %s", tck, exc)
                 continue
-
+            
             # Normalise action to upper-case string
             action_str = str(action).strip().upper()
-            print(tck, ": ", action_str)
+            logging.info("%s: %s", tck, action_str)
 
             # Keep tickers with a BUY signal
             if action_str == "BUY":

@@ -234,7 +234,7 @@ ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
 fig.autofmt_xdate()
 
 # 📉 Plot Net Worth (left Y-axis)
-ax1.plot(timestamps, balances, color='blue', label="Net Worth ($)")
+ax1.plot(timestamps, portfolio_values, color='blue', label="Net Worth ($)")
 ax1.set_xlabel("Time")
 ax1.set_ylabel("Net Worth ($)", color='blue')
 ax1.tick_params(axis='y', labelcolor='blue')

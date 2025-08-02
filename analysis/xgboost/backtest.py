@@ -13,7 +13,6 @@ from utils import load_and_engineer_features
 
 STOCK_TICKER = "AAPL"
 LOOKAHEAD_LIST = [3, 5, 8]
-ENABLE_MODERATE = False
 ENABLE_INTRADAY = False
 WEAK_STRONG_THRESHOLD = 20
 SHORT_RATE = 0.2
@@ -50,6 +49,7 @@ df.dropna(inplace=True)  # Remove last row, which now has a NaN target
 # Portfolio and tracking
 initial_cash = 100000
 cash = initial_cash
+cash_short = 0
 position = 0
 portfolio_values = []
 last_predicted_price = 0
@@ -128,6 +128,28 @@ for i in range(len(df)-800, len(df)-1):
     
     # extract the date
     date = pd.to_datetime(test_data["timestamp"].values[0]).date()
+    
+    # 💣 Partial Margin Call Check
+    if position < 0:
+        short_market_value = abs(position) * current_price
+        required_margin = 0.3 * short_market_value
+        collateral_cash = cash - cash_short
+
+        if collateral_cash < required_margin:
+            # Calculate how many shares to cover to fix margin
+            required_short_value = collateral_cash / 0.3
+            allowed_position = required_short_value / current_price
+            shares_to_cover = abs(position) - allowed_position
+            shares_to_cover = int(min(shares_to_cover, abs(position)))  # clip to max available
+
+            if shares_to_cover > 0:
+                print(f"** MARGIN CALL: partially covering {shares_to_cover} shares at {current_price} = {shares_to_cover * current_price}")
+                cash -= shares_to_cover * current_price
+                cash_short -= shares_to_cover * current_price
+                position += shares_to_cover  # reduce negative short position
+                last_trade_date = date
+                continue
+
 
     # Skip if a trade was already made today (simulate T+1 rule)
     if not ENABLE_INTRADAY and date == last_trade_date:
@@ -135,61 +157,27 @@ for i in range(len(df)-800, len(df)-1):
         portfolio_value = cash + position * current_price
         continue
 
-    # moderate LONG ENTRY
-    if direction > 0 and direction < WEAK_STRONG_THRESHOLD and ENABLE_MODERATE:
-
-        # exit half our shorts first
-        if position < 0:
-            shorts_to_close = abs(position // 2)
-            cash -= shorts_to_close * current_price
-            position += shorts_to_close
-            last_trade_date = date
-
-        # buy shares moderately if we can
-        to_invest = 0.1 * cash
-        num_shares = to_invest // current_price
-        if num_shares > 0:
-
-            print(f"** BOUGHT {num_shares} at {current_price} = {num_shares * current_price}")
-            cash -= num_shares * current_price
-            position += num_shares
-            entry_price = current_price
-            last_trade_date = date
-
     # strong LONG entry
-    elif direction > WEAK_STRONG_THRESHOLD:
+    if direction > WEAK_STRONG_THRESHOLD:
 
         # exit ALL short first
         if position < 0:
             cash -= abs(position) * current_price
+            cash_short = 0
             position = 0
             last_trade_date = date
+        else:
+            # buy shares more aggressively if we can
+            to_invest = BUY_RATE * cash
+            num_shares = to_invest // current_price
+            if num_shares > 0:
 
-        # buy shares more aggressively if we can
-        to_invest = BUY_RATE * cash
-        num_shares = to_invest // current_price
-        if num_shares > 0:
+                print(f"** BOUGHT {num_shares} at {current_price} = {num_shares * current_price}")
+                cash -= num_shares * current_price
+                position += num_shares
+                entry_price = current_price
+                last_trade_date = date
 
-            print(f"** BOUGHT {num_shares} at {current_price} = {num_shares * current_price}")
-            cash -= num_shares * current_price
-            position += num_shares
-            entry_price = current_price
-            last_trade_date = date
-
-    # moderate short
-    elif direction < 0 and direction > -WEAK_STRONG_THRESHOLD and ENABLE_MODERATE:
-        
-        # we sell 50% of our shares
-        if position > 0:
-
-            to_sell = position // 2 
-            
-            print(f"** SOLD {to_sell} at {current_price} = {to_sell * current_price}")
-            cash += to_sell * current_price
-            position -= to_sell
-            last_trade_date = date
-
-    
     # strong short
     elif direction < -WEAK_STRONG_THRESHOLD:
         
@@ -203,14 +191,26 @@ for i in range(len(df)-800, len(df)-1):
             position -= to_sell
             last_trade_date = date
 
-        # then we go short (SHORT_RATE% of cash)
-        to_short = SHORT_RATE * cash
-        num_shorts = to_short // current_price
-        if num_shorts > 0:
-            cash += num_shorts * current_price
-            position -= num_shorts  # Negative value = short position
-            entry_price = current_price
-            last_trade_date = date
+        else:
+            # then we go short (SHORT_RATE% of cash)
+            collateral_cash = cash - cash_short
+
+            shortable_amount = collateral_cash// 2 #50% margin
+            shortable_shares_max = shortable_amount // current_price
+
+            want_short_amount = SHORT_RATE * cash
+            want_short_shares = want_short_amount // current_price
+
+            num_shorts = min(want_short_shares, shortable_shares_max)
+            if num_shorts > 0:
+
+                print(f"** SHORTING {num_shorts} at {current_price} = {num_shorts * current_price}")
+                cash += num_shorts * current_price
+                cash_short += num_shorts * current_price
+
+                position -= num_shorts  # Negative value = short position
+                entry_price = current_price
+                last_trade_date = date
 
     # Track portfolio value
     portfolio_value = cash + position * current_price

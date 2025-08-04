@@ -22,6 +22,8 @@ import json
 import re
 import discord
 import xgboost as xgb
+import catboost
+from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 from timeframe import TIMEFRAME_SCHEDULE
 import ast
 from sklearn.linear_model import RidgeCV
@@ -247,9 +249,9 @@ def parse_ml_models(override: str | None = None) -> list[str]:
     raw = [m.strip().lower() for m in ml_raw.split(",") if m.strip()]
 
     if "all" in raw:
-        raw += ["forest", "xgboost", "lightgbm", "lstm", "transformer"]
+        raw += ["forest", "xgboost", "lightgbm", "catboost", "lstm", "transformer"]
     if "all_cls" in raw:
-        raw += ["forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"]
+        raw += ["forest_cls", "xgboost_cls", "catboost_cls" "lightgbm_cls", "transformer_cls"]
 
     canonical: list[str] = []
     for m in raw:
@@ -259,6 +261,8 @@ def parse_ml_models(override: str | None = None) -> list[str]:
             case "rf" | "randomforest":               canonical.append("forest")
             case "rf_cls" | "forest_cls":             canonical.append("forest_cls")
             case "xgb_cls" | "xgboost_cls":           canonical.append("xgboost_cls")
+            case "cb" | "catboost":                   canonical.append("catboost")
+            case "cb_cls" | "catboost_cls":           canonical.append("catboost_cls")
             case "classifier" | "transformer_cls":    canonical.append("transformer_cls")
             case "sub_vote" | "sub-vote":             canonical.append("sub-vote")
             case "sub_meta" | "sub-meta":             canonical.append("sub-meta")
@@ -291,7 +295,21 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
     if model_name in ["forest", "rf", "randomforest"]:
         return RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
     elif model_name == "xgboost":
-        return xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+        return xgb.XGBRegressor(
+            n_estimators=114, 
+            max_depth=9, 
+            learning_rate=0.14264252588219034,
+            subsample=0.5524803023252148,
+            colsample_bytree=0.7687841723045249,
+            gamma=0.5856035407199236,
+            reg_alpha=0.5063880221467401,
+            reg_lambda=0.0728996118523866,
+        )
+    elif model_name == "catboost":
+        return CatBoostRegressor(iterations=600, depth=6, learning_rate=0.05,
+            l2_leaf_reg=3, bagging_temperature=0.5,
+            loss_function="RMSE", eval_metric="RMSE",
+            random_seed=42, verbose=False)
     elif model_name == "lightgbm":
         return lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
     elif model_name == "forest_cls":
@@ -302,7 +320,11 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
         return XGBClassifier(n_estimators=N_ESTIMATORS,
                              random_state=RANDOM_SEED,
                              use_label_encoder=False, eval_metric="logloss")
-
+    elif model_name == "catboost_cls":
+        return CatBoostClassifier(iterations=600, depth=6, learning_rate=0.05,
+            l2_leaf_reg=3, bagging_temperature=0.5,
+            loss_function="Logloss", eval_metric="AUC",
+            random_seed=42, verbose=False)
     elif model_name == "lightgbm_cls":
         return LGBMClassifier(n_estimators=N_ESTIMATORS,
                               random_state=RANDOM_SEED)
@@ -432,7 +454,7 @@ def predict_sentiment(text):
 # -------------------------------
 CLASSIFIER_MODELS = {
     "forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls",
-    "sub-vote", "sub_vote", "sub-meta", "sub_meta"
+    "sub-vote", "sub_vote", "sub-meta", "sub_meta", "catboost_cls"
 }
 
 def get_logic_dir_and_json():
@@ -733,7 +755,7 @@ def fetch_candles_plus_features_and_predclose(
     # ───── 7. regenerate predicted_close only for the new rows ──────────────
     ml_models     = get_ml_models_for_ticker(ticker)
     has_regressor = any(m in ["xgboost", "forest", "rf", "randomforest",
-                              "lstm", "transformer"] for m in ml_models)
+                              "lstm", "transformer", "catboost"] for m in ml_models)
 
     if has_regressor and DISABLE_PRED_CLOSE == False:
         if 'predicted_close' not in df_combined.columns:
@@ -756,7 +778,20 @@ def fetch_candles_plus_features_and_predclose(
                             n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
                     elif m == "xgboost":
                         mdl = xgb.XGBRegressor(
-                            n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                                n_estimators=114, 
+                                max_depth=9, 
+                                learning_rate=0.14264252588219034,
+                                subsample=0.5524803023252148,
+                                colsample_bytree=0.7687841723045249,
+                                gamma=0.5856035407199236,
+                                reg_alpha=0.5063880221467401,
+                                reg_lambda=0.0728996118523866,
+                            )
+                    elif m == "catboost":
+                        mdl = CatBoostRegressor(iterations=600, depth=6, learning_rate=0.05,
+                                                l2_leaf_reg=3, bagging_temperature=0.5,
+                                                loss_function="RMSE", eval_metric="RMSE",
+                                                random_seed=RANDOM_SEED, verbose=False)
                     elif m in ["lightgbm", "lgbm"]:
                         mdl = lgb.LGBMRegressor(
                             n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
@@ -1144,7 +1179,7 @@ def _fit_base_classifiers(
 ) -> dict[str, object]:
     """Fit only the requested base classifiers."""
     if model_names is None:
-        model_names = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
+        model_names = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls", "catboost_cls"}
 
     models: dict[str, object] = {}
     pos_weight = ((len(y_bin) - y_bin.sum()) / y_bin.sum()) if y_bin.sum() else 1.0
@@ -1174,6 +1209,13 @@ def _fit_base_classifiers(
             tree_method="hist",
         )
         models["xgboost_cls"] = make_pipeline(xgb_raw).fit(X_scaled, y_bin)
+
+    if "catboost_cls" in model_names:
+        cb_raw = CatBoostClassifier(iterations=600, depth=6, learning_rate=0.05,
+                                    l2_leaf_reg=3, bagging_temperature=0.5,
+                                    loss_function="Logloss", eval_metric="AUC",
+                                    random_seed=RANDOM_SEED, verbose=False)
+        models["catboost_cls"] = make_pipeline(cb_raw).fit(X_scaled, y_bin)
 
     # ▸ lightgbm
     if "lightgbm_cls" in model_names:
@@ -1224,7 +1266,7 @@ def _train_meta_classifier(models: dict[str, object],
     names_used: list[str] = []
     cv = TimeSeriesSplit(n_splits=4, test_size=seq_len)
 
-    for name in ("forest_cls", "xgboost_cls", "lightgbm_cls"):
+    for name in ("forest_cls", "xgboost_cls", "lightgbm_cls", "catboost_cls"):
         if name not in models:
             continue
         pipe = models[name]   
@@ -1356,11 +1398,10 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
     # Sequence models
     seq_len = 60
 
-    regression_model_ids = ["forest", "rf", "randomforest", "xgboost", "lightgbm", "lstm", "transformer"]
-    use_meta_model = sorted(ml_models) == sorted(["forest", "xgboost", "lightgbm", "lstm", "transformer"])
+    use_meta_model = sorted(ml_models) == sorted(["forest", "xgboost", "lightgbm", "lstm", "transformer", "catboost"])
 
     classifier_set = {"forest_cls", "xgboost_cls",
-                    "lightgbm_cls", "transformer_cls"}
+                    "lightgbm_cls", "transformer_cls", "catboost_cls"}
 
     if any(m in classifier_set for m in ml_models):
 
@@ -1400,7 +1441,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         # --------------------------------------------------
         #  b)   STACK  … all_cls / explicit 4-list
         # --------------------------------------------------
-        wanted = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
+        wanted = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls", "catboost_cls"}
         if (ml_models == ["all_cls"]) or set(ml_models) == wanted:
 
             base_models = _fit_base_classifiers(
@@ -1422,7 +1463,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
 
     # --- If meta model (all 5 regressors selected) ---
     if use_meta_model:
-        model_names_for_meta = ["forest", "xgboost", "lightgbm", "lstm", "transformer"]
+        model_names_for_meta = ["forest", "xgboost", "lightgbm", "lstm", "transformer", "catboost"]
         N = len(df)
         start_idx = max(seq_len+1, 70)
         preds_dict = {name:[] for name in model_names_for_meta}
@@ -1443,12 +1484,31 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
             preds_dict["forest"].append(rf_pred)
             # XGBOOST
             try:
-                xgb_model_meta = xgb.XGBRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                xgb_model_meta = xgb.XGBRegressor(
+                    n_estimators=114, 
+                    max_depth=9, 
+                    learning_rate=0.14264252588219034,
+                    subsample=0.5524803023252148,
+                    colsample_bytree=0.7687841723045249,
+                    gamma=0.5856035407199236,
+                    reg_alpha=0.5063880221467401,
+                    reg_lambda=0.0728996118523866,
+                )
                 xgb_model_meta.fit(local_X, local_y)
                 xgb_pred = xgb_model_meta.predict(X_pred_row)[0]
             except:
                 xgb_pred = np.nan
             preds_dict["xgboost"].append(xgb_pred)
+            try:
+                cb_model_meta = CatBoostRegressor(iterations=600, depth=6, learning_rate=0.05,
+                                                l2_leaf_reg=3, bagging_temperature=0.5,
+                                                loss_function="RMSE", eval_metric="RMSE",
+                                                random_seed=RANDOM_SEED, verbose=False)
+                cb_model_meta.fit(local_X, local_y)
+                cb_pred = cb_model_meta.predict(X_pred_row)[0]
+            except:
+                cb_pred = np.nan
+            preds_dict["catboost"].append(cb_pred)
             # LIGHTGBM
             try:
                 lgbm_model_meta = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
@@ -1512,6 +1572,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
             y_true.append(y.iloc[i])
         preds_arr = np.vstack([preds_dict["forest"],
                                preds_dict["xgboost"],
+                               preds_dict["catboost"],
                                preds_dict["lightgbm"],
                                preds_dict["lstm"],
                                preds_dict["transformer"]]).T
@@ -1573,6 +1634,16 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         xgb_pred = xgb_model.predict(last_row_df)[0]
         out_preds.append(xgb_pred)
         out_names.append("xgb_pred")
+
+    if "catboost" or "cb" in ml_models:
+        cb_model = CatBoostRegressor(iterations=600, depth=6, learning_rate=0.05,
+                                                l2_leaf_reg=3, bagging_temperature=0.5,
+                                                loss_function="RMSE", eval_metric="RMSE",
+                                                random_seed=RANDOM_SEED, verbose=False)
+        cb_model.fit(X, y)
+        cb_pred = cb_model.predict(last_row_df)[0]
+        out_preds.append(cb_pred)
+        out_names.append("cb_pred")
 
     if "lightgbm" in ml_models or "lgbm" in ml_models:
         lgbm_model = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
@@ -1886,7 +1957,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
     # 2. ML-ranking branch (unchanged from original)
     # ────────────────────────────────────────────────────────────────────
     ml_models      = get_ml_models_for_ticker(for_selection=True)
-    classifier_set = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls"}
+    classifier_set = {"forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls", "catboost_cls"}
     results: list[tuple[float, str]] = []
 
     for tck in tickers:
@@ -2346,7 +2417,7 @@ def trade_logic(current_price: float, predicted_price: float, ticker: str):
         ml_models = get_ml_models_for_ticker(ticker)
         classifier_stack = {"forest_cls", "xgboost_cls", "lightgbm_cls",
                             "transformer_cls", "sub-vote", "sub_meta",
-                            "sub-meta", "sub_vote"}
+                            "sub-meta", "sub_vote", "catboost_cls"}
         logic_dir, _ = get_logic_dir_and_json()
 
         # ─── choose module ───────────────────────────────────────────────────
@@ -2432,13 +2503,6 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
             except Exception as e:
                 logging.error(f"[{ticker}] Error saving CSV: {e}")
                 continue
-
-            if NEWS_MODE == "on":
-                df = merge_sentiment_from_csv(df, ticker)
-                df.to_csv(csv_filename, index=False)
-                logging.info(f"[{ticker}] Updated candle CSV with merged sentiment & features, minus disabled.")
-            else:
-                logging.info(f"[{ticker}] NEWS_MODE=off, skipping sentiment merge.")
         else:
             logging.info(f"[{ticker}] skip_data=True. Using existing CSV {csv_filename} for trade job.")
             if not os.path.exists(csv_filename):
@@ -2725,7 +2789,7 @@ def console_listener():
                     ml_models = get_ml_models_for_ticker(BACKTEST_TICKER)
                     if {"forest_cls", "xgboost_cls", "lightgbm_cls",
                     "transformer_cls", "sub-vote", "sub_meta",
-                    "sub-meta", "sub_vote"} & set(ml_models):
+                    "sub-meta", "sub_vote", "catboost_cls"} & set(ml_models):
                         logic_module_name = "classifier"
                     else:
                         logic_module_name = _get_logic_script_name(TRADE_LOGIC)
@@ -2738,7 +2802,7 @@ def console_listener():
                         continue
 
                     classifier_names = {"forest_cls", "xgboost_cls",
-                                        "lightgbm_cls"}
+                                        "lightgbm_cls", "catboost_cls"}
 
                     if classifier_names & set(ml_models):
                         logic_num_str = ",".join(ml_models)
@@ -2749,468 +2813,470 @@ def console_listener():
                         results_dir   = os.path.join("results", logic_num_str)
 
                     os.makedirs(results_dir, exist_ok=True)
+                    tf_code = timeframe_to_code(timeframe_for_backtest)
+                    csv_filename = os.path.join(DATA_DIR, f"{BACKTEST_TICKER}_{tf_code}.csv")
+                    if skip_data:
+                        logging.info(f"[{BACKTEST_TICKER}] backtest -r: using existing CSV {BACKTEST_TICKER}")
+                        if not os.path.exists(csv_filename):
+                            logging.error(f"[{BACKTEST_TICKER}] CSV file {csv_filename} does not exist, skipping.")
+                            continue
+                        df = read_csv_limited(csv_filename)
+                        if df.empty:
+                            logging.error(f"[{BACKTEST_TICKER}] CSV is empty, skipping.")
+                            continue
+                    else:
+                        df = fetch_candles_plus_features_and_predclose(
+                            BACKTEST_TICKER,
+                            bars=N_BARS,
+                            timeframe=BAR_TIMEFRAME,
+                            rewrite_mode=REWRITE
+                        )
+                        df.to_csv(csv_filename, index=False)
+                        logging.info(f"[{BACKTEST_TICKER}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
 
+                    allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+                    df = df.loc[:, [col for col in df.columns if col in allowed]]
 
-                    for ticker in BACKTEST_TICKER:
-                        tf_code = timeframe_to_code(timeframe_for_backtest)
-                        csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
-                        if skip_data:
-                            logging.info(f"[{ticker}] backtest -r: using existing CSV {csv_filename}")
-                            if not os.path.exists(csv_filename):
-                                logging.error(f"[{ticker}] CSV file {csv_filename} does not exist, skipping.")
-                                continue
-                            df = read_csv_limited(csv_filename)
-                            if df.empty:
-                                logging.error(f"[{ticker}] CSV is empty, skipping.")
-                                continue
+                    if 'close' not in df.columns:
+                        logging.error(f"[{BACKTEST_TICKER}] No 'close' column after feature processing. Cannot backtest.")
+                        continue
+                    df['target'] = df['close'].shift(-1)
+                    df.dropna(subset=['target'], inplace=True)
+                    if len(df) <= test_size + 1:
+                        logging.error(f"[{BACKTEST_TICKER}] Not enough rows for backtest split. Need more data than test_size.")
+                        continue
+
+                    total_len = len(df)
+                    train_end = total_len - test_size
+                    if train_end < 1:
+                        logging.error(f"[{BACKTEST_TICKER}] train_end < 1. Not enough data for that test_size.")
+                        continue
+
+                    predictions = []
+                    actuals = []
+                    timestamps = []
+                    trade_records = []
+                    portfolio_records = []
+                    start_balance = 10000.0
+                    cash = start_balance
+                    position_qty = 0
+                    avg_entry_price = 0.0
+
+                    def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
+                        trade_records.append({
+                            "timestamp": tstamp,
+                            "action": action,
+                            "shares": shares,
+                            "current_price": curr_price,
+                            "predicted_price": pred_price,
+                            "profit_loss": pl
+                        })
+
+                    def get_portfolio_value(pos_qty, csh, c_price, avg_price):
+                        if pos_qty > 0:
+                            return csh + (c_price - avg_price) * pos_qty
+                        elif pos_qty < 0:
+                            return csh + (avg_price - c_price) * abs(pos_qty)
                         else:
-                            df = fetch_candles_plus_features_and_predclose(
-                                ticker,
-                                bars=N_BARS,
-                                timeframe=BAR_TIMEFRAME,
-                                rewrite_mode=REWRITE
-                            )
-                            df.to_csv(csv_filename, index=False)
-                            logging.info(f"[{ticker}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
+                            return csh
 
-                        allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
-                        df = df.loc[:, [col for col in df.columns if col in allowed]]
+                    if approach in ["simple", "complex"]:
+                        ml_models = get_ml_models_for_ticker(BACKTEST_TICKER)
+                        if approach == "simple":
+                            train_df = df.iloc[:train_end]
+                            test_df  = df.iloc[train_end:]
+                            idx_list = list(test_df.index)
 
-                        if 'close' not in df.columns:
-                            logging.error(f"[{ticker}] No 'close' column after feature processing. Cannot backtest.")
-                            continue
-                        df['target'] = df['close'].shift(-1)
-                        df.dropna(subset=['target'], inplace=True)
-                        if len(df) <= test_size + 1:
-                            logging.error(f"[{ticker}] Not enough rows for backtest split. Need more data than test_size.")
-                            continue
+                            feature_cols = [c for c in POSSIBLE_FEATURE_COLS if c in train_df.columns]
+                            X_train = train_df[feature_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                            y_train = train_df['target']
 
-                        total_len = len(df)
-                        train_end = total_len - test_size
-                        if train_end < 1:
-                            logging.error(f"[{ticker}] train_end < 1. Not enough data for that test_size.")
-                            continue
-
-                        predictions = []
-                        actuals = []
-                        timestamps = []
-                        trade_records = []
-                        portfolio_records = []
-                        start_balance = 10000.0
-                        cash = start_balance
-                        position_qty = 0
-                        avg_entry_price = 0.0
-
-                        def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
-                            trade_records.append({
-                                "timestamp": tstamp,
-                                "action": action,
-                                "shares": shares,
-                                "current_price": curr_price,
-                                "predicted_price": pred_price,
-                                "profit_loss": pl
-                            })
-
-                        def get_portfolio_value(pos_qty, csh, c_price, avg_price):
-                            if pos_qty > 0:
-                                return csh + (c_price - avg_price) * pos_qty
-                            elif pos_qty < 0:
-                                return csh + (avg_price - c_price) * abs(pos_qty)
-                            else:
-                                return csh
-
-                        if approach in ["simple", "complex"]:
-                            ml_models = get_ml_models_for_ticker(ticker)
-                            if approach == "simple":
-                                train_df = df.iloc[:train_end]
-                                test_df  = df.iloc[train_end:]
-                                idx_list = list(test_df.index)
-
-                                feature_cols = [c for c in POSSIBLE_FEATURE_COLS if c in train_df.columns]
-                                X_train = train_df[feature_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-                                y_train = train_df['target']
-
-                                model_stack = []
-                                for m in ml_models:
-                                    if m in ["forest", "rf", "randomforest"]:
-                                        mdl = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                                    elif m == "xgboost":
-                                        mdl = xgb.XGBRegressor(
-                                            n_estimators=114, 
-                                            max_depth=9, 
-                                            learning_rate=0.14264252588219034,
-                                            subsample=0.5524803023252148,
-                                            colsample_bytree=0.7687841723045249,
-                                            gamma=0.5856035407199236,
-                                            reg_alpha=0.5063880221467401,
-                                            reg_lambda=0.0728996118523866,
-                                        )
-                                    elif m in ["lightgbm", "lgbm"]:
-                                        mdl = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                                    else:
-                                        continue
-                                    mdl.fit(X_train, y_train)
-                                    model_stack.append(mdl)
-
-                                if not model_stack:
-                                    logging.error(f"[{ticker}] No supported model for simple backtest.")
+                            model_stack = []
+                            for m in ml_models:
+                                if m in ["forest", "rf", "randomforest"]:
+                                    mdl = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                                elif m == "xgboost":
+                                    mdl = xgb.XGBRegressor(
+                                        n_estimators=114, 
+                                        max_depth=9, 
+                                        learning_rate=0.14264252588219034,
+                                        subsample=0.5524803023252148,
+                                        colsample_bytree=0.7687841723045249,
+                                        gamma=0.5856035407199236,
+                                        reg_alpha=0.5063880221467401,
+                                        reg_lambda=0.0728996118523866,
+                                    )
+                                elif m == "catboost":
+                                    mdl = CatBoostRegressor(iterations=600, depth=6, learning_rate=0.05,
+                                                            l2_leaf_reg=3, bagging_temperature=0.5,
+                                                            loss_function="RMSE", eval_metric="RMSE",
+                                                            random_seed=42, verbose=False)
+                                elif m in ["lightgbm", "lgbm"]:
+                                    mdl = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
+                                else:
                                     continue
-                            else: # complex
-                                idx_list = list(range(train_end, total_len))               
-                            if len(df.iloc[:train_end]) < 70:
-                                logging.error(f"[{ticker}] Not enough training rows for {approach} approach.")
+                                mdl.fit(X_train, y_train)
+                                model_stack.append(mdl)
+
+                            if not model_stack:
+                                logging.error(f"[{BACKTEST_TICKER}] No supported model for simple backtest.")
                                 continue
-                            if "sub-vote" in ml_models or "sub-meta" in ml_models:
-                                mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-                                signal_df  = call_sub_main(mode, df, execution="backtest")
+                        else: # complex
+                            idx_list = list(range(train_end, total_len))               
+                        if len(df.iloc[:train_end]) < 70:
+                            logging.error(f"[{BACKTEST_TICKER}] Not enough training rows for {approach} approach.")
+                            continue
+                        if "sub-vote" in ml_models or "sub-meta" in ml_models:
+                            mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
+                            signal_df  = call_sub_main(mode, df, execution="backtest")
 
-                                # --- keep only actionable rows and order chronologically ---------------
-                                trade_actions = (
-                                    signal_df[signal_df["action"].isin(["BUY", "SELL"])]
-                                    .copy()
-                                    .sort_values("timestamp")
-                                    .reset_index(drop=True)
-                                )
+                            # --- keep only actionable rows and order chronologically ---------------
+                            trade_actions = (
+                                signal_df[signal_df["action"].isin(["BUY", "SELL"])]
+                                .copy()
+                                .sort_values("timestamp")
+                                .reset_index(drop=True)
+                            )
 
-                                # -----------------------------------------------------------------------
-                                #  Portfolio state variables
-                                # -----------------------------------------------------------------------
-                                trade_records      = []
-                                portfolio_records  = []
-                                predictions        = []
-                                actuals            = []
-                                timestamps         = []
+                            # -----------------------------------------------------------------------
+                            #  Portfolio state variables
+                            # -----------------------------------------------------------------------
+                            trade_records      = []
+                            portfolio_records  = []
+                            predictions        = []
+                            actuals            = []
+                            timestamps         = []
 
-                                START_BALANCE      = 10_000.0
-                                cash               = START_BALANCE
-                                position_qty       = 0
-                                avg_entry_price    = 0.0
+                            START_BALANCE      = 10_000.0
+                            cash               = START_BALANCE
+                            position_qty       = 0
+                            avg_entry_price    = 0.0
 
-                                # convenience -----------------------------------------------------------
-                                def record_trade(act, ts, qty, px, pl=None):
-                                    trade_records.append({
-                                        "timestamp"     : ts,
-                                        "action"        : act,
-                                        "shares"        : qty,
-                                        "current_price" : px,
-                                        "profit_loss"   : pl
-                                    })
+                            # convenience -----------------------------------------------------------
+                            def record_trade(act, ts, qty, px, pl=None):
+                                trade_records.append({
+                                    "timestamp"     : ts,
+                                    "action"        : act,
+                                    "shares"        : qty,
+                                    "current_price" : px,
+                                    "profit_loss"   : pl
+                                })
 
-                                # timestamp alignment ---------------------------------------------------
-                                df['timestamp']           = pd.to_datetime(df['timestamp'])
-                                trade_actions['timestamp'] = pd.to_datetime(trade_actions['timestamp'])
+                            # timestamp alignment ---------------------------------------------------
+                            df['timestamp']           = pd.to_datetime(df['timestamp'])
+                            trade_actions['timestamp'] = pd.to_datetime(trade_actions['timestamp'])
 
-                                df_sorted          = df.sort_values('timestamp').reset_index(drop=True)
-                                actions_sorted     = trade_actions.sort_values('timestamp').reset_index(drop=True)
+                            df_sorted          = df.sort_values('timestamp').reset_index(drop=True)
+                            actions_sorted     = trade_actions.sort_values('timestamp').reset_index(drop=True)
 
-                                merged_actions = pd.merge_asof(
-                                    actions_sorted,
-                                    df_sorted,
-                                    on='timestamp',
-                                    direction='backward'
-                                )
+                            merged_actions = pd.merge_asof(
+                                actions_sorted,
+                                df_sorted,
+                                on='timestamp',
+                                direction='backward'
+                            )
 
-                                # -----------------------------------------------------------------------
-                                #  Iterate over each (action, candle) row – enforce position sanity
-                                # -----------------------------------------------------------------------
-                                for _, row in merged_actions.iterrows():
-                                    raw_act = row["action"]
-                                    ts      = row["timestamp"]
-                                    price   = row["close"]
+                            # -----------------------------------------------------------------------
+                            #  Iterate over each (action, candle) row – enforce position sanity
+                            # -----------------------------------------------------------------------
+                            for _, row in merged_actions.iterrows():
+                                raw_act = row["action"]
+                                ts      = row["timestamp"]
+                                price   = row["close"]
 
-                                    if raw_act == "BUY":
-                                        # If already long, ignore duplicate BUY
-                                        if position_qty > 0:
-                                            raw_act = "NONE"
-                                        # If short, COVER first
-                                        elif position_qty < 0:
-                                            pl = (avg_entry_price - price) * abs(position_qty)
-                                            cash += pl
-                                            record_trade("COVER", ts, abs(position_qty), price, pl)
-                                            position_qty    = 0
-                                            avg_entry_price = 0.0
-
-                                    elif raw_act == "SELL":
-                                        if position_qty <= 0:
-                                            raw_act = "NONE"
-
-                                    # ------------------------------------------------ execute action ---
-                                    if raw_act == "BUY":
-                                        shares_to_buy = int(cash // price)
-                                        if shares_to_buy > 0:
-                                            position_qty    = shares_to_buy
-                                            avg_entry_price = price
-                                            record_trade("BUY", ts, shares_to_buy, price)
-
-                                    elif raw_act == "SELL":
-                                        pl   = (price - avg_entry_price) * position_qty
+                                if raw_act == "BUY":
+                                    # If already long, ignore duplicate BUY
+                                    if position_qty > 0:
+                                        raw_act = "NONE"
+                                    # If short, COVER first
+                                    elif position_qty < 0:
+                                        pl = (avg_entry_price - price) * abs(position_qty)
                                         cash += pl
-                                        record_trade("SELL", ts, position_qty, price, pl)
+                                        record_trade("COVER", ts, abs(position_qty), price, pl)
                                         position_qty    = 0
                                         avg_entry_price = 0.0
 
-                                    # ------------------------------------------------ portfolio value --
-                                    port_val = (
-                                        cash
-                                        + (price - avg_entry_price) * position_qty
-                                        if position_qty != 0 else cash
-                                    )
-                                    portfolio_records.append({"timestamp": ts, "portfolio_value": port_val})
+                                elif raw_act == "SELL":
+                                    if position_qty <= 0:
+                                        raw_act = "NONE"
 
-                                # -----------------------------------------------------------------------
-                                #  Ensure results directory exists (unchanged)
-                                # -----------------------------------------------------------------------
-                                results_dir = os.path.join("sub", "sub-results")
-                                os.makedirs(results_dir, exist_ok=True)
+                                # ------------------------------------------------ execute action ---
+                                if raw_act == "BUY":
+                                    shares_to_buy = int(cash // price)
+                                    if shares_to_buy > 0:
+                                        position_qty    = shares_to_buy
+                                        avg_entry_price = price
+                                        record_trade("BUY", ts, shares_to_buy, price)
 
+                                elif raw_act == "SELL":
+                                    pl   = (price - avg_entry_price) * position_qty
+                                    cash += pl
+                                    record_trade("SELL", ts, position_qty, price, pl)
+                                    position_qty    = 0
+                                    avg_entry_price = 0.0
 
-                            # ----------- ALL OTHER ML MODES -----------------------------------
-                            else:
-                                ROLL_WIN = test_size
+                                # ------------------------------------------------ portfolio value --
+                                port_val = (
+                                    cash
+                                    + (price - avg_entry_price) * position_qty
+                                    if position_qty != 0 else cash
+                                )
+                                portfolio_records.append({"timestamp": ts, "portfolio_value": port_val})
 
-                                for i_, row_idx in enumerate(idx_list):
-
-                                    if approach == "simple":
-                                        if row_idx == 0:
-                                            continue
-                                        feat_row = df.loc[row_idx - 1, feature_cols]
-                                        X_pred = pd.DataFrame([feat_row], columns=feature_cols)
-                                        X_pred = X_pred.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-                                        preds = [mdl.predict(X_pred)[0] for mdl in model_stack]
-                                        pred_close = float(np.mean(preds))
-                                    else:
-                                        sub_df = df.iloc[:row_idx]
-                                        pred_close = train_and_predict(sub_df, ticker=ticker)
-                                    row_data   = df.loc[row_idx]
-                                    real_close = row_data["close"]
-
-                                    # ───────────────────────────────────────────────────────────
-                                    # 2. Build the ROLLING candles slice handed to run_backtest
-                                    # ───────────────────────────────────────────────────────────
-                                    start_idx  = max(0, row_idx - ROLL_WIN + 1)      # never < 0
-                                    candles_bt = df.iloc[start_idx : row_idx + 1].copy()
-
-                                    # make sure the prediction column exists & is float-typed
-                                    if "predicted_close" not in candles_bt.columns:
-                                        candles_bt["predicted_close"] = np.nan
-                                    candles_bt["predicted_close"] = candles_bt["predicted_close"].astype(float)
-
-                                    # ensure pred_close is a scalar, then set it
-                                    if isinstance(pred_close, dict):
-                                        pred_close = list(pred_close.values())[-1]  # grab last value
-                                    pred_close = float(np.asarray(pred_close).flatten()[-1])
-                                    candles_bt.at[candles_bt.index[-1], "predicted_close"] = pred_close
+                            # -----------------------------------------------------------------------
+                            #  Ensure results directory exists (unchanged)
+                            # -----------------------------------------------------------------------
+                            results_dir = os.path.join("sub", "sub-results")
+                            os.makedirs(results_dir, exist_ok=True)
 
 
-                                    # ───────────────────────────────────────────────────────────
-                                    # 3. Call the user’s trading-logic module
-                                    # ───────────────────────────────────────────────────────────
-                                    action = logic_module.run_backtest(
-                                        current_price     = real_close,
-                                        predicted_price   = pred_close,
-                                        position_qty      = position_qty,
-                                        current_timestamp = row_data["timestamp"],
-                                        candles           = candles_bt,
-                                        ticker            = BACKTEST_TICKER
-                                    )
-
-                                    # ───────────────────────────────────────────────────────────
-                                    # 4. Log the prediction so RMSE/plots still work
-                                    # ───────────────────────────────────────────────────────────
-                                    predictions.append(pred_close)
-                                    actuals.append(real_close)
-                                    timestamps.append(row_data["timestamp"])
-
-                                    # ───────────────────────────────────────────────────────────
-                                    # 5. Trade-simulation block (unchanged)
-                                    # ───────────────────────────────────────────────────────────
-                                    if action == "BUY"   and position_qty > 0:  action = "NONE"
-                                    if action == "SHORT" and position_qty < 0:  action = "NONE"
-                                    if action == "SELL"  and position_qty <= 0: action = "NONE"
-                                    if action == "COVER" and position_qty >= 0: action = "NONE"
-
-                                    if action == "BUY":
-                                        if position_qty < 0:
-                                            pl = (avg_entry_price - real_close) * abs(position_qty)
-                                            cash += pl
-                                            record_trade("COVER", row_data["timestamp"],
-                                                        abs(position_qty), real_close,
-                                                        pred_close, pl)
-                                            position_qty   = 0
-                                            avg_entry_price = 0.0
-
-                                        shares_to_buy = int(cash // real_close)
-                                        if shares_to_buy > 0:
-                                            position_qty    = shares_to_buy
-                                            avg_entry_price = real_close
-                                            record_trade("BUY", row_data["timestamp"],
-                                                        shares_to_buy, real_close,
-                                                        pred_close, None)
-
-                                    elif action == "SELL":
-                                        if position_qty > 0:
-                                            pl = (real_close - avg_entry_price) * position_qty
-                                            cash += pl
-                                            record_trade("SELL", row_data["timestamp"],
-                                                        position_qty, real_close,
-                                                        pred_close, pl)
-                                            position_qty    = 0
-                                            avg_entry_price = 0.0
-
-                                    elif action == "SHORT":
-                                        if position_qty > 0:
-                                            pl = (real_close - avg_entry_price) * position_qty
-                                            cash += pl
-                                            record_trade("SELL", row_data["timestamp"],
-                                                        position_qty, real_close,
-                                                        pred_close, pl)
-                                            position_qty    = 0
-                                            avg_entry_price = 0.0
-
-                                        shares_to_short = int(cash // real_close)
-                                        if shares_to_short > 0:
-                                            position_qty    = -shares_to_short
-                                            avg_entry_price = real_close
-                                            record_trade("SHORT", row_data["timestamp"],
-                                                        shares_to_short, real_close,
-                                                        pred_close, None)
-
-                                    elif action == "COVER":
-                                        if position_qty < 0:
-                                            pl = (avg_entry_price - real_close) * abs(position_qty)
-                                            cash += pl
-                                            record_trade("COVER", row_data["timestamp"],
-                                                        abs(position_qty), real_close,
-                                                        pred_close, pl)
-                                            position_qty    = 0
-                                            avg_entry_price = 0.0
-
-                                    val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
-                                    portfolio_records.append(
-                                        {"timestamp": row_data["timestamp"], "portfolio_value": val}
-                                    )
-                            # ----------------- END inner loop ---------------------------------
-
+                        # ----------- ALL OTHER ML MODES -----------------------------------
                         else:
-                            logging.warning(
-                                f"[{ticker}] Unknown approach={approach}. Skipping backtest."
-                            )
-                            continue
+                            ROLL_WIN = test_size
 
-                        # ------------------------------------------------------------------
-                        #  ▸  RESULTS & METRICS  (skip RMSE/MAE when no regression preds)
-                        # ------------------------------------------------------------------
-                        collecting_regression = len(predictions) > 0
+                            for i_, row_idx in enumerate(idx_list):
 
-                        if collecting_regression:
-                            y_pred = np.array(predictions, dtype=float)
-                            y_test = np.array(actuals,      dtype=float)
+                                if approach == "simple":
+                                    if row_idx == 0:
+                                        continue
+                                    feat_row = df.loc[row_idx - 1, feature_cols]
+                                    X_pred = pd.DataFrame([feat_row], columns=feature_cols)
+                                    X_pred = X_pred.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                                    preds = [mdl.predict(X_pred)[0] for mdl in model_stack]
+                                    pred_close = float(np.mean(preds))
+                                else:
+                                    sub_df = df.iloc[:row_idx]
+                                    pred_close = train_and_predict(sub_df, ticker=BACKTEST_TICKER)
+                                row_data   = df.loc[row_idx]
+                                real_close = row_data["close"]
 
-                            rmse = math.sqrt(mean_squared_error(y_test, y_pred))
-                            mae  = mean_absolute_error(y_test, y_pred)
+                                # ───────────────────────────────────────────────────────────
+                                # 2. Build the ROLLING candles slice handed to run_backtest
+                                # ───────────────────────────────────────────────────────────
+                                start_idx  = max(0, row_idx - ROLL_WIN + 1)      # never < 0
+                                candles_bt = df.iloc[start_idx : row_idx + 1].copy()
 
-                            avg_close = y_test.mean() if len(y_test) else 1e-6
-                            accuracy  = 100.0 - (mae / avg_close * 100.0)
+                                # make sure the prediction column exists & is float-typed
+                                if "predicted_close" not in candles_bt.columns:
+                                    candles_bt["predicted_close"] = np.nan
+                                candles_bt["predicted_close"] = candles_bt["predicted_close"].astype(float)
 
-                            logging.info(
-                                f"[{ticker}] Backtest ({approach}) — "
-                                f"test_size={test_size}, "
-                                f"RMSE={rmse:.4f}, MAE={mae:.4f}, "
-                                f"Accuracy≈{accuracy:.2f}%"
-                            )
-                        else:
-                            logging.info(
-                                f"[{ticker}] Backtest ({approach}) — "
-                                "classification / signal mode "
-                                "(sub-vote / sub-meta) — RMSE/MAE not computed."
-                            )
+                                # ensure pred_close is a scalar, then set it
+                                if isinstance(pred_close, dict):
+                                    pred_close = list(pred_close.values())[-1]  # grab last value
+                                pred_close = float(np.asarray(pred_close).flatten()[-1])
+                                candles_bt.at[candles_bt.index[-1], "predicted_close"] = pred_close
 
-                        # ---------------- save artefacts ----------------
-                        tf_code       = timeframe_to_code(timeframe_for_backtest)
-                        results_dir   = os.path.join("results", logic_num_str)
-                        os.makedirs(results_dir, exist_ok=True)
 
-                        # ▸ prediction CSV & plot — only when we *have* predictions
-                        if collecting_regression:
-                            out_pred_csv = os.path.join(
-                                results_dir,
-                                f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.csv",
-                            )
-                            out_pred_png = os.path.join(
-                                results_dir,
-                                f"backtest_predictions_{ticker}_{test_size}_{tf_code}_{approach}.png",
-                            )
+                                # ───────────────────────────────────────────────────────────
+                                # 3. Call the user’s trading-logic module
+                                # ───────────────────────────────────────────────────────────
+                                action = logic_module.run_backtest(
+                                    current_price     = real_close,
+                                    predicted_price   = pred_close,
+                                    position_qty      = position_qty,
+                                    current_timestamp = row_data["timestamp"],
+                                    candles           = candles_bt,
+                                    ticker            = BACKTEST_TICKER
+                                )
 
-                            pd.DataFrame(
-                                {
-                                    "timestamp": timestamps,
-                                    "actual_close": actuals,
-                                    "predicted_close": predictions,
-                                }
-                            ).to_csv(out_pred_csv, index=False)
+                                # ───────────────────────────────────────────────────────────
+                                # 4. Log the prediction so RMSE/plots still work
+                                # ───────────────────────────────────────────────────────────
+                                predictions.append(pred_close)
+                                actuals.append(real_close)
+                                timestamps.append(row_data["timestamp"])
 
-                            plt.figure(figsize=(10, 6))
-                            plt.plot(timestamps, actuals,     label="Actual")
-                            plt.plot(timestamps, predictions, label="Predicted")
-                            plt.title(
-                                f"{ticker} Backtest ({approach} — last {test_size}) "
-                                f"[{timeframe_for_backtest}]"
-                            )
-                            plt.xlabel("Timestamp")
-                            plt.ylabel("Close Price")
-                            plt.legend()
-                            plt.grid(True)
-                            if test_size > 30:
-                                plt.xticks(rotation=45)
-                            plt.tight_layout()
-                            plt.savefig(out_pred_png)
-                            plt.close()
+                                # ───────────────────────────────────────────────────────────
+                                # 5. Trade-simulation block (unchanged)
+                                # ───────────────────────────────────────────────────────────
+                                if action == "BUY"   and position_qty > 0:  action = "NONE"
+                                if action == "SHORT" and position_qty < 0:  action = "NONE"
+                                if action == "SELL"  and position_qty <= 0: action = "NONE"
+                                if action == "COVER" and position_qty >= 0: action = "NONE"
 
-                            logging.info(f"[{ticker}] Saved predictions → {out_pred_csv}")
-                            logging.info(f"[{ticker}] Saved prediction plot → {out_pred_png}")
+                                if action == "BUY":
+                                    if position_qty < 0:
+                                        pl = (avg_entry_price - real_close) * abs(position_qty)
+                                        cash += pl
+                                        record_trade("COVER", row_data["timestamp"],
+                                                    abs(position_qty), real_close,
+                                                    pred_close, pl)
+                                        position_qty   = 0
+                                        avg_entry_price = 0.0
 
-                        # ▸ trade log & portfolio series (always saved)
-                        trade_log_csv = os.path.join(
-                            results_dir,
-                            f"backtest_trades_{ticker}_{test_size}_{tf_code}_{approach}.csv",
+                                    shares_to_buy = int(cash // real_close)
+                                    if shares_to_buy > 0:
+                                        position_qty    = shares_to_buy
+                                        avg_entry_price = real_close
+                                        record_trade("BUY", row_data["timestamp"],
+                                                    shares_to_buy, real_close,
+                                                    pred_close, None)
+
+                                elif action == "SELL":
+                                    if position_qty > 0:
+                                        pl = (real_close - avg_entry_price) * position_qty
+                                        cash += pl
+                                        record_trade("SELL", row_data["timestamp"],
+                                                    position_qty, real_close,
+                                                    pred_close, pl)
+                                        position_qty    = 0
+                                        avg_entry_price = 0.0
+
+                                elif action == "SHORT":
+                                    if position_qty > 0:
+                                        pl = (real_close - avg_entry_price) * position_qty
+                                        cash += pl
+                                        record_trade("SELL", row_data["timestamp"],
+                                                    position_qty, real_close,
+                                                    pred_close, pl)
+                                        position_qty    = 0
+                                        avg_entry_price = 0.0
+
+                                    shares_to_short = int(cash // real_close)
+                                    if shares_to_short > 0:
+                                        position_qty    = -shares_to_short
+                                        avg_entry_price = real_close
+                                        record_trade("SHORT", row_data["timestamp"],
+                                                    shares_to_short, real_close,
+                                                    pred_close, None)
+
+                                elif action == "COVER":
+                                    if position_qty < 0:
+                                        pl = (avg_entry_price - real_close) * abs(position_qty)
+                                        cash += pl
+                                        record_trade("COVER", row_data["timestamp"],
+                                                    abs(position_qty), real_close,
+                                                    pred_close, pl)
+                                        position_qty    = 0
+                                        avg_entry_price = 0.0
+
+                                val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
+                                portfolio_records.append(
+                                    {"timestamp": row_data["timestamp"], "portfolio_value": val}
+                                )
+                        # ----------------- END inner loop ---------------------------------
+
+                    else:
+                        logging.warning(
+                            f"[{BACKTEST_TICKER}] Unknown approach={approach}. Skipping backtest."
                         )
-                        port_csv = os.path.join(
-                            results_dir,
-                            f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.csv",
+                        continue
+
+                    # ------------------------------------------------------------------
+                    #  ▸  RESULTS & METRICS  (skip RMSE/MAE when no regression preds)
+                    # ------------------------------------------------------------------
+                    collecting_regression = len(predictions) > 0
+
+                    if collecting_regression:
+                        y_pred = np.array(predictions, dtype=float)
+                        y_test = np.array(actuals,      dtype=float)
+
+                        rmse = math.sqrt(mean_squared_error(y_test, y_pred))
+                        mae  = mean_absolute_error(y_test, y_pred)
+
+                        avg_close = y_test.mean() if len(y_test) else 1e-6
+                        accuracy  = 100.0 - (mae / avg_close * 100.0)
+
+                        logging.info(
+                            f"[{BACKTEST_TICKER}] Backtest ({approach}) — "
+                            f"test_size={test_size}, "
+                            f"RMSE={rmse:.4f}, MAE={mae:.4f}, "
+                            f"Accuracy≈{accuracy:.2f}%"
                         )
-                        port_png = os.path.join(
-                            results_dir,
-                            f"backtest_portfolio_{ticker}_{test_size}_{tf_code}_{approach}.png",
+                    else:
+                        logging.info(
+                            f"[{BACKTEST_TICKER}] Backtest ({approach}) — "
+                            "classification / signal mode "
+                            "(sub-vote / sub-meta) — RMSE/MAE not computed."
                         )
 
-                        pd.DataFrame(trade_records).to_csv(trade_log_csv, index=False)
-                        pd.DataFrame(portfolio_records).to_csv(port_csv, index=False)
-                        logging.info(f"[{ticker}] Saved trades → {trade_log_csv}")
-                        logging.info(f"[{ticker}] Saved portfolio series → {port_csv}")
+                    # ---------------- save artefacts ----------------
+                    tf_code       = timeframe_to_code(timeframe_for_backtest)
+                    results_dir   = os.path.join("results", logic_num_str)
+                    os.makedirs(results_dir, exist_ok=True)
 
-                        # portfolio value plot (only if records exist)
-                        port_df = pd.DataFrame(portfolio_records)
-                        if not port_df.empty:
-                            plt.figure(figsize=(10, 6))
-                            plt.plot(
-                                port_df["timestamp"],
-                                port_df["portfolio_value"],
-                                label="Portfolio Value",
-                            )
-                            plt.title(
-                                f"{ticker} Portfolio Value Backtest ({approach})"
-                            )
-                            plt.xlabel("Timestamp")
-                            plt.ylabel("Portfolio Value (USD)")
-                            plt.legend()
-                            plt.grid(True)
-                            if test_size > 30:
-                                plt.xticks(rotation=45)
-                            plt.tight_layout()
-                            plt.savefig(port_png)
-                            plt.close()
+                    # ▸ prediction CSV & plot — only when we *have* predictions
+                    if collecting_regression:
+                        out_pred_csv = os.path.join(
+                            results_dir,
+                            f"backtest_predictions_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
+                        )
+                        out_pred_png = os.path.join(
+                            results_dir,
+                            f"backtest_predictions_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.png",
+                        )
 
-                            logging.info(f"[{ticker}] Saved portfolio plot → {port_png}")
+                        pd.DataFrame(
+                            {
+                                "timestamp": timestamps,
+                                "actual_close": actuals,
+                                "predicted_close": predictions,
+                            }
+                        ).to_csv(out_pred_csv, index=False)
+
+                        plt.figure(figsize=(10, 6))
+                        plt.plot(timestamps, actuals,     label="Actual")
+                        plt.plot(timestamps, predictions, label="Predicted")
+                        plt.title(
+                            f"{BACKTEST_TICKER} Backtest ({approach} — last {test_size}) "
+                            f"[{timeframe_for_backtest}]"
+                        )
+                        plt.xlabel("Timestamp")
+                        plt.ylabel("Close Price")
+                        plt.legend()
+                        plt.grid(True)
+                        if test_size > 30:
+                            plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        plt.savefig(out_pred_png)
+                        plt.close()
+
+                        logging.info(f"[{BACKTEST_TICKER}] Saved predictions → {out_pred_csv}")
+                        logging.info(f"[{BACKTEST_TICKER}] Saved prediction plot → {out_pred_png}")
+
+                    # ▸ trade log & portfolio series (always saved)
+                    trade_log_csv = os.path.join(
+                        results_dir,
+                        f"backtest_trades_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
+                    )
+                    port_csv = os.path.join(
+                        results_dir,
+                        f"backtest_portfolio_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
+                    )
+                    port_png = os.path.join(
+                        results_dir,
+                        f"backtest_portfolio_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.png",
+                    )
+
+                    pd.DataFrame(trade_records).to_csv(trade_log_csv, index=False)
+                    pd.DataFrame(portfolio_records).to_csv(port_csv, index=False)
+                    logging.info(f"[{BACKTEST_TICKER}] Saved trades → {trade_log_csv}")
+                    logging.info(f"[{BACKTEST_TICKER}] Saved portfolio series → {port_csv}")
+
+                    # portfolio value plot (only if records exist)
+                    port_df = pd.DataFrame(portfolio_records)
+                    if not port_df.empty:
+                        plt.figure(figsize=(10, 6))
+                        plt.plot(
+                            port_df["timestamp"],
+                            port_df["portfolio_value"],
+                            label="Portfolio Value",
+                        )
+                        plt.title(
+                            f"{BACKTEST_TICKER} Portfolio Value Backtest ({approach})"
+                        )
+                        plt.xlabel("Timestamp")
+                        plt.ylabel("Portfolio Value (USD)")
+                        plt.legend()
+                        plt.grid(True)
+                        if test_size > 30:
+                            plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        plt.savefig(port_png)
+                        plt.close()
+
+                        logging.info(f"[{BACKTEST_TICKER}] Saved portfolio plot → {port_png}")
 
         elif cmd == "get-best-tickers":
             n = 1
@@ -3229,7 +3295,6 @@ def console_listener():
             else:
                 logging.info("feature-importance: Will fetch fresh data for each ticker, then compute importance.")
 
-            for ticker in BACKTEST_TICKER:
                 tf_code  = timeframe_to_code(BAR_TIMEFRAME)
                 csv_file = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
 

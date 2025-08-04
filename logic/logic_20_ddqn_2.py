@@ -11,6 +11,9 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.optimizers import Adam
 
+agent = None
+STATE_SIZE = None
+
 # =============================================================================
 # Environment & Helper Functions
 # =============================================================================
@@ -64,10 +67,22 @@ def get_enabled_features():
 def get_csv_filename(ticker: str) -> str:
     return f"data/{ticker}_{CONVERTED_TIMEFRAME}.csv"
 
-def load_csv_data(ticker: str) -> pd.DataFrame:
+def load_csv_data(ticker: str, until_timestamp=None) -> pd.DataFrame:
     filename = get_csv_filename(ticker)
-    df = pd.read_csv(filename)
-    return df
+
+    # Always try to parse the `timestamp` column if it exists
+    try:
+        df = pd.read_csv(filename, parse_dates=["timestamp"])
+    except ValueError:
+        # No timestamp column – load raw
+        df = pd.read_csv(filename)
+
+    # Optional leakage-prevention filter
+    if until_timestamp is not None and "timestamp" in df.columns:
+        cutoff = pd.to_datetime(until_timestamp, utc=True)
+        df = df[df["timestamp"] <= cutoff]
+
+    return df.reset_index(drop=True)
 
 def filter_features(df: pd.DataFrame) -> pd.DataFrame:
     enabled = get_enabled_features()
@@ -168,59 +183,30 @@ class DDQNAgent:
 # Random Forest Model Integration
 # =============================================================================
 
-class RFPricePredictor:
-    def __init__(self):
-        self.model = RandomForestRegressor(n_estimators=100, random_state=42)
-        self.trained = False
 
-    def train(self, df: pd.DataFrame, target_column: str = 'close'):
-        # Use enabled features (numeric columns) as predictors
-        features = filter_features(df)
-        # Ensure consistency with training by using only numeric columns
-        if target_column not in df.columns:
-            return
-        X = features.values[:-1]   # all but the last row
-        y = df[target_column].values[1:]  # next period's close
-        if len(X) > 0 and len(y) > 0:
-            self.model.fit(X, y)
-            self.trained = True
+def init_models_if_needed(ticker: str, until_timestamp=None):
+    global agent, STATE_SIZE
 
-    def predict(self, X_features: np.ndarray) -> float:
-        if self.trained:
-            return self.model.predict(X_features)[0]
-        else:
-            # If not trained, return the first feature as a fallback
-            return X_features[0, 0]
+    if agent is not None:
+        return  # already initialised
 
-# =============================================================================
-# Global Agent & RF Predictor Initialization
-# =============================================================================
+    # Derive feature count using the realistic slice of history
+    try:
+        df = filter_features(load_csv_data(ticker, until_timestamp))
+        feature_count = df.shape[1]
+    except Exception:
+        feature_count = len(get_enabled_features())
 
-# Determine state_size based on:
-#   enabled features (from CSV) + predicted_price (1) + current_position (1)
-try:
-    sample_df = filter_features(load_csv_data(TICKERS[0]))
-    sample_feature_count = sample_df.shape[1]
-except Exception:
-    sample_feature_count = len(get_enabled_features())
-STATE_SIZE = sample_feature_count + 2  # + predicted_price and current_position
-ACTION_SIZE = len(ACTIONS)
-
-# Create global instances
-agent = DDQNAgent(state_size=STATE_SIZE, action_size=ACTION_SIZE)
-rf_predictor = RFPricePredictor()
-# Optionally, train the RF model using historical data from the first ticker:
-try:
-    df_rf = load_csv_data(TICKERS[0])
-    rf_predictor.train(df_rf)
-except Exception:
-    pass
+    STATE_SIZE = feature_count + 2  # extra slots for predicted_price & position
+    ACTION_SIZE = len(ACTIONS)
+    agent = DDQNAgent(state_size=STATE_SIZE, action_size=ACTION_SIZE)
 
 # =============================================================================
 # Core Functions
 # =============================================================================
 
 def run_logic(current_price: float, predicted_price: float, ticker: str):
+    init_models_if_needed(ticker)
     # Import live trading API and execution functions (assumed available)
     from forest import api, buy_shares, sell_shares, short_shares, close_short
 
@@ -244,14 +230,6 @@ def run_logic(current_price: float, predicted_price: float, ticker: str):
 
     # Build state: (CSV features from last row + predicted_price + current_position)
     state = get_state(df_filtered, predicted_price, position_qty)
-
-    # Update predicted_price using the RF model on raw numeric features
-    rf_features = df_filtered.iloc[-1].values.astype(float).reshape(1, -1)
-    rf_pred = rf_predictor.predict(rf_features)
-    combined_predicted_price = (predicted_price + rf_pred) / 2.0
-
-    # Update state with the combined prediction
-    state = get_state(df_filtered, combined_predicted_price, position_qty)
 
     # Agent selects an action (index)
     action_index = agent.act(state)
@@ -305,50 +283,47 @@ def run_logic(current_price: float, predicted_price: float, ticker: str):
     agent.replay()
     agent.update_target_model()
 
-def run_backtest(current_price: float, predicted_price: float, position_qty: float, current_timestamp, candles, ticker) -> str:
+def run_backtest(current_price: float,
+                 predicted_price: float,
+                 position_qty: float,
+                 current_timestamp,
+                 candles,   # kept for API compatibility
+                 ticker: str) -> str:
+    # Ensure networks are initialised on the same truncated data slice
+    init_models_if_needed(ticker, current_timestamp)
+
+    # Pull at most the last 500 records up to the cut-off time
     try:
-        df = load_csv_data(ticker)
-        # Only consider the last 500 candles for backtesting
-        df = df.tail(500)
-        df_filtered = filter_features(df)
+        df = load_csv_data(ticker, current_timestamp)
+        df_filtered = filter_features(df.tail(500))
     except Exception as e:
         print(f"Error loading CSV for backtest ticker {ticker}: {e}")
         return "NONE"
 
-    # Build state using provided position_qty
-    state = get_state(df_filtered, predicted_price, position_qty)
-    # Update predicted_price using RF on raw numeric features from the last row
-    rf_features = df_filtered.iloc[-1].values.astype(float).reshape(1, -1)
-    rf_pred = rf_predictor.predict(rf_features)
-    combined_predicted_price = (predicted_price + rf_pred) / 2.0
-    state = get_state(df_filtered, combined_predicted_price, position_qty)
+    if df_filtered.empty:
+        print(f"No historical data for {ticker} up to {current_timestamp}")
+        return "NONE"
 
+    # Assemble RL state
+    state = get_state(df_filtered, predicted_price, position_qty)
+
+    # Let the agent pick its action
     action_index = agent.act(state)
     action = ACTIONS[action_index]
 
-    # Avoid duplicate/back-to-back trades:
-    if action == "BUY" and position_qty >= 1:
+    # Guardrails to avoid duplicate / contradictory positions
+    if action == "BUY"  and position_qty >= 1:  
         return "NONE"
-    if action == "SHORT" and position_qty <= -1:
-        return "NONE"
-    if action == "SELL" and position_qty <= 0:
-        return "NONE"
-    if action == "COVER" and position_qty >= 0:
+    if action == "SELL" and position_qty <= 0:  
         return "NONE"
 
-    # Confidence threshold: require at least a 1% move in the proper direction
-    confidence_threshold = 0.01
-    if action == "BUY" and combined_predicted_price <= current_price * (1 + confidence_threshold):
-        return "NONE"
-    if action == "SELL" and combined_predicted_price >= current_price * (1 - confidence_threshold):
-        return "NONE"
-    if action == "SHORT" and combined_predicted_price >= current_price * (1 - confidence_threshold):
-        return "NONE"
-    if action == "COVER" and combined_predicted_price <= current_price * (1 + confidence_threshold):
-        return "NONE"
+    threshold = 0.01  # 1 %
 
-    return action
+    if action == "BUY":
+        return "BUY" if predicted_price >= current_price * (1 + threshold) else "NONE"
 
-# =============================================================================
-# End of logic.py
-# =============================================================================
+    if action == "SELL":
+        return "SELL" if predicted_price <= current_price * (1 - threshold) else "NONE"
+
+    # For SHORT, COVER, or anything else: do nothing
+    return "NONE"

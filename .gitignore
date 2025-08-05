@@ -3,8 +3,6 @@
 *logs
 *output
 /catboost_info
-/*.csv
-*.png
 /lib
 /lib64
 /bin

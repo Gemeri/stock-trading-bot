@@ -14,6 +14,7 @@ LOOKAHEAD_LIST = [3, 5, 8]
 ENABLE_INTRADAY = False
 SHORT_RATE = 0.2
 BUY_RATE = 0.2
+TRAIN_BACK_WINDOW = 800
 
 # Load training data
 df = load_and_engineer_features(f"../01-fetch/data/{STOCK_TICKER}_H1.csv")
@@ -48,12 +49,12 @@ df.dropna(inplace=True)  # Remove last row, which now has a NaN target
 predict_item_list:list[PredictItem] = []
 
 # Backtest from candle end-1200 to now -> 18mo circa
-for i in range(len(df)-800, len(df)-1):
+for i in range(len(df)-TRAIN_BACK_WINDOW, len(df)-1):
 
     print(f"Loading candles for {STOCK_TICKER} from {i-800} to {i}")
 
     # Train model on previous 12 months (approx. 800 candles)
-    train_data = df.iloc[i-800:i]
+    train_data = df.iloc[i-TRAIN_BACK_WINDOW:i]
     test_data = df.iloc[i:i+1]
     
     # Use simple features (you can expand)
@@ -98,17 +99,19 @@ for i in range(len(df)-800, len(df)-1):
         # we append to the list
         predicted_prices.append(model.predict(X_test)[0])
 
-    print("models trained")
-    
     current_price = test_data['close'].values[0]
 
     direction = stock_price_direction([0] + LOOKAHEAD_LIST, [current_price] + predicted_prices)
 
     # extract the date
     timestamp = pd.to_datetime(test_data["timestamp"].values[0])
+
+    item = PredictItem(timestamp, current_price, direction)
+
+    print(f"Item -> {item} / still to go: {len(df)-1-i}")
     
     # populate the working dataset
-    predict_item_list.append(PredictItem(timestamp, current_price, direction))
+    predict_item_list.append(item)
                            
 print("#### Prediction phase completed")
 

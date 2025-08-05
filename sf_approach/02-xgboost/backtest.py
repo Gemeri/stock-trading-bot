@@ -37,7 +37,7 @@ def run_backtest(
                 shares_to_cover = int(min(shares_to_cover, abs(position)))  # clip to max available
 
                 if shares_to_cover > 0:
-                    print(f"** MARGIN CALL: partially covering {shares_to_cover} shares at {current_price} = {shares_to_cover * current_price}")
+                    #print(f"** MARGIN CALL: partially covering {shares_to_cover} shares at {current_price} = {shares_to_cover * current_price}")
                     cash -= shares_to_cover * current_price
                     cash_short -= shares_to_cover * current_price
                     position += shares_to_cover  # reduce negative short position
@@ -47,7 +47,7 @@ def run_backtest(
 
         # Skip if a trade was already made today (simulate T+1 rule)
         if not enable_intraday and current_date == last_trade_date:
-            print(f"Skipping trade because last_trade_date = {last_trade_date}")
+            #print(f"Skipping trade because last_trade_date = {last_trade_date}")
             portfolio_value = cash + position * current_price
             continue
 
@@ -66,7 +66,7 @@ def run_backtest(
                 num_shares = to_invest // current_price
                 if num_shares > 0:
 
-                    print(f"** BOUGHT {num_shares} at {current_price} = {num_shares * current_price}")
+                    #print(f"** BOUGHT {num_shares} at {current_price} = {num_shares * current_price}")
                     cash -= num_shares * current_price
                     position += num_shares
                     entry_price = current_price
@@ -98,7 +98,7 @@ def run_backtest(
                 num_shorts = min(want_short_shares, shortable_shares_max)
                 if num_shorts > 0:
 
-                    print(f"** SHORTING {num_shorts} at {current_price} = {num_shorts * current_price}")
+                    #print(f"** SHORTING {num_shorts} at {current_price} = {num_shorts * current_price}")
                     cash += num_shorts * current_price
                     cash_short += num_shorts * current_price
 
@@ -108,7 +108,7 @@ def run_backtest(
         # Track portfolio value
         portfolio_value = cash + position * current_price
 
-        print(f"-> current position: {position} / portfolio_value {portfolio_value}")
+        #print(f"-> current position: {position} / portfolio_value {portfolio_value}")
 
         ret_list.append(BacktestItem(
             timestamp=item.timestamp,

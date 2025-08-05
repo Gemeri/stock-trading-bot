@@ -74,6 +74,10 @@ SENTIMENT_OFFSET_MINUTES= int(os.getenv("SENTIMENT_OFFSET_MINUTES", "20"))
 BACKTEST_TICKER =  os.getenv("BACKTEST_TICKER", "TSLA")
 DISABLE_PRED_CLOSE = os.getenv("DISABLE_PRED_CLOSE", "True")
 
+_raw = os.getenv("STATIC_TICKERS", "")
+STATIC_TICKERS = {t.strip().upper()
+                  for t in _raw.split(",") 
+                  if t.strip()}      
 BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
 N_BARS        = int(os.getenv("N_BARS", "5000"))
 ROLLING_CANDLES = int(os.getenv("ROLLING_CANDLES", "0"))
@@ -1876,7 +1880,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
     # ────────────────────────────────────────────────────────────────────
     # 1. Trade-logic branch ─ use run_backtest for scoring
     # ────────────────────────────────────────────────────────────────────
-    if SELECTION_MODEL.endswith('.py'):
+    if SELECTION_MODEL and SELECTION_MODEL.endswith('.py'):
         # Dynamically load the trade-logic module (from module path or file)
         try:
             logic_module = importlib.import_module(SELECTION_MODEL)
@@ -2103,6 +2107,11 @@ def send_discord_order_message(action, ticker, price, predicted_price, extra_inf
 
 def buy_shares(ticker, qty, buy_price, predicted_price):
     logging.info("BUY: %s", ticker)
+    
+    if ticker.upper() in STATIC_TICKERS:
+        logging.info("Ticker %s is in STATIC_TICKERS. Skipping...", ticker)
+        return
+    
     if qty <= 0:
         return
     try:
@@ -2185,6 +2194,9 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
 
 def sell_shares(ticker, qty, sell_price, predicted_price):
     logging.info("SELL: %s", ticker)
+    if ticker.upper() in STATIC_TICKERS:
+        logging.info("Ticker %s is in STATIC_TICKERS. Skipping...", ticker)
+        return
     if qty <= 0:
         return
     try:
@@ -2241,6 +2253,11 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
 
 def short_shares(ticker, qty, short_price, predicted_price):
     logging.info("SHORT: %s", ticker)
+
+    if ticker.upper() in STATIC_TICKERS:
+        logging.info("Ticker %s is in STATIC_TICKERS. Skipping...", ticker)
+        return
+    
     if qty <= 0:
         return
     try:
@@ -2321,6 +2338,11 @@ def close_short(ticker, qty, cover_price):
     logging.info("COVER: %s", ticker)
     if qty <= 0:
         return
+    
+    if ticker.upper() in STATIC_TICKERS:
+        logging.info("Ticker %s is in STATIC_TICKERS. Skipping...", ticker)
+        return
+
     try:
         pos = None
         try:

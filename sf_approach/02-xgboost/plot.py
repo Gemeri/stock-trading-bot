@@ -3,6 +3,7 @@ from data import BacktestItem
 import matplotlib.pyplot as plt
 from dataclasses import asdict
 from datetime import datetime
+import matplotlib.dates as mdates
 
 
 def plot_and_save(stock_ticker:str, backtest_list:list[BacktestItem], threshold:int)->str:
@@ -54,7 +55,6 @@ def plot_and_save(stock_ticker:str, backtest_list:list[BacktestItem], threshold:
     ax3.tick_params(axis='y', labelcolor='red')
 
     # 🏷️ Format X-axis as dates
-    import matplotlib.dates as mdates
     ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
     fig.autofmt_xdate()

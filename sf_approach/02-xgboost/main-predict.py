@@ -5,16 +5,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from linear import stock_price_direction
 from data import PredictItem
-from backtest import run_backtest
-from plot import plot_and_save
+from utils import to_df
 
 from utils import load_and_engineer_features
 
 STOCK_TICKER = "AAPL"
 LOOKAHEAD_LIST = [3, 5, 8]
 ENABLE_INTRADAY = False
-MIN_ACTION_THRESHOLD = 5
-MAX_ACTION_THRESHOLD = 20
 SHORT_RATE = 0.2
 BUY_RATE = 0.2
 
@@ -115,15 +112,8 @@ for i in range(len(df)-800, len(df)-1):
                            
 print("#### Prediction phase completed")
 
-for action_threshold in range(MIN_ACTION_THRESHOLD, MAX_ACTION_THRESHOLD + 1):
-    
-    print(f"Trying threshold: {action_threshold}")
-    backtest_list = run_backtest(predict_item_list, action_threshold)
-    
-    latest_balance = backtest_list[-1].portfolio_value
+df = to_df(predict_item_list)
 
-    print(f"---> Balance: f{latest_balance}")
+df.to_csv(f"pred/predict-data-{STOCK_TICKER}.csv", index=True)
 
-    plot_and_save(STOCK_TICKER, backtest_list, action_threshold)
-
-print("ALL DONE")
+print("#### Prediction file saved")

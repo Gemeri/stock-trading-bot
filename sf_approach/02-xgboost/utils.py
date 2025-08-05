@@ -1,4 +1,6 @@
 import pandas as pd
+from data import PredictItem
+from dataclasses import asdict
 
 def load_and_engineer_features(filepath: str) -> pd.DataFrame:
     """
@@ -36,3 +38,17 @@ def load_and_engineer_features(filepath: str) -> pd.DataFrame:
     df.dropna(inplace=True)
 
     return df
+
+def load_predictions(filepath:str) -> list[PredictItem]:
+
+    # Load data
+    df = pd.read_csv(filepath)
+
+    return [PredictItem(**row) for row in df.to_dict(orient="records")]
+
+
+def to_df(item_list:list) -> pd.DataFrame:
+
+    dicts = [asdict(item) for item in item_list]
+    
+    return pd.DataFrame(dicts)

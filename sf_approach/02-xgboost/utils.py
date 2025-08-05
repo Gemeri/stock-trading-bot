@@ -42,7 +42,7 @@ def load_and_engineer_features(filepath: str) -> pd.DataFrame:
 def load_predictions(filepath:str) -> list[PredictItem]:
 
     # Load data
-    df = pd.read_csv(filepath)
+    df = pd.read_csv(filepath, index_col=0, parse_dates=["timestamp"])
 
     return [PredictItem(**row) for row in df.to_dict(orient="records")]
 

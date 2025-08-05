@@ -2,6 +2,8 @@ from backtest import run_backtest
 from plot import plot_and_save
 from utils import load_predictions
 
+import numpy as np
+
 
 STOCK_TICKER = "AAPL"
 
@@ -9,10 +11,10 @@ MIN_ACTION_THRESHOLD = 5
 MAX_ACTION_THRESHOLD = 20
 
 MIN_BUY_RATE = 0.1
-MAX_BUY_RATE = 0.3
+MAX_BUY_RATE = 1
 
 MIN_SHORT_RATE = 0.1
-MAX_SHORT_RATE = 0.3
+MAX_SHORT_RATE = 0.5
 
 # we load the CSV as dataframe
 predict_item_list = load_predictions(f"pred/predict-data-{STOCK_TICKER}.csv")
@@ -24,11 +26,13 @@ best_threshold = False
 best_buy_rate = False
 best_short_rate = False
 
+best_backtest_list = []
+
 for action_threshold in range(MIN_ACTION_THRESHOLD, MAX_ACTION_THRESHOLD + 1):
 
-    for buy_rate in range(MIN_BUY_RATE, MAX_BUY_RATE, 0.01):
+    for buy_rate in np.arange(MIN_BUY_RATE, MAX_BUY_RATE+0.05, 0.05):
             
-        for short_rate in range(MIN_SHORT_RATE, MAX_SHORT_RATE, 0.01):
+        for short_rate in np.arange(MIN_SHORT_RATE, MAX_SHORT_RATE+0.05, 0.05):
     
             print(f"Attempting backtest with threshold: {action_threshold} / buy_rate={buy_rate}, short_rate={short_rate}")
 
@@ -40,11 +44,12 @@ for action_threshold in range(MIN_ACTION_THRESHOLD, MAX_ACTION_THRESHOLD + 1):
 
             if latest_balance > top_balance:
                 top_balance = latest_balance
-                best_threshold = best_threshold
-                best_buy_rate = best_buy_rate
-                best_short_rate = best_short_rate
+                best_threshold = action_threshold
+                best_buy_rate = buy_rate
+                best_short_rate = short_rate
+                best_backtest_list = backtest_list
 
-        #plot_and_save(STOCK_TICKER, backtest_list, action_threshold)
+        #
 
 print(f"ALL DONE")
 
@@ -52,3 +57,5 @@ print(f"=> top_balance: {top_balance}")
 print(f"=> best_threshold: {best_threshold}")
 print(f"=> best_short_rate: {best_short_rate}")
 print(f"=> best_buy_rate: {best_buy_rate}")
+
+plot_and_save(STOCK_TICKER, best_backtest_list, best_threshold)

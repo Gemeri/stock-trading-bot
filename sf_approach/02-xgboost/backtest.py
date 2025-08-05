@@ -17,7 +17,7 @@ def run_backtest(
 
     ret_list:list[BacktestItem] = []
 
-    for item in range(predict_item_list):
+    for item in predict_item_list:
 
         current_price = item.stock_price
         current_date = item.timestamp.date()
@@ -80,7 +80,7 @@ def run_backtest(
 
                 to_sell = position
 
-                print(f"** SOLD {to_sell} at {current_price} = {to_sell * current_price}")
+                #print(f"** SOLD {to_sell} at {current_price} = {to_sell * current_price}")
                 cash += to_sell * current_price
                 position -= to_sell
                 last_trade_date = current_date

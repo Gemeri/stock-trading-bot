@@ -1,4 +1,11 @@
 from data import PredictItem, BacktestItem
+from collections import deque
+from datetime import timedelta
+
+
+def prune_old_trades(trade_dates, current_date):
+    while trade_dates and (current_date - trade_dates[0]).days >= 5:
+        trade_dates.popleft()
 
 def run_backtest(
         predict_item_list:list[PredictItem], 
@@ -17,11 +24,34 @@ def run_backtest(
 
     ret_list:list[BacktestItem] = []
 
+    # PDT tracking
+    intraday_trade_dates = deque()
+    opened_today = None
+
     for item in predict_item_list:
 
         current_price = item.stock_price
         current_date = item.timestamp.date()
         current_direction = item.direction
+
+        # Intraday rule check
+        if not enable_intraday and len(intraday_trade_dates) >= 3 and current_date == last_trade_date:
+            
+            # Skip intraday trade due to PDT rule
+            portfolio_value = cash + position * current_price
+            ret_list.append(BacktestItem(
+                timestamp=item.timestamp,
+                action=last_action,
+                stock_price=current_price,
+                portfolio_value=portfolio_value,
+                position=position,
+                cash=cash,
+                cash_short=cash_short,
+            ))
+            continue
+
+        trade_executed = False
+        opened_today = False
         
         # Partial Margin Call Check
         if position < 0:
@@ -44,14 +74,7 @@ def run_backtest(
                     last_trade_date = current_date
                     continue
 
-
-        # Skip if a trade was already made today (simulate T+1 rule)
-        if not enable_intraday and current_date == last_trade_date:
-            #print(f"Skipping trade because last_trade_date = {last_trade_date}")
-            portfolio_value = cash + position * current_price
-            continue
-
-        # strong LONG entry
+        # LONG entry
         if current_direction > action_threshold:
 
             # exit ALL short first
@@ -60,6 +83,7 @@ def run_backtest(
                 cash_short = 0
                 position = 0
                 last_trade_date = current_date
+                trade_executed = True
             else:
                 # buy shares more aggressively if we can
                 to_invest = buy_rate * cash
@@ -69,10 +93,11 @@ def run_backtest(
                     #print(f"** BOUGHT {num_shares} at {current_price} = {num_shares * current_price}")
                     cash -= num_shares * current_price
                     position += num_shares
-                    entry_price = current_price
+                    trade_executed = True
+                    opened_today = True
                     last_trade_date = current_date
 
-        # strong short
+        # SHORT entry
         elif current_direction < -action_threshold:
             
             # we sell 100% of our shares
@@ -84,6 +109,7 @@ def run_backtest(
                 cash += to_sell * current_price
                 position -= to_sell
                 last_trade_date = current_date
+                trade_executed = True
 
             else:
                 # then we go short (SHORT_RATE% of cash)
@@ -104,6 +130,12 @@ def run_backtest(
 
                     position -= num_shorts  # Negative value = short position
                     last_trade_date = current_date
+                    trade_executed = True
+                    opened_today = True
+
+        # Intraday detection
+        if not enable_intraday and trade_executed and current_date == last_trade_date and opened_today:
+            intraday_trade_dates.append(current_date)
 
         # Track portfolio value
         portfolio_value = cash + position * current_price

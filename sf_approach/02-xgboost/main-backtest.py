@@ -1,11 +1,10 @@
-from backtest import run_backtest
+from alpaca_backtest import run_backtest
 from plot import plot_and_save
 from utils import load_predictions
 
 import numpy as np
 
-
-STOCK_TICKER = "AAPL"
+STOCK_TICKER = "INTC"
 
 MIN_ACTION_THRESHOLD = 5
 MAX_ACTION_THRESHOLD = 20

@@ -6,8 +6,9 @@ import numpy as np
 
 STOCK_TICKER = "INTC"
 
-MIN_ACTION_THRESHOLD = 1
-MAX_ACTION_THRESHOLD = 20
+MIN_ACTION_THRESHOLD = 0.1
+MAX_ACTION_THRESHOLD = 3
+ACTION_INCREMENT = 0.1
 
 # we load the CSV as dataframe
 predict_item_list = load_predictions(f"pred/predict-data-{STOCK_TICKER}.csv")

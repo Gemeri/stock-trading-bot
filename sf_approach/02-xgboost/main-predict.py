@@ -9,7 +9,7 @@ from utils import to_df
 
 from utils import load_and_engineer_features
 
-STOCK_TICKER = "INTC"
+STOCK_TICKER = "AAPL"
 LOOKAHEAD_LIST = [3, 5, 8]
 ENABLE_INTRADAY = False
 SHORT_RATE = 0.2

@@ -17,12 +17,9 @@ def plot_and_save(stock_ticker:str, backtest_list:list[BacktestItem], threshold:
     # ⏱ Prepare timestamp index
     timestamps = df['timestamp'].to_numpy()
     portfolio_values = df['portfolio_value'].to_numpy()
-    actions = df['action'].to_numpy()
     stock_prices = df['stock_price'].to_numpy()
-    position_values = df['position'].to_numpy()
-    balances = df['cash'].to_numpy()
+    cash = df['cash'].to_numpy()
     cash_short = df['cash_short'].to_numpy()
-    cash_collateral = df['cash_collateral'].to_numpy()
 
     # 📈 Create plot
     fig, ax1 = plt.subplots(figsize=(16, 8))
@@ -40,20 +37,20 @@ def plot_and_save(stock_ticker:str, backtest_list:list[BacktestItem], threshold:
     ax1.grid(True)
 
     # 📊 Plot action bars (on same axis)
-    bar_colors = ['green' if a > 0 else 'red' if a < 0 else 'gray' for a in actions]
-    ax1.bar(timestamps, actions, color=bar_colors, alpha=0.5, label='Trades')
+    #bar_colors = ['green' if a > 0 else 'red' if a < 0 else 'gray' for a in actions]
+    #ax1.bar(timestamps, actions, color=bar_colors, alpha=0.5, label='Trades')
 
     # 📈 Plot Stock Price (right Y-axis)
     ax2 = ax1.twinx()
-    ax2.plot(timestamps, stock_prices, color='orange', label="Stock Price ($)")
+    ax2.plot(timestamps, stock_prices, color='orange', label="Stock Price ($)", linewidth=2.5)
     ax2.set_ylabel("Stock Price ($)", color='orange')
     ax2.tick_params(axis='y', labelcolor='orange')
 
-    # 💰 Plot cash collateral (third Y-axis)
+    # 💰 Plot cash (third Y-axis)
     ax3 = ax1.twinx()
     ax3.spines['right'].set_position(('outward', 50))  # Offset third axis
-    ax3.plot(timestamps, cash_collateral, color='red', label='Cash Col ($)', linestyle=':')
-    ax3.set_ylabel("Cash Col ($)", color='red')
+    ax3.plot(timestamps, cash, color='red', label='Cash ($)', linestyle=':')
+    ax3.set_ylabel("Cash ($)", color='red')
     ax3.tick_params(axis='y', labelcolor='red')
 
     # 💰 Plot cash short (third Y-axis)
@@ -80,7 +77,7 @@ def plot_and_save(stock_ticker:str, backtest_list:list[BacktestItem], threshold:
 
     # Save figure
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    plt.savefig(f"pred/backtest-graph-{stock_ticker}-th{threshold}-{timestamp}.png")
+    plt.savefig(f"pred/backtest-graph-{stock_ticker}-th{threshold:.2f}-{timestamp}.png")
 
     # Save as CSV
-    df.to_csv(f"pred/backtest-data-{stock_ticker}-th{threshold}-{timestamp}.csv", index=True)
+    df.to_csv(f"pred/backtest-data-{stock_ticker}-th{threshold:.2f}-{timestamp}.csv", index=True)

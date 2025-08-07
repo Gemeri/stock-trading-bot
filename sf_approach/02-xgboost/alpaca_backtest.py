@@ -47,6 +47,7 @@ def run_backtest(
                 position=position,
                 cash=cash,
                 cash_short=cash_short,
+                cash_collateral=collateral_cash
             ))
             continue
 
@@ -115,7 +116,7 @@ def run_backtest(
                 # then we go short (SHORT_RATE% of cash)
                 collateral_cash = cash - cash_short
 
-                shortable_amount = collateral_cash// 2 #50% margin
+                shortable_amount = collateral_cash// 2 #50% margin as per Alpacas restrictions
                 shortable_shares_max = shortable_amount // current_price
 
                 want_short_amount = short_rate * cash
@@ -150,6 +151,7 @@ def run_backtest(
             position=position,
             cash=cash,
             cash_short=cash_short,
+            cash_collateral=cash-cash_short
         ))
 
     return ret_list

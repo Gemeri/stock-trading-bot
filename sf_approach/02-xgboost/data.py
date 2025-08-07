@@ -16,3 +16,4 @@ class BacktestItem:
     position: int
     cash: float
     cash_short: float
+    cash_collateral:float

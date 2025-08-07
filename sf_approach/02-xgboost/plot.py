@@ -21,9 +21,11 @@ def plot_and_save(stock_ticker:str, backtest_list:list[BacktestItem], threshold:
     stock_prices = df['stock_price'].to_numpy()
     position_values = df['position'].to_numpy()
     balances = df['cash'].to_numpy()
+    cash_short = df['cash_short'].to_numpy()
+    cash_collateral = df['cash_collateral'].to_numpy()
 
     # 📈 Create plot
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    fig, ax1 = plt.subplots(figsize=(16, 8))
 
     # dates formatting
     ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
@@ -47,12 +49,19 @@ def plot_and_save(stock_ticker:str, backtest_list:list[BacktestItem], threshold:
     ax2.set_ylabel("Stock Price ($)", color='orange')
     ax2.tick_params(axis='y', labelcolor='orange')
 
-    # 💰 Plot Cash (third Y-axis)
+    # 💰 Plot cash collateral (third Y-axis)
     ax3 = ax1.twinx()
-    ax3.spines['right'].set_position(('outward', 60))  # Offset third axis
-    ax3.plot(timestamps, balances, color='red', label='Cash ($)', linestyle=':')
-    ax3.set_ylabel("Cash ($)", color='red')
+    ax3.spines['right'].set_position(('outward', 50))  # Offset third axis
+    ax3.plot(timestamps, cash_collateral, color='red', label='Cash Col ($)', linestyle=':')
+    ax3.set_ylabel("Cash Col ($)", color='red')
     ax3.tick_params(axis='y', labelcolor='red')
+
+    # 💰 Plot cash short (third Y-axis)
+    ax4 = ax1.twinx()
+    ax4.spines['right'].set_position(('outward', 100))  # Offset third axis
+    ax4.plot(timestamps, cash_short, color='green', label='Cash Short ($)', linestyle='--')
+    ax4.set_ylabel("Cash Short ($)", color='green')
+    ax4.tick_params(axis='y', labelcolor='green')
 
     # 🏷️ Format X-axis as dates
     ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
@@ -64,7 +73,8 @@ def plot_and_save(stock_ticker:str, backtest_list:list[BacktestItem], threshold:
     lines, labels = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     lines3, labels3 = ax3.get_legend_handles_labels()
-    ax1.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc="upper left")
+    lines4, labels4 = ax4.get_legend_handles_labels()
+    ax1.legend(lines + lines2 + lines3 + lines4, labels + labels2 + labels3 + labels4, loc="upper left")
 
     fig.tight_layout()    
 

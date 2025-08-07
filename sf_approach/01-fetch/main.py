@@ -8,7 +8,7 @@ logging.basicConfig(
 
 logging.info("Getting data... ")
 
-TICKER_LIST = ['AAPL', 'ADBE', 'TSLA', 'AMD', 'AMZN', 'BA', 'INTC', 'MSFT', 'NKE', 'NVDA', 'ORCL', 'PLTR', 'PYPL', 'SNOW', 'V']
+TICKER_LIST = ['CPG', 'ADT']
 
 for ticker in TICKER_LIST:
     

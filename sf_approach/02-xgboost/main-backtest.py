@@ -1,19 +1,23 @@
 from alpaca_backtest import run_backtest
 from plot import plot_and_save
 from utils import load_predictions
-
+import sys
 import numpy as np
 
-STOCK_TICKER = "INTC"
+if len(sys.argv) > 1:
+    stock_ticker = sys.argv[1].upper()
+    print(f"Stock ticker: {stock_ticker}")
+else:
+    raise ValueError("No stock ticker specified")
 
 MIN_ACTION_THRESHOLD = 0.1
 MAX_ACTION_THRESHOLD = 3
 ACTION_INCREMENT = 0.1
 
 # we load the CSV as dataframe
-predict_item_list = load_predictions(f"pred/predict-data-{STOCK_TICKER}.csv")
+predict_item_list = load_predictions(f"pred/predict-data-{stock_ticker}.csv")
 
-print(f"Loaded {len(predict_item_list)} items for ticker {STOCK_TICKER}")
+print(f"Loaded {len(predict_item_list)} items for ticker {stock_ticker}")
 
 top_balance = 0
 best_threshold = False
@@ -42,4 +46,4 @@ print(f"ALL DONE")
 print(f"=> top_balance: {top_balance}")
 print(f"=> best_threshold: {best_threshold}")
 
-plot_and_save(STOCK_TICKER, best_backtest_list, best_threshold)
+plot_and_save(stock_ticker, best_backtest_list, best_threshold)

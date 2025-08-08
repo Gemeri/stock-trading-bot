@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+import sys
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from linear import stock_price_direction
@@ -9,15 +10,20 @@ from utils import to_df
 
 from utils import load_and_engineer_features
 
-STOCK_TICKER = "AAPL"
 LOOKAHEAD_LIST = [3, 5, 8]
 ENABLE_INTRADAY = False
 SHORT_RATE = 0.2
 BUY_RATE = 0.2
 TRAIN_BACK_WINDOW = 800
 
+if len(sys.argv) > 1:
+    stock_ticker = sys.argv[1].upper()
+    print(f"Stock ticker: {stock_ticker}")
+else:
+    raise ValueError("No stock ticker specified")
+
 # Load training data
-df = load_and_engineer_features(f"../01-fetch/data/{STOCK_TICKER}_H1.csv")
+df = load_and_engineer_features(f"../01-fetch/data/{stock_ticker}_H1.csv")
 
 # ----------------------------
 # 2. Feature Engineering on Timestamp
@@ -51,7 +57,7 @@ predict_item_list:list[PredictItem] = []
 # Backtest from candle end-1200 to now -> 18mo circa
 for i in range(len(df)-TRAIN_BACK_WINDOW, len(df)-1):
 
-    print(f"Loading candles for {STOCK_TICKER} from {i-800} to {i}")
+    print(f"Loading candles for {stock_ticker} from {i-800} to {i}")
 
     # Train model on previous 12 months (approx. 800 candles)
     train_data = df.iloc[i-TRAIN_BACK_WINDOW:i]
@@ -117,6 +123,6 @@ print("#### Prediction phase completed")
 
 df = to_df(predict_item_list)
 
-df.to_csv(f"pred/predict-data-{STOCK_TICKER}.csv", index=True)
+df.to_csv(f"pred/predict-data-{stock_ticker}.csv", index=True)
 
 print("#### Prediction file saved")

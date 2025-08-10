@@ -23,7 +23,7 @@ else:
     raise ValueError("No stock ticker specified")
 
 # Load training data
-df = load_and_engineer_features(f"../01-fetch/data/{stock_ticker}_H1.csv")
+df = load_and_engineer_features(f"../01_fetch/data/{stock_ticker}_H1.csv")
 
 # ----------------------------
 # 2. Feature Engineering on Timestamp

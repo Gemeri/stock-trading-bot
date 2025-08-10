@@ -32,7 +32,7 @@ def _process_trade_item(
 
     # Intraday rule check
     if len(state.intraday_trade_dates) >= 3 and current_date == state.last_trade_date:
-        log_list.append(f"intraday stop triggered")
+        log_list.append(f"intraday stop triggered - trades {state.intraday_trade_dates}")
         portfolio_value = state.cash + state.position * current_price
         
 

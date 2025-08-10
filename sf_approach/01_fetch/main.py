@@ -8,7 +8,7 @@ logging.basicConfig(
 
 logging.info("Getting data... ")
 
-TICKER_LIST = ['CPG', 'ADT']
+TICKER_LIST = ['VKTX']
 
 for ticker in TICKER_LIST:
     

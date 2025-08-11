@@ -9,51 +9,20 @@ import argparse
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from sub.common import compute_meta_labels, USE_META_LABEL
-
 FEATURES = [
-    # basic price/vol
-    "open", "high", "low", "close", "volume", "vwap", "transactions",
-    # sentiment / price derived
-    "sentiment", "price_change", "high_low_range", "log_volume",
-    # oscillators & trend
-    "macd_line", "macd_signal", "macd_histogram", "rsi", "momentum", "roc", "atr",
-    # EMAs
-    "ema_9", "ema_21", "ema_50", "ema_200",
-    # ADX & volume
-    "adx", "obv",
-    # bands
-    "bollinger_upper", "bollinger_lower",
-    # lagged closes
-    "lagged_close_1", "lagged_close_2", "lagged_close_3", "lagged_close_5", "lagged_close_10",
-    # candle anatomy & gaps
-    "candle_body_ratio", "wick_dominance", "gap_vs_prev",
-    # z‑scores & transforms
-    "volume_zscore", "atr_zscore", "rsi_zscore",
-    # engineered flags
-    "adx_trend", "macd_cross", "macd_hist_flip",
-    # calendar / rolling extremes
-    "day_of_week", "days_since_high", "days_since_low"
+    'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions', 'sentiment',
+    'price_change', 'high_low_range', 'log_volume', 'macd_line', 'macd_signal', 'macd_histogram',
+    'rsi', 'roc', 'atr', 'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx', 'obv', 'bollinger_upper', 
+    'bollinger_lower', 'bollinger_percB', 'returns_1', 'returns_3', 'returns_5', 'std_5', 'std_10',
+    'lagged_close_1', 'lagged_close_2', 'lagged_close_3', 'lagged_close_5', 'lagged_close_10',
+    'candle_body_ratio', 'wick_dominance', 'gap_vs_prev', 'volume_zscore', 'atr_zscore', 'rsi_zscore',
+    'macd_cross', 'macd_hist_flip', 'month', 'hour_sin', 'hour_cos', 'day_of_week_sin', 
+    'day_of_week_cos', 'days_since_high', 'days_since_low',
 ]
-
-BEST_XGB_PARAMS = {
-    "n_estimators":     700,
-    "learning_rate":    0.05,
-    "max_depth":        4,
-    "min_child_weight": 5,
-    "subsample":        0.80,
-    "colsample_bytree": 0.80,
-    "gamma":            0.0,
-    "reg_alpha":        0.0,
-    "reg_lambda":       1.0,
-}
 
 
 def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    if USE_META_LABEL:
-        return compute_meta_labels(df).rename(columns={"meta_label": "label"})
 
     df["label"] = (df["close"].shift(-1) > df["close"]).astype(int)
     return df.dropna(subset=FEATURES + ["label"]).reset_index(drop=True)
@@ -71,7 +40,12 @@ def fit(X_train: np.ndarray, y_train: np.ndarray):
         random_state=42,
         n_jobs=-1,
         use_label_encoder=False,
-        **BEST_XGB_PARAMS,
+        n_estimators=100, 
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42
     )
 
     core.fit(

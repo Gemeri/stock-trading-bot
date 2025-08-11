@@ -13,8 +13,10 @@ from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 
 FEATURES = [
     'ema_9', 'ema_21', 'ema_50', 'ema_200',
-    'adx', 'adx_trend', 'obv', 'close',
-    'rsi', 'macd_line'
+    'adx', 'obv',
+    'rsi', 'macd_line',
+    'open', 'high', 'low', 'close',
+    'days_since_high', 'days_since_low'
 ]
 
 PARAM_GRID = {

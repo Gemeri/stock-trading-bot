@@ -22,6 +22,7 @@ import json
 import re
 import discord
 import xgboost as xgb
+from tqdm.auto import tqdm
 import catboost
 from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 from timeframe import TIMEFRAME_SCHEDULE
@@ -63,8 +64,8 @@ load_dotenv()
 # trading / model selection ------------------------------------------------------------------
 ML_MODEL  = os.getenv("ML_MODEL", "forest")
 
-API_KEY   = os.getenv("ALPACA_API_KEY", "")
-API_SECRET= os.getenv("ALPACA_API_SECRET", "")
+API_KEY = os.getenv("ALPACA_API_KEY", "")
+API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 SUBMETA_USE_ACTION = os.getenv("SUBMETA_USE_ACTION", "false").strip().lower() == "true"
 
@@ -180,23 +181,14 @@ def read_csv_limited(path: str) -> pd.DataFrame:
 # list of every feature column your models know about
 # ----------------------------------------------------
 POSSIBLE_FEATURE_COLS = [
-    'open', 'high', 'low', 'close', 'volume', 'vwap', 'sentiment',
-    'macd_line', 'macd_signal', 'macd_histogram',
-    'rsi', 'momentum', 'roc', 'atr', 'obv',
-    'bollinger_upper', 'bollinger_lower',
-    'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx',
-    'lagged_close_1', 'lagged_close_2', 'lagged_close_3',
-    'lagged_close_5', 'lagged_close_10',
-    'candle_body_ratio', "transactions",
-    'wick_dominance', "price_change",
-    'gap_vs_prev', "high_low_range",
-    'volume_zscore', "log_volume",
-    'atr_zscore', 'rsi_zscore',
-    'adx_trend', 'macd_cross',
-    'macd_hist_flip', 
-    'day_of_week',
-    'days_since_high',
-    'days_since_low'
+    'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions', 'sentiment',
+    'price_change', 'high_low_range', 'log_volume', 'macd_line', 'macd_signal', 'macd_histogram',
+    'rsi', 'roc', 'atr', 'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx', 'obv', 'bollinger_upper', 
+    'bollinger_lower', 'bollinger_percB', 'returns_1', 'returns_3', 'returns_5', 'std_5', 'std_10',
+    'lagged_close_1', 'lagged_close_2', 'lagged_close_3', 'lagged_close_5', 'lagged_close_10',
+    'candle_body_ratio', 'wick_dominance', 'gap_vs_prev', 'volume_zscore', 'atr_zscore', 'rsi_zscore',
+    'macd_cross', 'macd_hist_flip', 'month', 'hour_sin', 'hour_cos', 'day_of_week_sin', 
+    'day_of_week_cos', 'days_since_high', 'days_since_low',
 ]
 
 def make_pipeline(base_est): 
@@ -442,21 +434,50 @@ api = tradeapi.REST(API_KEY, API_SECRET, API_BASE_URL, api_version='v2')
 # 4. Sentiment Analysis Model Setup
 # -------------------------------
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
 try:
-    tokenizer = AutoTokenizer.from_pretrained("mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
-    model = AutoModelForSequenceClassification.from_pretrained("mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
-except:
+    # ProsusAI FinBERT (financial sentiment)
+    tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+    model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    # Resolve label indices dynamically in case the config changes in the future
+    _LABEL2ID = getattr(model.config, "label2id", {"positive": 0, "negative": 1, "neutral": 2})
+    _POS_IDX = int(_LABEL2ID.get("positive", 0))
+    _NEG_IDX = int(_LABEL2ID.get("negative", 1))
+except Exception as e:
     tokenizer = None
     model = None
-    logging.info("Offline. API and Sentiment will not function and will result in errors")
+    _LABEL2ID = {"positive": 0, "negative": 1, "neutral": 2}
+    _POS_IDX, _NEG_IDX = 0, 1
+    logging.info(f"Offline / FinBERT load failed: {e}. Sentiment disabled and will return neutral-like values.")
     
-def predict_sentiment(text):
-    inputs = tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
+def predict_sentiment(text: str):
+    """
+    Uses ProsusAI/finbert to produce:
+      - sentiment_class: argmax index from model logits
+      - confidence_scores: softmax(probabilities) as a float list [P(pos), P(neg), P(neu)] *order resolved via model.config*
+      - sentiment_score: P(positive) - P(negative)
+    """
+    if not text:
+        return 2, [0.0, 0.0, 1.0], 0.0  # neutral-ish fallback for empty text
+
+    if tokenizer is None or model is None:
+        # Fallback if model couldn't be loaded
+        logging.warning("predict_sentiment called while FinBERT is unavailable. Returning neutral-like values.")
+        return 2, [0.0, 0.0, 1.0], 0.0
+
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        max_length=512,
+        truncation=True
+    )
     outputs = model(**inputs)
+    probs = outputs.logits.softmax(dim=1)[0].tolist()
+
+    # FinBERT's config defines indices (resolved above); compute positive-minus-negative
+    sentiment_score = probs[_POS_IDX] - probs[_NEG_IDX]
     sentiment_class = outputs.logits.argmax(dim=1).item()
-    confidence_scores = outputs.logits.softmax(dim=1)[0].tolist()
-    sentiment_score = confidence_scores[2] - confidence_scores[0]
-    return sentiment_class, confidence_scores, sentiment_score
+    return sentiment_class, probs, sentiment_score
 
 # -------------------------------
 # 4b. Dictionary to map TRADE_LOGIC to actual module filenames
@@ -678,6 +699,12 @@ def fetch_candles_plus_features_and_predclose(
         df_existing = pd.DataFrame()
         last_ts     = None
 
+    first_missing_pred_idx = None
+    if 'predicted_close' in df_existing.columns:
+        na_mask = df_existing['predicted_close'].isna().to_numpy()
+        if na_mask.any():
+            first_missing_pred_idx = int(np.argmax(na_mask))
+
     # ───── 2. figure out how many fresh bars we need ───────────────────────
     if last_ts is not None:
         now_utc      = datetime.now(pytz.utc)
@@ -696,69 +723,69 @@ def fetch_candles_plus_features_and_predclose(
         logging.info(f"[{ticker}] Data up-to-date and preds present – skipping update.")
         return df_existing.copy()
 
-
-    # ───── 3. fetch ONLY the missing candles ───────────────────────────────
     df_candles_new = fetch_candles(
         ticker,
         bars=bars_needed,
         timeframe=timeframe,
         last_timestamp=last_ts
     )
-    if df_candles_new.empty:
-        logging.warning(f"[{ticker}] No new bars fetched.")
+
+    has_new = not df_candles_new.empty
+    is_backfill_only = (not has_new) and (first_missing_pred_idx is not None)
+
+    # no new bars AND nothing to backfill → exit early
+    if not has_new and not is_backfill_only:
+        logging.info(f"[{ticker}] No new bars fetched and no missing predicted_close.")
         return df_existing.copy()
 
-    df_candles_new['timestamp'] = pd.to_datetime(
-        df_candles_new['timestamp'], utc=True)
+    # normalize timestamps only if we actually have new rows
+    if has_new:
+        df_candles_new['timestamp'] = pd.to_datetime(df_candles_new['timestamp'], utc=True)
 
-    if last_ts is not None:
+    # if we do have new rows, keep only those newer than last_ts
+    if has_new and last_ts is not None:
         df_candles_new = df_candles_new[df_candles_new['timestamp'] > last_ts]
-        if df_candles_new.empty:
+        has_new = not df_candles_new.empty
+        if not has_new and not is_backfill_only:
             logging.info(f"[{ticker}] No candles newer than {last_ts}.")
             return df_existing.copy()
 
-    # ───── 4. attach incremental sentiment to the new slice ──────────────
-    if last_ts is not None:
-        news_days = 1
-        start_dt  = last_ts
-    else:
-        news_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650)
-        start_dt  = None
-
-    articles_per_day = ARTICLES_PER_DAY_MAPPING.get(BAR_TIMEFRAME, 1)
-    news_list = fetch_news_sentiments(
-        ticker,
-        news_days,
-        articles_per_day,
-        start_dt=start_dt
-    )
-    sentiments = assign_sentiment_to_candles(df_candles_new, news_list)
-    df_candles_new['sentiment'] = sentiments
-
-    try:
-        if os.path.exists(sentiment_csv):
-            df_sent_old = pd.read_csv(sentiment_csv, parse_dates=['timestamp'])
+    # ───── 4) attach incremental sentiment only when adding new candles ─────
+    if has_new:
+        if last_ts is not None:
+            news_days = 1; start_dt = last_ts
         else:
-            df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment'])
+            news_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650); start_dt = None
 
-        df_sent_new = pd.DataFrame({
-            "timestamp": df_candles_new['timestamp'],
-            "sentiment": [f"{s:.15f}" for s in sentiments]
-        })
-        (pd.concat([df_sent_old, df_sent_new])
-           .drop_duplicates(subset=['timestamp'])
-           .sort_values('timestamp')
-           .to_csv(sentiment_csv, index=False))
-    except Exception as e:
-        logging.error(f"[{ticker}] Unable to update sentiment CSV: {e}")
+        articles_per_day = ARTICLES_PER_DAY_MAPPING.get(BAR_TIMEFRAME, 1)
+        news_list = fetch_news_sentiments(ticker, news_days, articles_per_day, start_dt=start_dt)
+        sentiments = assign_sentiment_to_candles(df_candles_new, news_list)
+        df_candles_new['sentiment'] = sentiments
 
-    # ───── 5. combine old + new *before* engineering features ──────────────
+    if has_new:
+        try:
+            if os.path.exists(sentiment_csv):
+                df_sent_old = pd.read_csv(sentiment_csv, parse_dates=['timestamp'])
+            else:
+                df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment'])
+
+            df_sent_new = pd.DataFrame({
+                "timestamp": df_candles_new['timestamp'],
+                "sentiment": [f"{s:.15f}" for s in sentiments]
+            })
+            (pd.concat([df_sent_old, df_sent_new])
+            .drop_duplicates(subset=['timestamp'])
+            .sort_values('timestamp')
+            .to_csv(sentiment_csv, index=False))
+        except Exception as e:
+            logging.error(f"[{ticker}] Unable to update sentiment CSV: {e}")
+
     df_combined = (pd.concat([df_existing, df_candles_new], ignore_index=True)
                      .drop_duplicates(subset=['timestamp'])
                      .sort_values('timestamp')
                      .reset_index(drop=True))
 
-    # ────── 6. run feature engineering on the FULL frame ───────────────
+    # 6) features
     df_combined = add_features(df_combined)
     df_combined = compute_custom_features(df_combined)
 
@@ -766,24 +793,44 @@ def fetch_candles_plus_features_and_predclose(
         if col != 'timestamp':
             df_combined[col] = pd.to_numeric(df_combined[col], errors='coerce')
 
-    # ───── 7. regenerate predicted_close only for the new rows ──────────────
+    if 'predicted_close' not in df_combined.columns:
+        df_combined['predicted_close'] = np.nan
+
+    # 7) regenerate predicted_close
     ml_models     = get_ml_models_for_ticker(ticker)
     has_regressor = any(m in ["xgboost", "forest", "rf", "randomforest",
                               "lstm", "transformer", "catboost"] for m in ml_models)
 
-    if has_regressor and DISABLE_PRED_CLOSE == False:
+    # choose start: earliest missing OR start of new rows
+    n_start_new = len(df_combined) - len(df_candles_new)
+    if first_missing_pred_idx is not None:
+        n_start = min(first_missing_pred_idx, n_start_new)
+    else:
+        n_start = n_start_new
+
+    if has_regressor and DISABLE_PRED_CLOSE == 'False':
+        start = max(1, n_start)
+        end = len(df_combined)
+        total = max(0, end - start)
+        iterator = (tqdm(range(start, end),
+                    desc=f"[{ticker}] predicted_close",
+                    unit="row",
+                    dynamic_ncols=True,
+                    leave=False)
+            if tqdm and total > 0 else range(start, end))
+        logging.info(f"[{ticker}] Rolling ML predicted_close from index {max(1, n_start)} over {len(df_combined)-max(1,n_start)} rows…")
         if 'predicted_close' not in df_combined.columns:
             df_combined['predicted_close'] = np.nan
-
-        n_start = len(df_combined) - len(df_candles_new)
 
         if len(df_combined) - n_start > 0:
             logging.info(f"[{ticker}] Rolling ML predicted_close for "
                          f"{len(df_combined) - n_start} new row(s)…")
 
-            for i in range(max(1, n_start), len(df_combined)):
+            feature_cols = get_features(df_combined)
+
+            for i in iterator:
                 try:
-                    X_train = df_combined.iloc[:i][get_features(df_combined)]
+                    X_train = df_combined.iloc[:i][feature_cols]
                     y_train = df_combined.iloc[:i]['close']
 
                     m = ml_models[0]
@@ -829,7 +876,7 @@ def fetch_candles_plus_features_and_predclose(
                             n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
 
                     mdl.fit(X_train, y_train)
-                    X_pred = df_combined.iloc[[i-1]][get_features(df_combined)]
+                    X_pred = df_combined.iloc[[i-1]][feature_cols]
                     df_combined.at[i, 'predicted_close'] = mdl.predict(X_pred)[0]
                 except Exception as e:
                     logging.error(f"[{ticker}] predicted_close error idx={i}: {e}")
@@ -869,11 +916,16 @@ def fetch_news_sentiments(
     ticker: str,
     num_days: int,
     articles_per_day: int,
-    start_dt: datetime | None = None
+    start_dt: datetime | None = None,
+    base_url: str = "https://data.alpaca.markets/v1beta1/news"
 ):
+    """
+    Pulls Alpaca v1beta1 news via REST (no api.get_news), including full content,
+    and feeds FinBERT the combined 'headline + content + summary'.
+    """
     news_list = []
 
-    # ----------------------------------------------------------------------
+    # --------- date range setup ----------
     if start_dt is not None:
         start_date_news = pd.to_datetime(start_dt, utc=True)
         logging.info(f"[{ticker}] Incremental news pull from {start_date_news}.")
@@ -884,31 +936,82 @@ def fetch_news_sentiments(
     today_dt = datetime.now(timezone.utc)
     total_days = (today_dt.date() - start_date_news.date()).days + 1
 
+    # --------- headers (use keys if available) ----------
+    headers = {"accept": "application/json"}
+
+    api_key = API_KEY
+    api_secret = API_SECRET
+
+    if api_key and api_secret:
+        headers["APCA-API-KEY-ID"] = api_key
+        headers["APCA-API-SECRET-KEY"] = api_secret
+    else:
+        logging.warning("Missing API_KEY or API_SECRET in environment; Alpaca requests may fail (401).")
+
+    session = requests.Session()
+
     for day_offset in range(total_days):
         current_day = start_date_news + timedelta(days=day_offset)
         if current_day > today_dt:
             break
         next_day = current_day + timedelta(days=1)
+
         start_str = current_day.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_str   = next_day.strftime("%Y-%m-%dT%H:%M:%SZ")
-
         logging.info(f"[{ticker}]   ↳ {current_day.date()} …")
+
+        # --------- query Alpaca News (REST) ----------
+        params = {
+            "start": start_str,
+            "end": end_str,
+            "sort": "desc",
+            "symbols": ticker,
+            "limit": int(articles_per_day),
+            "include_content": "true",
+            "exclude_contentless": "true",
+        }
+
         try:
-            articles = api.get_news(ticker, start=start_str, end=end_str)
-            if articles:
-                count = min(len(articles), articles_per_day)
-                for article in articles[:count]:
-                    headline = article.headline or ""
-                    summary  = article.summary or ""
-                    combined = f"{headline} {summary}"
-                    _, _, sentiment_score = predict_sentiment(combined)
-                    created_at = article.created_at or current_day
-                    news_list.append({
-                        "created_at": created_at,
-                        "sentiment": sentiment_score,
-                        "headline": headline,
-                        "summary": summary
-                    })
+            resp = session.get(base_url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # API generally returns {"news": [...], "next_page_token": "..."}
+            items = []
+            if isinstance(data, dict) and "news" in data:
+                items = data["news"]
+            elif isinstance(data, list):
+                items = data  # just in case an SDK/proxy returns a raw list
+
+            if not items:
+                continue
+
+            # Keep just the first N (limit already enforced, but be defensive)
+            for article in items[:articles_per_day]:
+                headline = article.get("headline", "") or ""
+                summary  = article.get("summary", "") or ""
+                content  = article.get("content", "") or ""
+
+                combined = " ".join([seg for seg in (headline, content, summary) if seg]).strip()
+
+                # Prefer created_at; fall back to updated_at; fallback to current_day
+                created_at_raw = article.get("created_at") or article.get("updated_at")
+                created_at = pd.to_datetime(created_at_raw, utc=True, errors="coerce") if created_at_raw else None
+                if created_at is None or pd.isna(created_at):
+                    created_at = current_day
+
+                _, _, sentiment_score = predict_sentiment(combined)
+
+                news_list.append({
+                    "created_at": created_at,
+                    "sentiment": sentiment_score,
+                    "headline": headline,
+                    "summary": summary,
+                    "content": content,
+                    "url": article.get("url", ""),
+                    "source": (article.get("source") or {}).get("name") if isinstance(article.get("source"), dict) else article.get("source", "")
+                })
+
         except Exception as e:
             logging.error(f"Error fetching news for {ticker}: {e}")
 
@@ -942,9 +1045,13 @@ def assign_sentiment_to_candles(df: pd.DataFrame, news_list: list):
     return sentiments
 
 def save_news_to_csv(ticker: str, news_list: list):
+    """
+    Now also persists 'content' (full article text) for traceability.
+    """
     if not news_list:
         logging.info(f"[{ticker}] No articles to save.")
         return
+
     rows = []
     for item in news_list:
         item_sentiment_str = f"{item.get('sentiment', 0.0):.15f}"
@@ -952,6 +1059,7 @@ def save_news_to_csv(ticker: str, news_list: list):
             "created_at": item.get("created_at", ""),
             "headline": item.get("headline", ""),
             "summary": item.get("summary", ""),
+            "content": item.get("content", ""),     # NEW
             "sentiment": item_sentiment_str
         }
         rows.append(row)
@@ -1030,9 +1138,8 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
         df['rsi'] = 100 - (100 / (1 + rs))
         df['rsi'] = df['rsi'].fillna(50)
 
-    # --- MOMENTUM and ROC ---
+    # --- ROC ---
     if 'close' in df.columns:
-        df['momentum'] = (df['close'] - df['close'].shift(14)).fillna(0)
         shifted = df['close'].shift(14)
         df['roc'] = ((df['close'] - shifted) / shifted.replace(0, np.nan) * 100).fillna(0)
 
@@ -1087,13 +1194,20 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
                 df.at[i, 'obv'] = prev - df.at[i, 'volume']
             else:
                 df.at[i, 'obv'] = prev
-
+    
     # --- BOLLINGER BANDS (20,2) ---
     if 'close' in df.columns:
         ma20  = df['close'].rolling(window=20, min_periods=1).mean()
         std20 = df['close'].rolling(window=20, min_periods=1).std()
         df['bollinger_upper'] = (ma20 + 2 * std20).fillna(0.0)
         df['bollinger_lower'] = (ma20 - 2 * std20).fillna(0.0)
+        band_width = (df['bollinger_upper'] - df['bollinger_lower']).replace(0, np.nan)
+        df['bollinger_percB'] = ((df['close'] - df['bollinger_lower']) / band_width).fillna(0.0)
+        df['returns_1'] = df['close'].pct_change()
+        df['returns_3'] = df['close'].pct_change(3)
+        df['returns_5'] = df['close'].pct_change(5)
+        df['std_5'] = df['close'].rolling(5).std()
+        df['std_10'] = df['close'].rolling(10).std()
 
     # --- LAGGED CLOSES ---
     if 'close' in df.columns:
@@ -1129,9 +1243,6 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
             std = roll.std().replace(0, np.nan)
             df[z_feat] = ((df[feat] - mean) / std).fillna(0)
 
-    # 5. ADX Regime flag: 1 if ADX>30 (trending), else 0
-    df['adx_trend'] = (df.get('adx', 0) > 30).astype(int)
-
     # 6A. MACD crossing (signal): 1 if crossing up (MACD crosses above signal), -1 if crossing below, 0 otherwise
     if 'macd_line' in df.columns and 'macd_signal' in df.columns:
         macd_cross = np.where(
@@ -1154,9 +1265,24 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
         df['macd_cross'] = 0
         df['macd_hist_flip'] = 0
 
-    # 7. Day of week (0=Mon..4=Fri, NaN for missing timestamp)
     if 'timestamp' in df.columns:
-        df['day_of_week'] = pd.to_datetime(df['timestamp']).dt.dayofweek.fillna(-1).astype(int)
+        ts = pd.to_datetime(df['timestamp'], errors='coerce')
+
+        df['month'] = ts.dt.month.astype('Int64')
+
+        hour_raw = ts.dt.hour
+        dow_raw  = ts.dt.dayofweek
+
+        hour_safe = hour_raw.fillna(0)
+        dow_safe  = dow_raw.fillna(0)
+
+        df['hour_sin'] = np.sin(2 * np.pi * hour_safe / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * hour_safe / 24)
+        df['day_of_week_sin'] = np.sin(2 * np.pi * dow_safe / 7)
+        df['day_of_week_cos'] = np.cos(2 * np.pi * dow_safe / 7)
+
+        df = df.drop(columns=['day_of_week', 'hour'], errors='ignore')
+
 
     # 8. Days since last N-bar high/low (window=14)
     N = 14  # lookback for swing

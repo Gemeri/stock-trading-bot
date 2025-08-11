@@ -14,9 +14,9 @@ from sklearn.metrics import mean_squared_error
 
 
 FEATURES = [
-    'lagged_close_1', 'lagged_close_2',
-    'lagged_close_3', 'lagged_close_5',
-    'lagged_close_10', 'close'
+    'close',
+    'lagged_close_1', 'lagged_close_2', 'lagged_close_3', 'lagged_close_5', 'lagged_close_10',
+    'returns_1', 'returns_3', 'returns_5'
 ]
 
 BEST_PARAMS = {

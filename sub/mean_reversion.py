@@ -13,10 +13,14 @@ from sklearn.preprocessing import StandardScaler
 
 
 FEATURES = [
-    'bollinger_upper', 'bollinger_lower',
+    'bollinger_upper', 'bollinger_lower', 'bollinger_percB',
     'atr', 'atr_zscore',
     'candle_body_ratio', 'wick_dominance',
-    'rsi_zscore', 'macd_histogram', 'macd_hist_flip'
+    'rsi_zscore',
+    'macd_histogram', 'macd_hist_flip', 'macd_cross',
+    'high_low_range',
+    'std_5', 'std_10',
+    'gap_vs_prev'
 ]
 
 PARAM_GRID = {

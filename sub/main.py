@@ -10,12 +10,11 @@ from sklearn.metrics import roc_auc_score
 
 from typing import Tuple
 
-import sub.momentum            as mod1
-import sub.trend_continuation  as mod2
-import sub.mean_reversion      as mod3
-import sub.lagged_return       as mod4
-import sub.sentiment_volume    as mod5
-
+import sub.momentum as mod1
+import sub.trend_continuation as mod2
+import sub.mean_reversion as mod3
+import sub.lagged_return as mod4
+import sub.sentiment_volume as mod5
 
 USE_CLASSIFIER = True
 if USE_CLASSIFIER:
@@ -23,32 +22,27 @@ if USE_CLASSIFIER:
     SUBMODS = [mod1, mod2, mod3, mod4, mod5, mod6]
 else:
     SUBMODS = [mod1, mod2, mod3, mod4, mod5]
-N_SUBMODS = len(SUBMODS)
 
-# ─── Base Directories ─────────────────────────────────────────────────────────
-BASE_DIR    = os.path.dirname(__file__)
-ROOT_DIR    = os.path.abspath(os.path.join(BASE_DIR, os.pardir))
+BASE_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, os.pardir))
 RESULTS_DIR = os.path.join(BASE_DIR, "sub-results")
 
-# ─── Configuration ───────────────────────────────────────────────────────────
 load_dotenv()
-BAR_TIMEFRAME       = os.getenv("BAR_TIMEFRAME", "4Hour")
-TICKERS             = os.getenv("TICKERS", "TSLA").split(",")
-ML_MODEL            = os.getenv("ML_MODEL",  "sub-vote")
-TIMEFRAME_MAP       = {"4Hour":"H4","2Hour":"H2","1Hour":"H1","30Min":"M30","15Min":"M15"}
+BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
+TICKERS = os.getenv("TICKERS", "TSLA").split(",")
+ML_MODEL = os.getenv("ML_MODEL",  "sub-vote")
+TIMEFRAME_MAP = {"4Hour":"H4","2Hour":"H2","1Hour":"H1","30Min":"M30","15Min":"M15"}
 CONVERTED_TIMEFRAME = TIMEFRAME_MAP.get(BAR_TIMEFRAME, BAR_TIMEFRAME)
 HISTORY_PATH = os.path.join(RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv")
-USE_META_LABEL = os.getenv("USE_META_LABEL", "false") 
+USE_META_LABEL = os.getenv("USE_META_LABEL", "false")
 
-CSV_PATH  = os.path.join(ROOT_DIR, f"{TICKERS}_{CONVERTED_TIMEFRAME}.csv")
-MODE       = ML_MODEL  # "sub-vote" or "sub-meta"
-EXECUTION  = globals().get("EXECUTION", "backtest")
+TICKERS_STR = "-".join([t.strip() for t in TICKERS if t.strip()]) or "TSLA"
+CSV_PATH  = os.path.join(ROOT_DIR, f"{TICKERS_STR}_{CONVERTED_TIMEFRAME}.csv")
+MODE = ML_MODEL  # "sub-vote" or "sub-meta"
+EXECUTION = globals().get("EXECUTION", "backtest")
 
-# Default return thresholds (used only for submodels returning regression)
 REG_UP, REG_DOWN = 0.003, -0.003
 
-# Set to True to force thresholds to 0.55/0.45 everywhere
-# Disabled by default so thresholds can adapt to data
 FORCE_STATIC_THRESHOLDS = False
 STATIC_UP = 0.55
 STATIC_DOWN = 0.45
@@ -59,44 +53,48 @@ if META_MODEL_TYPE not in VALID_META_MODELS:
     raise ValueError(f"META_MODEL_TYPE must be one of {VALID_META_MODELS}")
 
 
-def _build_meta_features(df: pd.DataFrame, n_mods: int) -> np.ndarray:
-    """Return a feature matrix for the meta learner."""
+def is_multi(module) -> bool:
+    return hasattr(module, "MULTI_HORIZONS") and isinstance(module.MULTI_HORIZONS, (list, tuple)) and len(module.MULTI_HORIZONS) > 0
+
+def label_col_for(module, h: int | None):
+    if is_multi(module) and h is not None:
+        return f"label_h{int(h)}"
+    return "label"
+
+def max_lookahead(submods) -> int:
+    mx = 1
+    for m in submods:
+        if is_multi(m):
+            mx = max(mx, max(m.MULTI_HORIZONS))
+    return mx
+
+def expand_channels(submods):
+    chans = []
+    for m in submods:
+        if is_multi(m):
+            for h in m.MULTI_HORIZONS:
+                chans.append({"mod": m, "h": int(h), "name": f"{m.__name__}_h{h}"})
+        else:
+            chans.append({"mod": m, "h": None, "name": m.__name__})
+    return chans
+
+
+def build_meta_features(df: pd.DataFrame, n_mods: int | None = None) -> np.ndarray:
+    if n_mods is None:
+        n_mods = sum(1 for c in df.columns if isinstance(c, str) and c.startswith("m") and c[1:].isdigit())
     prob_cols = [f"m{i+1}"   for i in range(n_mods)]
-    acc_cols  = [f"acc{i+1}" for i in range(n_mods)]
+    acc_cols = [f"acc{i+1}" for i in range(n_mods)]
 
-    P = df[prob_cols].values          # shape (N, n_mods)
-    A = df[acc_cols].values           # shape (N, n_mods)
+    P = df[prob_cols].values
+    A = df[acc_cols].values
 
-    mean_p   = P.mean(axis=1, keepdims=True)
-    var_p    = P.var(axis=1,  keepdims=True)
-    # accuracy-weighted ensemble probability
-    wavg_p   = (P * A).sum(axis=1, keepdims=True) / (A.sum(axis=1, keepdims=True) + 1e-6)
+    mean_p = P.mean(axis=1, keepdims=True)
+    var_p = P.var(axis=1,  keepdims=True)
+    wavg_p = (P * A).sum(axis=1, keepdims=True) / (A.sum(axis=1, keepdims=True) + 1e-6)
 
-    return np.hstack([P, A, mean_p, var_p, wavg_p])     # final shape (N, 2*n_mods + 3)
+    return np.hstack([P, A, mean_p, var_p, wavg_p])
 
-
-def vote_from_prob(p: float, up: float, down: float) -> float:
-    """Voting logic for classification-style submodels."""
-    return 1 if p > up else (0 if p < down else 0.5)
-
-def vote_from_ret(r: float) -> float:
-    """Voting logic for regression-style submodels."""
-    return 1 if r > REG_UP else (0 if r < REG_DOWN else 0.5)
-
-def actual_direction(df: pd.DataFrame, t: int) -> int:
-    """
-    Returns 1 if next close > current close, else 0.
-    (Close-to-close direction, as required.)
-    """
-    return int(df['close'].iat[t+1] > df['close'].iat[t])
-
-# ─── Helper to construct the chosen meta learner ─────────────────────────────
-def _make_meta_model():
-    """
-    Return an *un-fitted* probability-calibrated classifier.
-    All models expose .fit(X,y) and .predict_proba(X) with a calibrated output
-    that is much better aligned across different meta-model options.
-    """
+def make_meta_model():
     if META_MODEL_TYPE == "logreg":
         base = LogisticRegression(max_iter=2000, class_weight="balanced")
     elif META_MODEL_TYPE == "lgbm":
@@ -114,7 +112,7 @@ def _make_meta_model():
             tree_method="hist", objective="binary:logistic",
             eval_metric="logloss", random_state=42
         )
-        return base     
+        return base
     elif META_MODEL_TYPE == "cat":
         from catboost import CatBoostClassifier
         base = CatBoostClassifier(
@@ -132,89 +130,121 @@ def _make_meta_model():
         )
         return base
 
-    # --- temperature-scale the probability output -----------------
-    return CalibratedClassifierCV(
-        base, method="isotonic", cv=3, n_jobs=-1
-    )
+    return CalibratedClassifierCV(base, method="isotonic", cv=3, n_jobs=-1)
+
 
 def update_submeta_history(CSV_PATH, HISTORY_PATH,
                            submods=SUBMODS, window=50, verbose=True):
-    """
-    Keeps submeta_history_*.csv in sync with the raw price CSV.
-    Handles an arbitrary number of sub-models (N_SUBMODS).
-    """
+
     df = pd.read_csv(CSV_PATH)
     if verbose:
         print("── DEBUG: CSV_PATH =", CSV_PATH)
         print("── DEBUG: columns in CSV:", df.columns.tolist())
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    col_m  = [f"m{i+1}"   for i in range(len(submods))]
-    col_acc= [f"acc{i+1}" for i in range(len(submods))]
-    if verbose:
-        print(HISTORY_PATH)
+    channels = []
+    for m in submods:
+        if is_multi(m):
+            for h in m.MULTI_HORIZONS:
+                channels.append({"mod": m, "h": int(h)})
+        else:
+            channels.append({"mod": m, "h": None})
+    n_ch = len(channels)
+
+    col_m = [f"m{i+1}"   for i in range(n_ch)]
+    col_acc = [f"acc{i+1}" for i in range(n_ch)]
+
+    hist = None
     if os.path.exists(HISTORY_PATH):
-        if verbose:
-            print("exists")
-        hist = pd.read_csv(HISTORY_PATH)
-        hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True)
-        last_ts   = hist["timestamp"].iloc[-1]
-        start_idx = df[df["timestamp"] > last_ts].index.min()
-        if pd.isna(start_idx):
+        tmp = pd.read_csv(HISTORY_PATH)
+        expected_cols = ["timestamp", *col_m, *col_acc, "meta_label"]
+        if list(tmp.columns) == expected_cols:
+            hist = tmp
+            hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True)
+        else:
+            if verbose:
+                print("[HISTORY] Schema changed; rebuilding history from scratch.")
+            hist = None
+
+    HMAX = max_lookahead(submods)
+    n = len(df)
+    usable_last_i = n - 1 - max(1, HMAX)
+    if usable_last_i < 0:
+        raise ValueError("Not enough rows to build history.")
+
+    if hist is not None and len(hist) > 0:
+        last_ts = hist["timestamp"].iloc[-1]
+        future = df[df["timestamp"] > last_ts]
+        if future.empty:
             if verbose: print("[HISTORY] Already up-to-date.")
             return hist
+        start_idx = int(future.index.min())
     else:
         hist = pd.DataFrame(columns=["timestamp", *col_m, *col_acc, "meta_label"])
-        start_idx = int(len(df) * 0.6)
+        start_idx = int(n * 0.6)
 
-    # pre-compute full labels/targets for ground truth accuracy
-    label_dfs = {}
-    for mod in submods:
-        if hasattr(mod, "compute_labels"):
-            label_dfs[mod] = mod.compute_labels(df).reset_index(drop=True)
-        else:
-            label_dfs[mod] = mod.compute_target(df).reset_index(drop=True)
+    start_idx = max(0, min(start_idx, usable_last_i))
+    end_idx = usable_last_i  # inclusive
 
-    # rolling storage for accuracy -----------------------------------------
-    preds_hist  = [[] for _ in submods]
-    labels_hist = [[] for _ in submods]
+    preds_hist = [[] for _ in range(n_ch)]
+    labels_hist = [[] for _ in range(n_ch)]
     recs = []
 
-    for i in range(start_idx, len(df) - 1):
+    for i in range(start_idx, end_idx + 1):  # inclusive; i+1 and i+HMAX are safe
         slc = df.iloc[: i + 1].reset_index(drop=True)
         preds, labels = [], []
 
-        for mod in submods:
-            if hasattr(mod, "compute_labels"):
-                d   = mod.compute_labels(slc)
-                tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["label"])
-                last_feats = d[mod.FEATURES].iloc[[-1]]
-                model = mod.fit(tr[mod.FEATURES].values, tr["label"].values)
-                p = mod.predict(model, last_feats)[0]
-                lbl = label_dfs[mod]["label"].iloc[i]
-            else:                                    # regression style
-                d   = mod.compute_target(slc)
-                tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["target"])
-                last_feats = d[mod.FEATURES].iloc[[-1]]
-                model = mod.fit(tr[mod.FEATURES], tr["target"])
-                p = mod.predict(model, last_feats)[0]
-                lbl = int(label_dfs[mod]["target"].iloc[i] > 0)
-            preds.append(p); labels.append(lbl)
+        for ch in channels:
+            m, h = ch["mod"], ch["h"]
 
-        # rolling accuracies ------------------------------------------------
-        for k in range(len(submods)):
-            preds_hist[k].append(preds[k]); labels_hist[k].append(labels[k])
+            if hasattr(m, "compute_labels"):  # classifier path
+                if is_multi(m):
+                    X_tr, y_tr = prepare_train_for_horizon(slc, m, h)
+                    if len(y_tr) < 50:
+                        p = 0.5
+                    else:
+                        last_feats = m.compute_labels(slc)[m.FEATURES].iloc[[-1]]
+                        model = m.fit(X_tr, y_tr, horizon=h)  # safe: only for multi
+                        p = m.predict(model, last_feats)[0]
+                    lbl = int(df["close"].iat[i + h] > df["close"].iat[i])
+                else:
+                    X_tr, y_tr = prepare_train(slc, m)
+                    if len(y_tr) < 50:
+                        p = 0.5
+                    else:
+                        last_feats = m.compute_labels(slc)[m.FEATURES].iloc[[-1]]
+                        model = m.fit(X_tr, y_tr)            # no horizon kwarg
+                        p = m.predict(model, last_feats)[0]
+                    lbl = int(df["close"].iat[i + 1] > df["close"].iat[i])  # 1-step
+            else:
+                d = m.compute_target(slc)
+                tr  = d.iloc[:-1].dropna(subset=m.FEATURES + ["target"])
+                last_feats = d[m.FEATURES].iloc[[-1]]
+                if len(tr) < 50:
+                    p = 0.0
+                else:
+                    model = m.fit(tr[m.FEATURES], tr["target"])
+                    p = m.predict(model, last_feats)[0]
+                d_full = m.compute_target(df)
+                lbl = int(d_full["target"].iat[i] > 0)
+
+            preds.append(p)
+            labels.append(lbl)
 
         accs = []
-        for k in range(len(submods)):
+        for k in range(n_ch):
+            preds_hist[k].append(preds[k])
+            labels_hist[k].append(labels[k])
             ph = np.array(preds_hist[k][-window-1:-1])
             lh = np.array(labels_hist[k][-window-1:-1])
             accs.append(np.mean(np.round(ph) == lh) if len(ph) else 0.5)
 
-        rec = {"timestamp": slc["timestamp"].iat[-1],
-               **{col_m[k]:   preds[k] for k in range(len(submods))},
-               **{col_acc[k]: accs[k]  for k in range(len(submods))},
-               "meta_label":  int(df["close"].iat[i+1] > df["close"].iat[i])}
+        rec = {
+            "timestamp": df["timestamp"].iat[i],
+            **{col_m[k]:   preds[k] for k in range(n_ch)},
+            **{col_acc[k]: accs[k]  for k in range(n_ch)},
+            "meta_label":  int(df["close"].iat[i+1] > df["close"].iat[i]),
+        }
         recs.append(rec)
 
         if verbose and (i - start_idx) % 10 == 0:
@@ -222,10 +252,10 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
 
     if recs:
         hist = pd.concat([hist, pd.DataFrame(recs)], ignore_index=True)
+        os.makedirs(RESULTS_DIR, exist_ok=True)
         hist.to_csv(HISTORY_PATH, index=False)
         if verbose: print(f"[HISTORY] Updated ⇒ {len(hist)} rows.")
     return hist
-
 
 
 def optimize_asymmetric_thresholds(
@@ -237,16 +267,15 @@ def optimize_asymmetric_thresholds(
     if manual_thresholds is not None:
         return manual_thresholds
 
-    # --- coarse → fine grid search (5× faster) ----------------------------
-    up_coarse   = np.linspace(0.60, 0.80, 11)
+    up_coarse = np.linspace(0.60, 0.80, 11)
     down_coarse = np.linspace(0.20, 0.40, 11)
 
     best_up, best_dn, best_sc = 0.55, 0.45, -np.inf
     for up in up_coarse:
         dn_candidates = down_coarse[down_coarse < up - 0.05]
         for dn in dn_candidates:
-            mask  = (probs > up) | (probs < dn)
-            if mask.sum() < 30:                       # skip tiny support
+            mask = (probs > up) | (probs < dn)
+            if mask.sum() < 30:
                 continue
 
             if metric == "accuracy":
@@ -254,14 +283,13 @@ def optimize_asymmetric_thresholds(
             elif metric == "f1":
                 from sklearn.metrics import f1_score
                 score = f1_score(labels[mask], probs[mask] > up)
-            elif metric == "profit":                  # NEW ▼
-                # assume +1 / −1 payoff per correct direction
+            elif metric == "profit":
                 pnl = np.where(
                     probs[mask] > up,  (labels[mask] == 1).astype(int),
                     - (labels[mask] == 0).astype(int)
                 )
                 score = pnl.mean()
-            else:                                     # roc_auc, etc.
+            else:
                 from sklearn.metrics import roc_auc_score
                 score = roc_auc_score(labels[mask], probs[mask])
 
@@ -275,23 +303,21 @@ def train_and_save_meta(cache_csv: str,
                         model_pkl: str,
                         threshold_pkl: str,
                         metric: str = "accuracy",
-                        n_mods: int = N_SUBMODS):
+                        n_mods: int | None = None):
 
     hist = pd.read_csv(cache_csv)
-    X = _build_meta_features(hist, n_mods)
+    X = build_meta_features(hist, n_mods)
     y = hist["meta_label"].values
 
-    # 60 % train / 40 % val split
     split = int(len(y) * 0.6)
     X_tr, y_tr = X[:split], y[:split]
     X_val, y_val = X[split:], y[split:]
 
-    meta = _make_meta_model()
+    meta = make_meta_model()
     meta.fit(X_tr, y_tr)
 
-    # asymmetric threshold optimisation on the *held-out* slice
     probs_val = meta.predict_proba(X_val)[:, 1]
-    up, down  = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
+    up, down = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
 
     with open(model_pkl, "wb") as f:
         pickle.dump(meta, f)
@@ -301,87 +327,93 @@ def train_and_save_meta(cache_csv: str,
     return meta, up, down
 
 
-
 def backtest_submodels(
     df: pd.DataFrame,
     initial_frac: float = 0.6,
     window: int = 50,
 ) -> pd.DataFrame:
-    """
-    Walk-forward back-test of *all active* sub-models.
-    Outputs only predictions m1..mN, rolling accuracies acc1..accN,
-    and meta_label.  When USE_CLASSIFIER is false N=5 (legacy path).
-    """
-    # pick sub-models --------------------------------------------------------
     submods = [mod1, mod2, mod3, mod4, mod5] + ([mod6] if USE_CLASSIFIER else [])
-    n_mods  = len(submods)
+    channels = expand_channels(submods)
+    n_ch = len(channels)
 
-    n   = len(df)
+    n = len(df)
+    HMAX = max_lookahead(submods)
     cut = int(n * initial_frac)
+    end_limit = n - 1 - HMAX  # ensures t+1 and t+HMAX exist
+
     rec = []
 
-    # pre-compute full labels/targets once for accuracy reference ----------
-    label_dfs = {}
-    for mod in submods:
-        if hasattr(mod, "compute_labels"):
-            label_dfs[mod] = mod.compute_labels(df).reset_index(drop=True)
-        else:
-            label_dfs[mod] = mod.compute_target(df).reset_index(drop=True)
+    preds_history = [[] for _ in range(n_ch)]
+    labels_history = [[] for _ in range(n_ch)]
 
-    # rolling containers for accuracy computation ---------------------------
-    preds_history  = [[] for _ in range(n_mods)]
-    labels_history = [[] for _ in range(n_mods)]
-
-    for t in tqdm(range(cut, n - 1), desc="Submodel BT"):
+    for t in tqdm(range(max(cut, 0), end_limit), desc="Submodel BT"):
         slice_df = df.iloc[: t + 1].reset_index(drop=True)
 
         preds, labels = [], []
-        # ---------- single-bar prediction for every sub-model --------------
-        for mod in submods:
-            if hasattr(mod, "compute_labels"):          # classifier sub-model
-                d   = mod.compute_labels(slice_df)
-                tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["label"])
-                last_feats = d[mod.FEATURES].iloc[[-1]]
-                model = mod.fit(tr[mod.FEATURES].values, tr["label"].values)
-                p   = mod.predict(model, last_feats)[0]
-                lbl = label_dfs[mod]["label"].iloc[t]
-            else:                                       # regression sub-model
-                d   = mod.compute_target(slice_df)
-                tr  = d.iloc[:-1].dropna(subset=mod.FEATURES + ["target"])
-                last_feats = d[mod.FEATURES].iloc[[-1]]
-                model = mod.fit(tr[mod.FEATURES], tr["target"])
-                p   = mod.predict(model, last_feats)[0]
-                lbl = int(label_dfs[mod]["target"].iloc[t] > 0)
+        for ch in channels:
+            m = ch["mod"]; h = ch["h"]
+
+            if hasattr(m, "compute_labels"):  # classifier (single or multi)
+                d   = m.compute_labels(slice_df)
+                if is_multi(m):
+                    lblcol = label_col_for(m, h)         # e.g., label_h3
+                    tr  = d.iloc[:-1].dropna(subset=m.FEATURES + [lblcol])
+                    if len(tr) < 50:
+                        p = 0.5
+                    else:
+                        last_feats = d[m.FEATURES].iloc[[-1]]
+                        model = m.fit(tr[m.FEATURES].values, tr[lblcol].values, horizon=h)
+                        p = m.predict(model, last_feats)[0]
+                    lbl = 1 if df["close"].iat[t + h] > df["close"].iat[t] else 0
+                else:
+                    tr  = d.iloc[:-1].dropna(subset=m.FEATURES + ["label"])
+                    if len(tr) < 50:
+                        p = 0.5
+                    else:
+                        last_feats = d[m.FEATURES].iloc[[-1]]
+                        model = m.fit(tr[m.FEATURES].values, tr["label"].values)
+                        p = m.predict(model, last_feats)[0]
+                    lbl = 1 if df["close"].iat[t + 1] > df["close"].iat[t] else 0
+
+            else:  # regression-style submodel
+                d = m.compute_target(slice_df)
+                tr  = d.iloc[:-1].dropna(subset=m.FEATURES + ["target"])
+                last_feats = d[m.FEATURES].iloc[[-1]]
+                if len(tr) < 50:
+                    p = 0.0
+                else:
+                    model = m.fit(tr[m.FEATURES], tr["target"])
+                    p = m.predict(model, last_feats)[0]
+                lbl = 1 if df["close"].iat[t + 1] > df["close"].iat[t] else 0
+
             preds.append(p); labels.append(lbl)
 
-        # ---------- rolling accuracy histories ----------------------------
-        for k in range(n_mods):
+        accs = []
+        for k in range(n_ch):
             preds_history[k].append(preds[k])
             labels_history[k].append(labels[k])
-
-        accs = []
-        for k in range(n_mods):
             ph = np.array(preds_history[k][-window - 1 : -1])
             lh = np.array(labels_history[k][-window - 1 : -1])
             accs.append(np.mean(np.round(ph) == lh) if len(ph) else 0.5)
 
         rec_dict = {
             "t": t,
-            **{f"m{k+1}":   preds[k] for k in range(n_mods)},
-            **{f"acc{k+1}": accs[k]  for k in range(n_mods)},
-            "meta_label": int(df["close"].iat[t + 1] > df["close"].iat[t]),
+            **{f"m{k+1}":   preds[k] for k in range(n_ch)},
+            **{f"acc{k+1}": accs[k]  for k in range(n_ch)},
+            "meta_label": 1 if df["close"].iat[t + 1] > df["close"].iat[t] else 0,
         }
         rec.append(rec_dict)
 
     return pd.DataFrame(rec).set_index("t")
 
+
 def walkforward_meta_backtest(cache_csv: str,
-                              n_mods: int = N_SUBMODS,
+                              n_mods: int | None = None,
                               initial_frac: float = 0.6,
                               metric: str = "accuracy"):
 
     hist = pd.read_csv(cache_csv)
-    N    = len(hist)
+    N = len(hist)
     start = int(N * initial_frac)
     if start < 10:
         raise ValueError("History too short for walk-forward meta test.")
@@ -389,21 +421,19 @@ def walkforward_meta_backtest(cache_csv: str,
     records = []
 
     for i in tqdm(range(start, N), desc="Walk-forward (meta)"):
-
-        X_train = _build_meta_features(hist.iloc[:i], n_mods)
+        X_train = build_meta_features(hist.iloc[:i], n_mods)
         y_train = hist.loc[:i-1, "meta_label"].values
 
-        meta = _make_meta_model().fit(X_train, y_train)
+        meta = make_meta_model().fit(X_train, y_train)
 
-        # choose thresholds on last 20 % of training slice
         split_val = max(1, int(len(y_train) * 0.2))
         probs_val = meta.predict_proba(X_train[-split_val:])[:, 1]
         up, down  = optimize_asymmetric_thresholds(
                         probs_val, y_train[-split_val:], metric=metric)
 
-        x_row   = _build_meta_features(hist.iloc[[i]], n_mods)
+        x_row = build_meta_features(hist.iloc[[i]], n_mods)
         prob_up = float(meta.predict_proba(x_row)[0, 1])
-        action  = "BUY" if prob_up > up else ("SELL" if prob_up < down else "HOLD")
+        action = "BUY" if prob_up > up else ("SELL" if prob_up < down else "HOLD")
 
         rec = {
             "timestamp":  hist.at[i, "timestamp"],
@@ -412,18 +442,16 @@ def walkforward_meta_backtest(cache_csv: str,
             "up_thresh":  up,
             "down_thresh":down,
         }
-        # keep the raw sub-model info for later analysis
-        for k in range(1, n_mods+1):
-            rec[f"m{k}"]   = hist.at[i, f"m{k}"]
-            rec[f"acc{k}"] = hist.at[i, f"acc{k}"]
+        k = sum(1 for c in hist.columns if isinstance(c, str) and c.startswith("m") and c[1:].isdigit())
+        for j in range(1, k+1):
+            rec[f"m{j}"]   = hist.at[i, f"m{j}"]
+            rec[f"acc{j}"] = hist.at[i, f"acc{j}"]
         records.append(rec)
 
     return pd.DataFrame(records)
 
 
-# ───────────────────────── run_backtest ──────────────────────────────────────
-def _enforce_position_rules(actions, start_open=False):
-    """Adjust BUY/SELL signals based on existing position state."""
+def enforce_position_rules(actions, start_open=False):
     out = []
     open_pos = start_open
     for act in actions:
@@ -446,36 +474,27 @@ def _enforce_position_rules(actions, start_open=False):
 
 
 def run_backtest(return_df: bool = False, start_open: bool = False):
-    """
-    Back-test either classic sub-vote or the walk-forward meta pipeline.
-    """
     df_orig = pd.read_csv(CSV_PATH)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # ─── Assemble active sub-model list ────────────────────────────────────
     submods = [mod1, mod2, mod3, mod4, mod5] + ([mod6] if USE_CLASSIFIER else [])
-    n_mods  = len(submods)
+    channels = expand_channels(submods)
+    n_ch = len(channels)
 
-    # ----------------------------------------------------------------------
-    # ---------- Classic majority-vote pipeline ----------------------------
-    # ----------------------------------------------------------------------
     if MODE == "sub-vote":
         back = backtest_submodels(df_orig, initial_frac=0.6)
         VOTE_UP, VOTE_DOWN = 0.55, 0.45
 
-        # one vote column per active sub-model -----------------------------
-        for k, mod in enumerate(submods, start=1):
+        vote_cols = []
+        for k, ch in enumerate(channels, start=1):
             pred_col, vote_col = f"m{k}", f"v{k}"
-            if hasattr(mod, "compute_labels"):          # classifier style
-                back[vote_col] = back[pred_col].map(
-                    lambda p: vote_from_prob(p, VOTE_UP, VOTE_DOWN)
-                )
-            else:                                       # regression style
-                back[vote_col] = back[pred_col].map(vote_from_ret)
+            m = ch["mod"]
+            if hasattr(m, "compute_labels"):          # classifier style
+                back[vote_col] = back[pred_col].map(lambda p: 1 if p > VOTE_UP else (0 if p < VOTE_DOWN else 0.5))
+            else:                                     # regression style
+                back[vote_col] = back[pred_col].map(lambda r: 1 if r > REG_UP else (0 if r < REG_DOWN else 0.5))
+            vote_cols.append(vote_col)
 
-        vote_cols    = [f"v{k}" for k in range(1, n_mods + 1)]
-        majority_req = (n_mods // 2) + 1
-
+        majority_req = (n_ch // 2) + 1
         back["buy_votes"]  = (back[vote_cols] == 1).sum(axis=1)
         back["sell_votes"] = (back[vote_cols] == 0).sum(axis=1)
         back["action"] = back.apply(
@@ -485,27 +504,18 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
         )
 
         back = back.reset_index().rename(columns={"index": "t"})
-        back["timestamp"] = pd.to_datetime(
-            df_orig["timestamp"].iloc[back["t"] + 1]
-        )
-        df_out = back[
-            ["timestamp", *[f"m{k}" for k in range(1, n_mods + 1)], "action"]
-        ]
+        back["timestamp"] = pd.to_datetime(df_orig["timestamp"].iloc[back["t"] + 1])
+        df_out = back[["timestamp", *[f"m{k}" for k in range(1, n_ch + 1)], "action"]]
         df_out["action"] = df_out["action"].map({1: "BUY", 0: "SELL", 0.5: "HOLD"})
 
-    # ----------------------------------------------------------------------
-    # ---------- NEW: Walk-forward meta pipeline ---------------------------
-    # ----------------------------------------------------------------------
     else:
-        cache_csv = os.path.join(
-            RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv"
-        )
-        # ensure history is up-to-date
+        cache_csv = os.path.join(RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv")
+        os.makedirs(RESULTS_DIR, exist_ok=True)
         update_submeta_history(CSV_PATH, cache_csv, submods=submods, verbose=True)
 
         df_out = walkforward_meta_backtest(
             cache_csv=cache_csv,
-            n_mods=n_mods,
+            n_mods=None,          # infer from history columns
             initial_frac=0.6,
             metric="accuracy",
         )
@@ -514,95 +524,103 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
         df_out.to_csv(out_fn, index=False, float_format="%.8f")
         print(f"[RESULT] Walk-forward results saved to {out_fn}")
 
-    # ----------------------------------------------------------------------
     if return_df:
-        df_out["action"] = _enforce_position_rules(df_out["action"].tolist(), start_open)
+        df_out["action"] = enforce_position_rules(df_out["action"].tolist(), start_open)
         return df_out
 
-    
 
-# ─── tiny helpers (unchanged) ────────────────────────────────────────────────
-def _prepare_train(df_slice: pd.DataFrame, module):
-    """Return (X, y) for the given sub-module on df_slice[:-1]."""
-    if hasattr(module, "compute_labels"):
-        d  = module.compute_labels(df_slice)
+def prepare_train(df_slice: pd.DataFrame, module):
+    if hasattr(module, "compute_labels") and not is_multi(module):
+        d = module.compute_labels(df_slice)
         tr = d.iloc[:-1].dropna(subset=module.FEATURES + ["label"])
         return tr[module.FEATURES].values, tr["label"].values
-    d  = module.compute_target(df_slice)
+    d = module.compute_target(df_slice)
     tr = d.iloc[:-1].dropna(subset=module.FEATURES + ["target"])
     return tr[module.FEATURES], tr["target"]
 
+def prepare_train_for_horizon(df_slice: pd.DataFrame, module, h: int):
+    assert hasattr(module, "compute_labels"), "Horizon training requires classifier module"
+    d = module.compute_labels(df_slice)
+    lbl_col = label_col_for(module, h)
+    tr = d.iloc[:-1].dropna(subset=module.FEATURES + [lbl_col])
+    return tr[module.FEATURES].values, tr[lbl_col].values
 
-def _row(df_slice: pd.DataFrame, module, idx: int | None = None):
+
+
+def row(df_slice: pd.DataFrame, module, idx: int | None = None):
     d = (
         module.compute_labels(df_slice)
         if hasattr(module, "compute_labels")
         else module.compute_target(df_slice)
     )
-
     if idx is not None and idx in d.index:
         return d.loc[[idx], module.FEATURES]
-
-    # graceful fall-back when the requested index is missing
     return d[module.FEATURES].iloc[[-1]]
 
 
-
-# ────────────────────────── run_live (verbose always on) ────────────────────
 def run_live(return_result: bool = True, position_open: bool = False):
-    """
-    Produce one live prediction.
-
-    • MODE == "sub-vote" → majority-vote result (0 / 0.5 / 1)
-    • MODE == "sub-meta" → tuple (probability, "BUY"/"HOLD"/"SELL")
-
-    Console output is always enabled.
-    """
-    # ─── Choose active sub-models -----------------------------------------
     submods = [mod1, mod2, mod3, mod4, mod5]
     if "USE_CLASSIFIER" in globals() and USE_CLASSIFIER:
-        submods.append(mod6)                # mod6 == sub.classifier
-    n_mods = len(submods)
+        submods.append(mod6)
+    channels = []
+    for m in submods:
+        if is_multi(m):
+            for h in m.MULTI_HORIZONS:
+                channels.append({"mod": m, "h": int(h)})
+        else:
+            channels.append({"mod": m, "h": None})
+    n_ch = len(channels)
 
     df = pd.read_csv(CSV_PATH)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    t = len(df) - 1                         # last bar index
+    t = len(df) - 1
 
-    # ─── Majority-vote path ───────────────────────────────────────────────
     if MODE == "sub-vote":
         VOTE_UP, VOTE_DOWN = 0.55, 0.45
 
-        # current-bar predictions for each sub-model -----------------------
         preds = []
-        for mod in submods:
-            preds.append(
-                mod.predict(
-                    mod.fit(*_prepare_train(df, mod)),
-                    _row(df, mod, t)
-                )[0]
-            )
+        for ch in channels:
+            m, h = ch["mod"], ch["h"]
+            if hasattr(m, "compute_labels"):
+                if is_multi(m):
+                    X_tr, y_tr = prepare_train_for_horizon(df, m, h)
+                    if len(y_tr) < 50:
+                        preds.append(0.5)
+                        continue
+                    model = m.fit(X_tr, y_tr, horizon=h)      # safe: multi only
+                    feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
+                    preds.append(m.predict(model, feats)[0])
+                else:
+                    X_tr, y_tr = prepare_train(df, m)
+                    if len(y_tr) < 50:
+                        preds.append(0.5)
+                        continue
+                    model = m.fit(X_tr, y_tr)                 # no horizon kwarg
+                    feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
+                    preds.append(m.predict(model, feats)[0])
+            else:
+                X_tr, y_tr = prepare_train(df, m)
+                model = m.fit(X_tr, y_tr)
+                feats = row(df, m, t)
+                preds.append(m.predict(model, feats)[0])
 
-        # translate predictions → votes -----------------------------------
         votes = []
-        for k, mod in enumerate(submods):
-            if hasattr(mod, "compute_labels"):           # classifier style
-                votes.append(vote_from_prob(preds[k], VOTE_UP, VOTE_DOWN))
-            else:                                        # regression style
-                votes.append(vote_from_ret(preds[k]))
+        for k, ch in enumerate(channels):
+            m = ch["mod"]
+            if hasattr(m, "compute_labels"):
+                votes.append(1 if preds[k] > VOTE_UP else (0 if preds[k] < VOTE_DOWN else 0.5))
+            else:
+                votes.append(1 if preds[k] > REG_UP else (0 if preds[k] < REG_DOWN else 0.5))
 
         buy, sell   = votes.count(1), votes.count(0)
-        majority_req = (n_mods // 2) + 1                # 3 of 5, 4 of 6, …
-        majority     = 1 if buy  >= majority_req else \
-                       (0 if sell >= majority_req else 0.5)
+        majority_req = (n_ch // 2) + 1
+        majority     = 1 if buy  >= majority_req else (0 if sell >= majority_req else 0.5)
         action = "BUY" if majority == 1 else ("SELL" if majority == 0 else "HOLD")
-        action = _enforce_position_rules([action], position_open)[0]
+        action = enforce_position_rules([action], position_open)[0]
         print(f"[LIVE-VOTE] result = {action}")
         return action if return_result else None
 
-    # ─── Meta-model path ──────────────────────────────────────────────────
-    hist = update_submeta_history(
-        CSV_PATH, HISTORY_PATH, submods=submods, verbose=True
-    )
+    hist = update_submeta_history(CSV_PATH, HISTORY_PATH, submods=submods, verbose=True)
 
     meta_pkl   = os.path.join(RESULTS_DIR, "meta_model.pkl")
     thresh_pkl = os.path.join(RESULTS_DIR, "meta_thresholds.pkl")
@@ -622,57 +640,46 @@ def run_live(return_result: bool = True, position_open: bool = False):
         meta, up, down = train_and_save_meta(HISTORY_PATH, meta_pkl, thresh_pkl)
         print(f"[META] Re-trained {META_MODEL_TYPE}  BUY>{up:.2f} / SELL<{down:.2f}")
 
-    # current sub-model preds + rolling accuracies -------------------------
-    window = 50
-    p, accs = [], []
+    current_probs = []
+    for ch in channels:
+        m, h = ch["mod"], ch["h"]
+        if hasattr(m, "compute_labels"):
+            if is_multi(m):
+                X_tr, y_tr = prepare_train_for_horizon(df, m, h)
+                if len(y_tr) < 50:
+                    current_probs.append(0.5)
+                    continue
+                model = m.fit(X_tr, y_tr, horizon=h)          # safe: multi only
+                feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
+                current_probs.append(m.predict(model, feats)[0])
+            else:
+                X_tr, y_tr = prepare_train(df, m)
+                if len(y_tr) < 50:
+                    current_probs.append(0.5)
+                    continue
+                model = m.fit(X_tr, y_tr)                     # no horizon kwarg
+                feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
+                current_probs.append(m.predict(model, feats)[0])
+        else:
+            X_tr, y_tr = prepare_train(df, m)
+            model = m.fit(X_tr, y_tr)
+            feats = row(df, m, t)
+            current_probs.append(m.predict(model, feats)[0])
 
-    for mod in submods:
-        if hasattr(mod, "compute_labels"):               # classifier sub-model
-            d  = mod.compute_labels(df)
-            pi = mod.predict(mod.fit(*_prepare_train(df, mod)), _row(df, mod, t))[0]
+    k = sum(1 for c in hist.columns if isinstance(c, str) and c.startswith("m") and c[1:].isdigit())
+    last_accs = [float(hist[f"acc{i+1}"].iloc[-1]) if f"acc{i+1}" in hist.columns else 0.5 for i in range(k)]
 
-            past_labels = d["label"].iloc[-(window + 1):-1].values
-            past_preds  = d["label"].iloc[-(window + 1):-1].index.map(
-                lambda j: mod.predict(
-                    mod.fit(*_prepare_train(d.iloc[: j + 1], mod)),
-                    _row(d, mod, j)
-                )[0]
-            ).values if len(d) > window else np.array([])
+    row_df = pd.DataFrame([{**{f"m{i+1}": current_probs[i] for i in range(k)},
+                            **{f"acc{i+1}": last_accs[i] for i in range(k)}}])
 
-            acc = (np.round(past_preds) == past_labels).mean() if len(past_preds) else 0.5
-        else:                                            # regression sub-model
-            d  = mod.compute_target(df)
-            pi = mod.predict(mod.fit(*_prepare_train(df, mod)), _row(df, mod, t))[0]
-
-            past_labels = (d["target"].iloc[-(window + 1):-1] > 0).astype(int).values
-            past_preds  = d["target"].iloc[-(window + 1):-1].index.map(
-                lambda j: int(
-                    mod.predict(
-                        mod.fit(*_prepare_train(d.iloc[: j + 1], mod)),
-                        _row(d, mod, j)
-                    )[0] > 0
-                )
-            ).values if len(d) > window else np.array([])
-
-            acc = (np.round(past_preds) == past_labels).mean() if len(past_preds) else 0.5
-
-        p.append(pi)
-        accs.append(acc)
-
-    feat_vec = _build_meta_features(
-                  pd.DataFrame([p + accs], columns=[*range(len(p)+len(accs))]),
-                  n_mods
-              )
-    prob  = float(meta.predict_proba(feat_vec)[0, 1])
+    feat_vec = build_meta_features(row_df, n_mods=k)
+    prob = float(meta.predict_proba(feat_vec)[0, 1])
     action = "BUY" if prob > up else ("SELL" if prob < down else "HOLD")
-    action = _enforce_position_rules([action], position_open)[0]
+    action = enforce_position_rules([action], position_open)[0]
     print(f"[LIVE] P(up)={prob:.3f}  →  {action}  (BUY>{up:.2f} / SELL<{down:.2f})")
 
     return (prob, action) if return_result else None
 
-
-
-# ─── Entrypoint ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse

@@ -12,8 +12,11 @@ from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 
 FEATURES = [
-    'sentiment', 'volume', 'volume_zscore',
-    'obv', 'gap_vs_prev', 'wick_dominance'
+    'sentiment',
+    'volume', 'log_volume', 'volume_zscore', 'transactions',
+    'vwap', 'obv',
+    'gap_vs_prev', 'wick_dominance',
+    'hour_sin', 'hour_cos', 'day_of_week_sin', 'day_of_week_cos', 'month'
 ]
 
 LGBM_PARAMS = {

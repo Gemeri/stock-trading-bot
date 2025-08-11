@@ -129,7 +129,7 @@ def load_tickerlist() -> list[str]:
                     val = val.strip()
                     # Allow direct trade logic scripts via selection_model
                     if val.lower().endswith('.py'):
-                        SELECTION_MODEL = f"logic\\{val}"
+                        SELECTION_MODEL = f"logic{os.sep}{val}"
                         TRADE_LOGIC = val
                     else:
                         SELECTION_MODEL = val
@@ -442,9 +442,14 @@ api = tradeapi.REST(API_KEY, API_SECRET, API_BASE_URL, api_version='v2')
 # 4. Sentiment Analysis Model Setup
 # -------------------------------
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-tokenizer = AutoTokenizer.from_pretrained("mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
-model = AutoModelForSequenceClassification.from_pretrained("mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
-
+try:
+    tokenizer = AutoTokenizer.from_pretrained("mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
+    model = AutoModelForSequenceClassification.from_pretrained("mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
+except:
+    tokenizer = None
+    model = None
+    logging.info("Offline. API and Sentiment will not function and will result in errors")
+    
 def predict_sentiment(text):
     inputs = tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
     outputs = model(**inputs)
@@ -682,8 +687,13 @@ def fetch_candles_plus_features_and_predclose(
     else:
         bars_needed = bars
 
-    if bars_needed == 0:
-        logging.info(f"[{ticker}] Data already up-to-date – no new candles.")
+    have_preds = (
+        "predicted_close" in df_existing.columns
+        and df_existing["predicted_close"].notna().all()
+    )
+
+    if bars_needed == 0 and have_preds:
+        logging.info(f"[{ticker}] Data up-to-date and preds present – skipping update.")
         return df_existing.copy()
 
 
@@ -2071,7 +2081,7 @@ def maybe_update_best_tickers(scheduled_time_ny: str | None = None):
         if not clock.is_open:
             return
     except Exception as e:
-        logging.error(f"Clock check failed: {e}")
+        logging.error(f"Clock check failed")
         return
 
     _, cache_ts = load_best_ticker_cache()
@@ -2631,7 +2641,7 @@ def run_job(scheduled_time_ny: str):
             clock = api.get_clock()
             break
         except Exception as e:
-            logging.error(f"Error checking market clock (Attempt {attempt}/{max_retries}): {e}")
+            logging.error(f"Error checking market clock (Attempt {attempt}/{max_retries})")
             if attempt < max_retries:
                 time.sleep(60)
             else:
@@ -3093,6 +3103,7 @@ def console_listener():
                                 # ───────────────────────────────────────────────────────────
                                 # 3. Call the user’s trading-logic module
                                 # ───────────────────────────────────────────────────────────
+                                print(logic_module)
                                 action = logic_module.run_backtest(
                                     current_price     = real_close,
                                     predicted_price   = pred_close,

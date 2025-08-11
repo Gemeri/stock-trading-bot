@@ -9,9 +9,11 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 from sklearn.calibration import CalibratedClassifierCV
 
 FEATURES = [
-    'rsi', 'momentum', 'roc',
-    'macd_histogram', 'macd_line', 'macd_signal',
-    'rsi_zscore', 'macd_cross', 'macd_hist_flip'
+    'rsi', 'roc',
+    'macd_line', 'macd_signal', 'macd_histogram',
+    'rsi_zscore', 'macd_cross', 'macd_hist_flip',
+    'adx',
+    'price_change'
 ]
 
 PARAM_GRID = {

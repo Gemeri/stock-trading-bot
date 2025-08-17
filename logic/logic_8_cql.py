@@ -26,6 +26,7 @@ if not logger.handlers:
     _handler.setFormatter(_formatter)
     logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # --------------------------- Constants ---------------------------------------
 
@@ -243,7 +244,15 @@ class ConservativeQLearner:
             invalid = ~valid_mask
             q_vals = q_vals.copy()
             q_vals[invalid] = -1e9  # mask invalid
-        return int(np.argmax(q_vals))
+    
+        q_vals = q_vals.copy()
+        q_vals[ACT_NONE] -= 1e-6
+
+        best_idxs = np.flatnonzero(q_vals == q_vals.max())
+        a = int(np.random.choice(best_idxs))
+
+        logger.debug(f"mask={(valid_mask.tolist() if valid_mask is not None else None)}, act={ACTION_TO_STR[a]}")
+        return a
 
     def update(self, buffer: ReplayBuffer):
         if len(buffer) < self.cfg.batch_size:
@@ -384,31 +393,18 @@ def _train_cql_on_history(
 # --------------------------- Inference Helpers -------------------------------
 
 
-def _decide_action_for_state(
-    agent: ConservativeQLearner,
-    state_vec: np.ndarray,
-    current_price: float,
-    position_qty: float,
-    cash: Optional[float] = None,
-) -> str:
-    """
-    Decide action respecting constraints, coercing invalid choices to NONE.
-    """
+def _decide_action_for_state(agent, state_vec, current_price, position_qty, cash: Optional[float] = None):
     shares = float(position_qty)
     price = float(current_price)
 
-    can_buy = (shares == 0.0) and (price > 0.0) and (cash is not None) and (int(float(cash) // price) > 0)
+    # Allow BUY when cash is unknown (backtests) — only enforce position constraint
+    can_buy  = (shares == 0.0) and (price > 0.0) and (cash is None or int(float(cash) // price) > 0)
     can_sell = (shares > 0.0)
     valid_mask = np.array([True, can_buy, can_sell], dtype=bool)
 
     a = agent.act(state_vec, valid_mask=valid_mask, greedy=True)
-
-    # Enforce business rules: invalid -> NONE
-    if a == ACT_BUY and not can_buy:
-        a = ACT_NONE
-    if a == ACT_SELL and not can_sell:
-        a = ACT_NONE
-
+    if a == ACT_BUY and not can_buy:  a = ACT_NONE
+    if a == ACT_SELL and not can_sell: a = ACT_NONE
     return ACTION_TO_STR[int(a)]
 
 
@@ -576,14 +572,14 @@ def run_backtest(
         ext_pred_value=float(predicted_price),
     )
 
-    # Decide next action; in backtests we don't know current cash here, so only enforce position constraint.
+    # in run_backtest(...):
     action_str = _decide_action_for_state(
-        agent,
-        state_vec,
+        agent, state_vec,
         current_price=float(current_price),
         position_qty=float(position_qty),
-        cash=None,  # cash constraint unknown -> only position-based validity
+        cash=float('inf')  # assume we can buy at least 1 share
     )
+
 
     # Enforce spec: BUY when already long => NONE; SELL when flat => NONE
     if action_str == "BUY" and position_qty > 0:

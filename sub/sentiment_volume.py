@@ -124,3 +124,4 @@ def fit(X_train: pd.DataFrame, y_train: pd.Series):
 def predict(model: LGBMClassifier, X: pd.DataFrame) -> np.ndarray:
     logging.info("Running PREDICT on sentiment_volume")
     return model.predict_proba(X)[:, 1]
+    

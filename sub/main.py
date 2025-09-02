@@ -10,6 +10,10 @@ from sklearn.metrics import roc_auc_score
 
 from typing import Tuple
 
+
+from sklearn.inspection import permutation_importance
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.metrics import brier_score_loss
 import sub.momentum as mod1
 import sub.trend_continuation as mod2
 import sub.mean_reversion as mod3
@@ -36,6 +40,7 @@ TIMEFRAME_MAP = {"4Hour":"H4","2Hour":"H2","1Hour":"H1","30Min":"M30","15Min":"M
 CONVERTED_TIMEFRAME = TIMEFRAME_MAP.get(BAR_TIMEFRAME, BAR_TIMEFRAME)
 HISTORY_PATH = os.path.join(RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv")
 USE_META_LABEL = os.getenv("USE_META_LABEL", "false")
+FEATURE_ANALYTICS_DIR = os.path.join(RESULTS_DIR, "feature-analytics")
 
 TICKERS_STR = "-".join([t.strip() for t in TICKERS if t.strip()]) or "TSLA"
 CSV_PATH  = os.path.join(ROOT_DIR, f"{TICKERS_STR}_{CONVERTED_TIMEFRAME}.csv")
@@ -94,6 +99,101 @@ def _linear_angle_generic(y_vals, x_vals=None):
         return float('nan')
     slope, _ = np.polyfit(x[mask], y[mask], 1)
     return float(np.degrees(np.arctan(slope)))
+
+def get_meta_feature_names(hist: pd.DataFrame, n_mods: int | None = None) -> list[str]:
+    """
+    Reconstruct the feature names used by build_meta_features(hist, n_mods).
+    Order must exactly match build_meta_features stacking:
+      [m1..mN, acc1..accN, mean_p, var_p, wavg_p, feat_*...]
+    """
+    if n_mods is None:
+        n_mods = sum(1 for c in hist.columns if isinstance(c, str) and c.startswith("m") and c[1:].isdigit())
+    prob_cols = [f"m{i+1}"   for i in range(n_mods)]
+    acc_cols  = [f"acc{i+1}" for i in range(n_mods)]
+    extras    = [c for c in hist.columns if isinstance(c, str) and c.startswith("feat_")]
+    # build_meta_features appends mean/var/wavg derived from the m* block
+    return [*prob_cols, *acc_cols, "mean_p", "var_p", "wavg_p", *extras]
+
+
+def _avg_coefficients_from_calibrated(meta) -> np.ndarray | None:
+    """
+    Try to pull averaged linear coefficients out of CalibratedClassifierCV if possible.
+    Returns None if unavailable.
+    """
+    try:
+        ccs = getattr(meta, "calibrated_classifiers_", None)
+        if not ccs:
+            return None
+        coefs = []
+        for cc in ccs:
+            base = getattr(cc, "base_estimator", None)
+            if base is None:
+                continue
+            if hasattr(base, "coef_"):
+                coefs.append(np.ravel(base.coef_))
+            elif hasattr(base, "feature_importances_"):
+                coefs.append(np.ravel(base.feature_importances_))
+        if coefs:
+            M = np.vstack(coefs)
+            return M.mean(axis=0)
+    except Exception:
+        pass
+    return None
+
+
+def compute_model_feature_importance(meta, X_val: np.ndarray, y_val: np.ndarray,
+                                     feature_names: list[str],
+                                     random_state: int = 42) -> pd.DataFrame:
+    """
+    Try multiple routes for importance:
+      1) Native .feature_importances_ (tree models)
+      2) Averaged linear coefficients (Calibrated + Logistic)
+      3) Permutation importance (fallback, model-agnostic)
+    Returns a DataFrame with normalized scores.
+    """
+    importances = None
+    method = None
+
+    # 1) direct attribute
+    try:
+        if hasattr(meta, "feature_importances_"):
+            vals = np.asarray(meta.feature_importances_, dtype=float)
+            if vals.shape[0] == X_val.shape[1]:
+                importances = vals
+                method = "model_feature_importances_"
+    except Exception:
+        pass
+
+    # 2) averaged coefficients from calibrations
+    if importances is None:
+        coefs = _avg_coefficients_from_calibrated(meta)
+        if coefs is not None and coefs.shape[0] == X_val.shape[1]:
+            importances = np.abs(coefs)  # magnitude as importance
+            method = "avg_linear_coefficients"
+
+    # 3) permutation fallback
+    if importances is None:
+        try:
+            perm = permutation_importance(meta, X_val, y_val, n_repeats=10, random_state=random_state, n_jobs=-1)
+            importances = perm.importances_mean
+            method = "permutation_importance"
+        except Exception:
+            # Last resort: zero vector
+            importances = np.zeros(X_val.shape[1], dtype=float)
+            method = "unavailable"
+
+    imp = pd.DataFrame({
+        "feature": feature_names,
+        "importance_raw": importances
+    })
+    # Normalize to [0,1] for readability
+    if imp["importance_raw"].max() > 0:
+        imp["importance_norm"] = (imp["importance_raw"] - imp["importance_raw"].min()) / (imp["importance_raw"].max() - imp["importance_raw"].min())
+    else:
+        imp["importance_norm"] = 0.0
+    imp["method"] = method
+    imp = imp.sort_values("importance_norm", ascending=False).reset_index(drop=True)
+    return imp
 
 
 
@@ -370,6 +470,239 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
         if verbose: print(f"[HISTORY] Updated ⇒ {len(hist)} rows.")
     return hist
 
+def _normalize_feature_for_thresholding(x: np.ndarray) -> np.ndarray:
+    """Robustly map a numeric vector to ~[0,1] for threshold optimization."""
+    x = np.asarray(x, dtype=float)
+    m1, m99 = np.nanpercentile(x, 1), np.nanpercentile(x, 99)
+    if not np.isfinite(m1) or not np.isfinite(m99) or m99 <= m1:
+        m1, m99 = np.nanmin(x), np.nanmax(x)
+    if not np.isfinite(m1) or not np.isfinite(m99) or m99 <= m1:
+        return np.zeros_like(x) + 0.5
+    z = (x - m1) / (m99 - m1)
+    return np.clip(z, 0, 1)
+
+
+def _rolling_auc(y_true: np.ndarray, score: np.ndarray, window: int) -> np.ndarray:
+    vals = []
+    for i in range(window, len(y_true)+1):
+        y_win = y_true[i-window:i]
+        s_win = score[i-window:i]
+        if len(np.unique(y_win)) < 2:
+            vals.append(np.nan)
+            continue
+        try:
+            vals.append(roc_auc_score(y_win, s_win))
+        except Exception:
+            vals.append(np.nan)
+    return np.array(vals, dtype=float)
+
+
+def evaluate_raw_feature_usefulness(hist: pd.DataFrame,
+                                    label_col: str = "meta_label",
+                                    min_samples: int = 200) -> pd.DataFrame:
+    """
+    Score columns present in history CSV ('m*', 'acc*', any 'feat_*') against the future direction label.
+    Produces a ranked DataFrame with many metrics and a composite score.
+    """
+    cols = [c for c in hist.columns if (
+        (isinstance(c, str) and (c.startswith("m") and c[1:].isdigit())) or
+        (isinstance(c, str) and c.startswith("acc")) or
+        (isinstance(c, str) and c.startswith("feat_"))
+    )]
+    y = hist[label_col].astype(int).values
+    out_rows = []
+
+    for c in cols:
+        x_raw = pd.to_numeric(hist[c], errors="coerce").values
+        mask = np.isfinite(x_raw) & np.isfinite(y)
+        if mask.sum() < min_samples:
+            continue
+
+        x = x_raw[mask]
+        yy = y[mask]
+
+        # Normalize for thresholding + AUC
+        x01 = _normalize_feature_for_thresholding(x)
+
+        # Optimize thresholds (profit-oriented) and evaluate
+        up_p, dn_p = optimize_asymmetric_thresholds(x01, yy, metric="profit")
+        trigger = (x01 > up_p) | (x01 < dn_p)
+        coverage = trigger.mean()
+
+        if trigger.sum() >= 30:
+            acc_trig = (yy[trigger] == (x01[trigger] > up_p)).mean()
+            pnl = np.where(
+                x01[trigger] > up_p,  (yy[trigger] == 1).astype(int),
+                - (yy[trigger] == 0).astype(int)
+            ).mean()
+        else:
+            acc_trig, pnl = np.nan, np.nan
+
+        # Directional ROC AUC
+        try:
+            auc = roc_auc_score(yy, x01)
+        except Exception:
+            auc = np.nan
+
+        # Mutual information
+        try:
+            mi = float(mutual_info_classif(x01.reshape(-1, 1), yy, random_state=42))
+        except Exception:
+            mi = np.nan
+
+        # Calibration skill (only meaningful when x01 ~ prob). Use Brier Skill vs climatology.
+        try:
+            p_hat = x01
+            baseline = yy.mean()
+            brier = brier_score_loss(yy, p_hat)
+            brier_ref = brier_score_loss(yy, np.full_like(p_hat, baseline, dtype=float))
+            bss = 1.0 - (brier / (brier_ref + 1e-12))
+        except Exception:
+            bss = np.nan
+
+        # Rolling AUC -> learning trend + stability
+        W = max(100, int(0.2 * len(yy)))
+        rauc = _rolling_auc(yy, x01, window=W)
+        if np.isfinite(rauc).sum() >= 5:
+            # slope of AUC over time (higher => improving)
+            idx = np.arange(len(rauc), dtype=float)
+            msk = np.isfinite(rauc)
+            if msk.sum() >= 5:
+                slope, _ = np.polyfit(idx[msk], rauc[msk], 1)
+                learning_trend = float(slope)
+                stab = float(np.nanstd(rauc))
+                recent_auc = float(np.nanmean(rauc[-max(5, len(rauc)//5):]))
+            else:
+                learning_trend, stab, recent_auc = np.nan, np.nan, np.nan
+        else:
+            learning_trend, stab, recent_auc = np.nan, np.nan, np.nan
+
+        # Linear + rank correlations with label (IC)
+        try:
+            pear = float(np.corrcoef(x01, yy)[0, 1])
+        except Exception:
+            pear = np.nan
+        try:
+            from scipy.stats import spearmanr
+            spear = float(spearmanr(x01, yy, nan_policy="omit").correlation)
+        except Exception:
+            spear = np.nan
+
+        out_rows.append({
+            "feature": c,
+            "auc": auc,
+            "mutual_info": mi,
+            "brier_skill": bss,
+            "trigger_coverage": coverage,
+            "trigger_accuracy": acc_trig,
+            "profit_like": pnl,
+            "pearson_ic": pear,
+            "spearman_ic": spear,
+            "learning_trend": learning_trend,
+            "stability_std": stab,
+            "recent_auc": recent_auc,
+            "up_thresh": up_p,
+            "down_thresh": dn_p,
+            "n": int(mask.sum()),
+        })
+
+    if not out_rows:
+        return pd.DataFrame()
+
+    dfu = pd.DataFrame(out_rows)
+
+    # Normalize/compose a single composite score
+    def _minmax(s):
+        if s.notna().any():
+            lo, hi = s.min(), s.max()
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                return (s - lo) / (hi - lo)
+        return pd.Series(np.where(np.isnan(s), np.nan, 0.0), index=s.index)
+
+    # Higher is better: auc, mutual_info, brier_skill, trigger_accuracy, profit_like, recent_auc, learning_trend (positive), (1 - stability)
+    s_auc   = _minmax(dfu["auc"])
+    s_mi    = _minmax(dfu["mutual_info"])
+    s_bss   = _minmax(dfu["brier_skill"])
+    s_acc   = _minmax(dfu["trigger_accuracy"])
+    s_pnl   = _minmax(dfu["profit_like"])
+    s_rec   = _minmax(dfu["recent_auc"])
+    s_lrn   = _minmax(dfu["learning_trend"])
+    s_cov   = _minmax(dfu["trigger_coverage"])
+    s_stab  = _minmax(-dfu["stability_std"])  # lower std is better
+
+    # Weighted blend (tune as needed)
+    composite = (
+        0.30 * s_auc.fillna(0)   +
+        0.20 * s_acc.fillna(0)   +
+        0.20 * s_pnl.fillna(0)   +
+        0.10 * s_bss.fillna(0)   +
+        0.08 * s_lrn.fillna(0)   +
+        0.06 * s_stab.fillna(0)  +
+        0.04 * s_mi.fillna(0)    +
+        0.02 * s_rec.fillna(0)
+        # coverage intentionally small; acts as a tie-breaker
+        + 0.00 * s_cov.fillna(0)
+    )
+
+    dfu["composite_score"] = composite
+    dfu = dfu.sort_values(["composite_score", "auc", "trigger_accuracy", "profit_like"], ascending=False).reset_index(drop=True)
+    return dfu
+
+def write_feature_usefulness_reports(history_csv: str,
+                                     out_dir: str = FEATURE_ANALYTICS_DIR,
+                                     meta_model=None,
+                                     n_mods: int | None = None) -> dict:
+    """
+    Loads history CSV, computes:
+      A) Per-column usefulness (raw history cols) → ranked table
+      B) Meta-model feature importance on build_meta_features() inputs
+    Writes CSVs into out_dir and returns paths.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    hist = pd.read_csv(history_csv)
+    if "meta_label" not in hist.columns or len(hist) < 300:
+        return {"skipped": True, "reason": "insufficient_history"}
+
+    # A) Raw column usefulness
+    raw_rank = evaluate_raw_feature_usefulness(hist)
+    raw_path_ts = os.path.join(out_dir, f"raw_feature_usefulness_{ts}.csv")
+    raw_path_latest = os.path.join(out_dir, "raw_feature_usefulness_latest.csv")
+    raw_rank.to_csv(raw_path_ts, index=False, float_format="%.6f")
+    raw_rank.to_csv(raw_path_latest, index=False, float_format="%.6f")
+
+    # B) Meta-model input importance (only if model provided)
+    meta_paths = {}
+    try:
+        if meta_model is not None:
+            # Construct X,y exactly like training
+            X = build_meta_features(hist, n_mods)
+            y = hist["meta_label"].values.astype(int)
+            split = int(len(y) * 0.6)
+            X_val, y_val = X[split:], y[split:]
+            if len(y_val) >= 100:
+                feat_names = get_meta_feature_names(hist, n_mods)
+                meta_imp = compute_model_feature_importance(meta_model, X_val, y_val, feat_names)
+                meta_ts = os.path.join(out_dir, f"meta_feature_importance_{ts}.csv")
+                meta_latest = os.path.join(out_dir, "meta_feature_importance_latest.csv")
+                meta_imp.to_csv(meta_ts, index=False, float_format="%.6f")
+                meta_imp.to_csv(meta_latest, index=False, float_format="%.6f")
+                meta_paths = {"meta_ts": meta_ts, "meta_latest": meta_latest}
+    except Exception as e:
+        # don't fail the run if importance can't be computed
+        meta_paths = {"meta_error": str(e)}
+
+    # Small JSON-like summary
+    summary = {
+        "timestamp_utc": ts,
+        "raw_usefulness_csv": raw_path_ts,
+        "raw_usefulness_latest": raw_path_latest,
+        **meta_paths
+    }
+    with open(os.path.join(out_dir, "summary_latest.txt"), "w") as f:
+        f.write(str(summary))
+    return summary
 
 
 def optimize_asymmetric_thresholds(
@@ -421,7 +754,7 @@ def train_and_save_meta(cache_csv: str,
 
     hist = pd.read_csv(cache_csv)
     X = build_meta_features(hist, n_mods)
-    y = hist["meta_label"].values
+    y = hist["meta_label"].values.astype(int)
 
     split = int(len(y) * 0.6)
     X_tr, y_tr = X[:split], y[:split]
@@ -437,6 +770,13 @@ def train_and_save_meta(cache_csv: str,
         pickle.dump(meta, f)
     with open(threshold_pkl, "wb") as f:
         pickle.dump({"up": up, "down": down, "model_type": META_MODEL_TYPE}, f)
+
+    # ⬇️ NEW: write feature usefulness + meta importance reports
+    try:
+        os.makedirs(FEATURE_ANALYTICS_DIR, exist_ok=True)
+        write_feature_usefulness_reports(cache_csv, out_dir=FEATURE_ANALYTICS_DIR, meta_model=meta, n_mods=n_mods)
+    except Exception as e:
+        print(f"[FEATURE-ANALYTICS] Failed to write reports: {e}")
 
     return meta, up, down
 
@@ -609,18 +949,40 @@ def enforce_position_rules(actions, start_open=False):
             out.append(a)
     return out
 
-
 def run_backtest(return_df: bool = False, start_open: bool = False):
     df_orig = pd.read_csv(CSV_PATH)
 
-    # in run_backtest()
+    # include regressor + optional classifier
     submods = [mod1, mod2, mod3, mod4, mod5, modR] + ([mod6] if USE_CLASSIFIER else [])
     channels = expand_channels(submods)
-
     n_ch = len(channels)
 
+    # ensure analytics dir exists + a timestamp for snapshots
+    os.makedirs(FEATURE_ANALYTICS_DIR, exist_ok=True)
+    ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+
     if MODE == "sub-vote":
+        # 1) run submodel backtest (produces m*, acc*, meta_label)
         back = backtest_submodels(df_orig, initial_frac=0.6)
+
+        # 2) save a "history-like" snapshot for analytics (timestamped and latest)
+        bt_hist_latest = os.path.join(
+            FEATURE_ANALYTICS_DIR,
+            f"subvote_backtest_history_{CONVERTED_TIMEFRAME}_latest.csv"
+        )
+        bt_hist_ts = os.path.join(
+            FEATURE_ANALYTICS_DIR,
+            f"subvote_backtest_history_{CONVERTED_TIMEFRAME}_{ts}.csv"
+        )
+        try:
+            back.to_csv(bt_hist_latest, index=True)
+            back.to_csv(bt_hist_ts, index=True)
+            # Run analytics on this snapshot (raw usefulness only; no meta model in vote mode)
+            write_feature_usefulness_reports(bt_hist_latest, out_dir=FEATURE_ANALYTICS_DIR, meta_model=None)
+        except Exception as e:
+            print(f"[FEATURE-ANALYTICS] (sub-vote backtest) Failed to write reports: {e}")
+
+        # 3) voting logic → df_out (unchanged)
         VOTE_UP, VOTE_DOWN = 0.55, 0.45
 
         vote_cols = []
@@ -648,17 +1010,34 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
         df_out["action"] = df_out["action"].map({1: "BUY", 0: "SELL", 0.5: "HOLD"})
 
     else:
+        # META backtest path:
         cache_csv = os.path.join(RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv")
         os.makedirs(RESULTS_DIR, exist_ok=True)
+
+        # 1) build/refresh history
         update_submeta_history(CSV_PATH, cache_csv, submods=submods, verbose=True)
 
+        # 2) fit a temporary meta model ONLY for importance reporting (doesn't affect BT results)
+        try:
+            hist = pd.read_csv(cache_csv)
+            meta_tmp = None
+            if "meta_label" in hist.columns and len(hist) >= 300:
+                X = build_meta_features(hist, n_mods=None)
+                y = hist["meta_label"].values.astype(int)
+                split = int(len(y) * 0.6)
+                if split >= 100:
+                    meta_tmp = make_meta_model().fit(X[:split], y[:split])
+            write_feature_usefulness_reports(cache_csv, out_dir=FEATURE_ANALYTICS_DIR, meta_model=meta_tmp)
+        except Exception as e:
+            print(f"[FEATURE-ANALYTICS] (meta backtest) Failed to write reports: {e}")
+
+        # 3) run the walk-forward meta backtest (unchanged)
         df_out = walkforward_meta_backtest(
             cache_csv=cache_csv,
             n_mods=None,          # infer from history columns
             initial_frac=0.6,
             metric="accuracy",
         )
-
         out_fn = os.path.join(RESULTS_DIR, f"meta_results_walkforward.csv")
         df_out.to_csv(out_fn, index=False, float_format="%.8f")
         print(f"[RESULT] Walk-forward results saved to {out_fn}")
@@ -730,7 +1109,6 @@ def run_live(return_result: bool = True, position_open: bool = False):
 
     if MODE == "sub-vote":
         VOTE_UP, VOTE_DOWN = 0.55, 0.45
-
         preds = []
         for ch in channels:
             m, h = ch["mod"], ch["h"]
@@ -738,29 +1116,25 @@ def run_live(return_result: bool = True, position_open: bool = False):
                 if is_multi(m):
                     X_tr, y_tr = prepare_train_for_horizon(df, m, h)
                     if len(y_tr) < 50:
-                        preds.append(0.5)
-                        continue
+                        preds.append(0.5); continue
                     model = m.fit(X_tr, y_tr, horizon=h)
                     feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
                     preds.append(m.predict(model, feats)[0])
                 else:
                     X_tr, y_tr = prepare_train(df, m)
                     if len(y_tr) < 50:
-                        preds.append(0.5)
-                        continue
+                        preds.append(0.5); continue
                     model = m.fit(X_tr, y_tr)
                     feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
                     preds.append(m.predict(model, feats)[0])
             elif hasattr(m, "compute_targets"):  # multi-horizon regression
                 X_tr, Y_tr, last_feats = prepare_train_regression_multi(df, m)
                 if len(X_tr) < 50:
-                    preds.append(np.nan)
-                    continue
+                    preds.append(np.nan); continue
                 model = m.fit(X_tr, Y_tr)
                 yhat_multi = m.predict(model, last_feats)[0]
                 idx = m.MULTI_HORIZONS.index(h)
                 preds.append(float(yhat_multi[idx]))
-
             else:
                 X_tr, y_tr = prepare_train(df, m)
                 model = m.fit(X_tr, y_tr)
@@ -774,7 +1148,6 @@ def run_live(return_result: bool = True, position_open: bool = False):
             if hasattr(m, "compute_labels"):
                 votes.append(1 if preds[k] > VOTE_UP else (0 if preds[k] < VOTE_DOWN else 0.5))
             elif hasattr(m, "compute_targets"):
-                # ⬇️ NEW: convert level prediction to direction by comparing to current close
                 if not np.isfinite(preds[k]):
                     votes.append(0.5)
                 else:
@@ -783,12 +1156,19 @@ def run_live(return_result: bool = True, position_open: bool = False):
             else:
                 votes.append(1 if preds[k] > REG_UP else (0 if preds[k] < REG_DOWN else 0.5))
 
-        buy, sell   = votes.count(1), votes.count(0)
+        buy, sell = votes.count(1), votes.count(0)
         majority_req = (n_ch // 2) + 1
-        majority     = 1 if buy  >= majority_req else (0 if sell >= majority_req else 0.5)
+        majority = 1 if buy >= majority_req else (0 if sell >= majority_req else 0.5)
         action = "BUY" if majority == 1 else ("SELL" if majority == 0 else "HOLD")
         action = enforce_position_rules([action], position_open)[0]
         print(f"[LIVE-VOTE] result = {action}")
+
+        # ⬇️ NEW: keep feature analytics fresh even in vote mode (raw CSV only)
+        try:
+            write_feature_usefulness_reports(HISTORY_PATH, out_dir=FEATURE_ANALYTICS_DIR, meta_model=None)
+        except Exception as e:
+            print(f"[FEATURE-ANALYTICS] (vote) Failed to write reports: {e}")
+
         return action if return_result else None
 
     # ——— META MODE ———
@@ -811,10 +1191,15 @@ def run_live(return_result: bool = True, position_open: bool = False):
     if must_retrain:
         meta, up, down = train_and_save_meta(HISTORY_PATH, meta_pkl, thresh_pkl)
         print(f"[META] Re-trained {META_MODEL_TYPE}  BUY>{up:.2f} / SELL<{down:.2f}")
+    else:
+        # ⬇️ NEW: even when reusing cache, refresh reports with the loaded model
+        try:
+            write_feature_usefulness_reports(HISTORY_PATH, out_dir=FEATURE_ANALYTICS_DIR, meta_model=meta)
+        except Exception as e:
+            print(f"[FEATURE-ANALYTICS] Failed to write reports: {e}")
 
     # Build the current m*/acc* row + engineered angles
     current_probs = []
-    # ⬇️ collectors for engineered angles
     clf_by_h, reg_by_h, base5_vals = {}, {}, []
 
     for ch in channels:
@@ -868,7 +1253,6 @@ def run_live(return_result: bool = True, position_open: bool = False):
     row_df = pd.DataFrame([{**{f"m{i+1}": current_probs[i] for i in range(k)},
                             **{f"acc{i+1}": last_accs[i] for i in range(k)}}])
 
-    # ⬇️ NEW: engineered angle features (no accuracy companions)
     angle_clf  = float(mod6.linear_angle([clf_by_h[h] for h in getattr(mod6, "MULTI_HORIZONS", []) if h in clf_by_h])) if 'mod6' in globals() and len(clf_by_h) >= 2 else float('nan')
     angle_reg  = float(modR.linear_angle([reg_by_h[h] for h in getattr(modR, "MULTI_HORIZONS", []) if h in reg_by_h])) if len(reg_by_h) >= 2 else float('nan')
     angle_base = float(_linear_angle_generic(base5_vals)) if len(base5_vals) >= 2 else float('nan')
@@ -884,7 +1268,6 @@ def run_live(return_result: bool = True, position_open: bool = False):
     print(f"[LIVE] P(up)={prob:.3f}  →  {action}  (BUY>{up:.2f} / SELL<{down:.2f})")
 
     return (prob, action) if return_result else None
-
 
 if __name__ == "__main__":
     import argparse

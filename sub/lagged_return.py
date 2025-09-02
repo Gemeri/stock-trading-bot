@@ -74,3 +74,4 @@ def predict(model: XGBRegressor, X: pd.DataFrame) -> np.ndarray:
     ret = model.predict(X)
     tau = getattr(model, "tau", 1.0)
     return 1 / (1 + np.exp(-(ret / tau)))
+    

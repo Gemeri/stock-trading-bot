@@ -79,6 +79,21 @@ def predict(model, X: np.ndarray) -> np.ndarray:
     logging.info("PREDICT all_features_xgboost (calibrated)")
     return model.predict_proba(X)[:, 1]
 
+def linear_angle(y_vals, x_vals=None):
+    if x_vals is None:
+        x_vals = MULTI_HORIZONS
+
+    x = np.asarray(x_vals, dtype=float)
+    y = np.asarray(y_vals, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        return float('nan')
+
+    slope, _ = np.polyfit(x[mask], y[mask], 1)
+    return float(np.degrees(np.arctan(slope)))
+
+
 
 # ─────────────────────────────── CLI (optional) ──────────────────────────────
 if __name__ == "__main__":
@@ -113,7 +128,9 @@ if __name__ == "__main__":
             clf  = fit(X_tr, y_tr, horizon=h)
             probs[h]  = float(predict(clf, row_feats)[0])
             labels[h] = int(df.at[t, lbl_col])
-
+            
+        angle_prob_deg = linear_angle([probs.get(h, np.nan) for h in MULTI_HORIZONS])
+        rec = {"t": t, "angle_prob_deg": angle_prob_deg}
         rec = {"t": t}
         for h in MULTI_HORIZONS:
             rec[f"prob_h{h}"]  = probs[h]

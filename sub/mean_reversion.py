@@ -1,17 +1,13 @@
 import numpy as np
 import pandas as pd
 import logging
-import argparse
 
-import matplotlib.pyplot as plt
 from sub.common import compute_meta_labels, USE_META_LABEL
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
-
+# Feature set used by this strategy (ensure your X arrays/frames are in this order)
 FEATURES = [
     'bollinger_upper', 'bollinger_lower', 'bollinger_percB',
     'atr', 'atr_zscore',
@@ -23,15 +19,21 @@ FEATURES = [
     'gap_vs_prev'
 ]
 
-PARAM_GRID = {
-    'n_estimators':     [250],
-    'max_depth':        [5, 10, 20],
-    'min_samples_leaf': [1],
-    'max_features':     [len(FEATURES)]
+# Fixed model hyperparameters (replacing the old grid search)
+MODEL_PARAMS = {
+    'n_estimators': 250,
+    'max_depth': 10,
+    'min_samples_leaf': 1,
+    'max_features': len(FEATURES),  # use all provided features
 }
 
 
-def compute_labels(df):
+def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute binary labels for training.
+    If USE_META_LABEL is True, delegate to meta-label helper (compatible with previous behavior).
+    Otherwise, label when move >= ATR occurs in the next 1-2 steps, conditioned on position vs Bollinger mean band.
+    """
     df = df.copy()
 
     if USE_META_LABEL:
@@ -48,53 +50,54 @@ def compute_labels(df):
 
     df['label'] = (up1 | up2 | dn1 | dn2).astype(int)
 
+    # Keep only rows where all features and the label are present
     return df.dropna(subset=FEATURES + ['label']).reset_index(drop=True)
 
-def sharpe(returns):
-    if len(returns)==0 or returns.std()==0:
+
+def sharpe(returns: pd.Series) -> float:
+    if len(returns) == 0 or returns.std() == 0:
         return np.nan
-    return returns.mean()/returns.std()*np.sqrt(252)
+    return returns.mean() / returns.std() * np.sqrt(252)
 
-def max_drawdown(equity):
+
+def max_drawdown(equity: pd.Series) -> float:
     roll_max = equity.cummax()
-    return ((equity - roll_max)/roll_max).min()
+    return ((equity - roll_max) / roll_max).min()
 
-def fit(X_train: np.ndarray, y_train: np.ndarray):
-    logging.info("Running FIT on mean_reversion (TS-CV + calibration)")
 
-    tscv = TimeSeriesSplit(n_splits=5)
+def fit(X_train: np.ndarray, y_train: np.ndarray) -> CalibratedClassifierCV:
+    """
+    Fit a RandomForest on the provided features with fixed hyperparameters
+    and wrap it in an isotonic CalibratedClassifier using time-series CV.
+    """
+    logging.info("Running FIT on mean_reversion (fixed RF params + calibration)")
 
-    base_rf = RandomForestClassifier(
+    # Base RandomForest using fixed params (no GridSearch)
+    rf = RandomForestClassifier(
         class_weight="balanced",
         random_state=42,
         n_jobs=-1,
+        **MODEL_PARAMS,
     )
 
-    grid = GridSearchCV(
-        estimator=base_rf,
-        param_grid=PARAM_GRID,
-        cv=tscv,
-        scoring="roc_auc",
-        n_jobs=-1,
-        verbose=1,
-    ).fit(X_train, y_train)
-
-    best_rf = grid.best_estimator_
-    logging.info("Best params ⇒ %s", grid.best_params_)
-
+    # Calibrate probabilities with time-series CV
     calib = CalibratedClassifierCV(
-        best_rf, method="isotonic", cv=TimeSeriesSplit(n_splits=3)
+        rf, method="isotonic", cv=TimeSeriesSplit(n_splits=3)
     ).fit(X_train, y_train)
 
-    _rf_params = best_rf.get_params()
+    # Expose fixed RF params for external inspection (mirrors prior behavior of exposing best params)
+    def _get_params(deep: bool = True):
+        return MODEL_PARAMS.copy()
 
-    def _get_params(deep=True):
-        return {k: _rf_params[k] for k in PARAM_GRID}
+    calib.get_params = _get_params  # type: ignore[attr-defined]
 
-    calib.get_params = _get_params
+    logging.info("Model trained with params ⇒ %s", MODEL_PARAMS)
     return calib
 
 
-def predict(model: RandomForestClassifier, X: np.ndarray) -> np.ndarray:
+def predict(model: CalibratedClassifierCV, X: np.ndarray) -> np.ndarray:
+    """
+    Return calibrated probability of the positive class.
+    """
     logging.info("Running PREDICT on mean_reversion")
     return model.predict_proba(X)[:, 1]

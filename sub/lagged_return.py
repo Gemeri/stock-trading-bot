@@ -1,77 +1,65 @@
-import os
-import argparse
-import logging
-
+# lagged_return.py
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from sub.common import compute_meta_labels, USE_META_LABEL
+from typing import List
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
+from xgboost import XGBClassifier
 
-from xgboost import XGBRegressor
-from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
-from sklearn.metrics import mean_squared_error
-
-
-FEATURES = [
-    'close',
-    'lagged_close_1', 'lagged_close_2', 'lagged_close_3', 'lagged_close_5', 'lagged_close_10',
-    'returns_1', 'returns_3', 'returns_5'
+FEATURES: List[str] = [
+    "close","atr",
+    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10",
+    "returns_1","returns_3","returns_5",
+    "ema_9","ema_21","ema_50","rsi","rsi_zscore",
+    "std_5","std_10","candle_body_ratio","wick_dominance","gap_vs_prev",
+    # engineered
+    "feat_ret_norm_3","feat_ret_norm_5"
 ]
 
-BEST_PARAMS = {
-    "n_estimators":     600,
-    "learning_rate":    0.03,
-    "max_depth":        6,
-    "subsample":        0.80,
-    "colsample_bytree": 0.80,
-    "min_child_weight": 20,
-    "reg_alpha":        0.0,
-    "reg_lambda":       1.0,
-}
+K_ATR: float = 0.15
 
-def compute_target(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if USE_META_LABEL:
-        return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
-    df['close_t1'] = df['close'].shift(-1)
-    df['target']  = (df['close_t1'] - df['close']) / df['close']
-    return df
+class PurgedTimeSeriesCV:
+    def __init__(self, n_splits=5, gap=1): self.n_splits=n_splits; self.gap=gap
+    def split(self, X, y=None, groups=None):
+        n=len(X); base=TimeSeriesSplit(n_splits=self.n_splits)
+        for tr,te in base.split(np.arange(n)):
+            tr = tr[tr<=tr[-1]-self.gap]; te = te[te>=te[0]+self.gap]
+            if len(tr) and len(te): yield tr,te
+    def get_n_splits(self, X=None, y=None, groups=None): return self.n_splits
 
-def sharpe(returns: np.ndarray) -> float:
-    arr = np.asarray(returns)
-    return np.nan if arr.std()==0 else arr.mean()/arr.std()*np.sqrt(252)
+def _safe_div(a,b):
+    b=np.asarray(b,float)
+    return np.where(np.abs(b)>1e-12, np.asarray(a,float)/b, 0.0)
 
-def max_drawdown(equity: pd.Series) -> float:
-    roll_max = equity.cummax()
-    return ((equity - roll_max)/roll_max).min()
+def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    close = d["close"].astype(float)
+    atr   = d.get("atr", pd.Series(np.nan, index=d.index)).astype(float)
 
+    # engineered
+    scale = _safe_div(atr, close)
+    d["feat_ret_norm_3"] = _safe_div(d.get("returns_3",0), scale)
+    d["feat_ret_norm_5"] = _safe_div(d.get("returns_5",0), scale)
 
-def fit(X_train: pd.DataFrame, y_train: pd.Series) -> XGBRegressor:
-    logging.info("RUNNING FIT on lagged_return – static params + early-stop")
+    ret1 = (close.shift(-1)-close)/close
+    up   = (ret1 >  K_ATR*scale)
+    dn   = (ret1 < -K_ATR*scale)
+    lab  = pd.Series(np.nan, index=d.index)
+    lab[up]=1; lab[dn]=0
+    d["label"] = lab
+    return d.reset_index(drop=True)
 
-    model = XGBRegressor(
-        objective="reg:squarederror",
-        n_jobs=-1,
-        random_state=42,
-        **BEST_PARAMS,
+def fit(X: np.ndarray, y: np.ndarray):
+    base = XGBClassifier(
+        n_estimators=500, learning_rate=0.03, max_depth=4,
+        subsample=0.8, colsample_bytree=0.9, reg_lambda=1.0,
+        objective="binary:logistic", eval_metric="logloss",
+        tree_method="hist", random_state=42
     )
-
-    val_size = max(100, int(0.1 * len(X_train)))
-    X_tr, X_val = X_train.iloc[:-val_size], X_train.iloc[-val_size:]
-    y_tr, y_val = y_train.iloc[:-val_size], y_train.iloc[-val_size:]
-
-    model.fit(
-        X_tr,
-        y_tr,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
-    )
+    splitter = PurgedTimeSeriesCV(n_splits=5, gap=1)
+    model = CalibratedClassifierCV(base, method="isotonic", cv=splitter, n_jobs=-1)
+    model.fit(X,y)
     return model
 
-def predict(model: XGBRegressor, X: pd.DataFrame) -> np.ndarray:
-    logging.info("Ruinning PREDICT on lagged_return")
-    ret = model.predict(X)
-    tau = getattr(model, "tau", 1.0)
-    return 1 / (1 + np.exp(-(ret / tau)))
-    
+def predict(model, X: np.ndarray) -> np.ndarray:
+    return model.predict_proba(X)[:,1]

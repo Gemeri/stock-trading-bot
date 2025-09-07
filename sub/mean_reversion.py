@@ -1,103 +1,67 @@
+# mean_reversion.py
 import numpy as np
 import pandas as pd
-import logging
-
-from sub.common import compute_meta_labels, USE_META_LABEL
+from typing import List
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
-# Feature set used by this strategy (ensure your X arrays/frames are in this order)
-FEATURES = [
-    'bollinger_upper', 'bollinger_lower', 'bollinger_percB',
-    'atr', 'atr_zscore',
-    'candle_body_ratio', 'wick_dominance',
-    'rsi_zscore',
-    'macd_histogram', 'macd_hist_flip', 'macd_cross',
-    'high_low_range',
-    'std_5', 'std_10',
-    'gap_vs_prev'
+FEATURES: List[str] = [
+    "close","atr","bollinger_percB","bollinger_upper","bollinger_lower",
+    "ema_9","ema_21","ema_50","rsi","rsi_zscore","std_5",
+    # engineered
+    "feat_dist_from_band","feat_atr_slope"
 ]
 
-# Fixed model hyperparameters (replacing the old grid search)
-MODEL_PARAMS = {
-    'n_estimators': 250,
-    'max_depth': 10,
-    'min_samples_leaf': 1,
-    'max_features': len(FEATURES),  # use all provided features
-}
+K_ATR: float = 0.25  # magnitude floor
 
+class PurgedTimeSeriesCV:
+    def __init__(self, n_splits=5, gap=1): self.n_splits=n_splits; self.gap=gap
+    def split(self, X, y=None, groups=None):
+        n=len(X); base=TimeSeriesSplit(n_splits=self.n_splits)
+        for tr,te in base.split(np.arange(n)):
+            tr = tr[tr<=tr[-1]-self.gap]; te = te[te>=te[0]+self.gap]
+            if len(tr) and len(te): yield tr,te
+    def get_n_splits(self, X=None, y=None, groups=None): return self.n_splits
+
+def _safe_div(a,b):
+    b=np.asarray(b,float)
+    return np.where(np.abs(b)>1e-12, np.asarray(a,float)/b, 0.0)
 
 def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute binary labels for training.
-    If USE_META_LABEL is True, delegate to meta-label helper (compatible with previous behavior).
-    Otherwise, label when move >= ATR occurs in the next 1-2 steps, conditioned on position vs Bollinger mean band.
-    """
-    df = df.copy()
+    d = df.copy()
+    close = d["close"].astype(float)
+    atr   = d.get("atr", pd.Series(np.nan, index=d.index)).astype(float)
+    percB = d.get("bollinger_percB", pd.Series(np.nan, index=d.index)).astype(float)
+    scale = _safe_div(atr, close)
 
-    if USE_META_LABEL:
-        # hand off to meta-label helper exactly as before
-        return compute_meta_labels(df).rename(columns={'meta_label': 'label'})
+    # engineered
+    mid = (d.get("bollinger_upper",0)+d.get("bollinger_lower",0))/2.0
+    d["feat_dist_from_band"] = _safe_div(close - mid, atr)
+    d["feat_atr_slope"] = pd.Series(atr).pct_change().fillna(0.0)
 
-    df['mean_band'] = (df['bollinger_upper'] + df['bollinger_lower']) / 2
-    c0, c1, c2 = df['close'], df['close'].shift(-1), df['close'].shift(-2)
+    ret1 = (close.shift(-1)-close)/close
+    ret2 = (close.shift(-2)-close)/close
+    fwd  = np.nanmax(np.vstack([ret1.values, ret2.values]), axis=0)
+    fwdn = np.nanmin(np.vstack([ret1.values, ret2.values]), axis=0)
 
-    up1 = (c0 > df['mean_band']) & ((c0 - c1) >= df['atr'])
-    up2 = (c0 > df['mean_band']) & ((c0 - c2) >= df['atr'])
-    dn1 = (c0 < df['mean_band']) & ((c1 - c0) >= df['atr'])
-    dn2 = (c0 < df['mean_band']) & ((c2 - c0) >= df['atr'])
+    lab = pd.Series(np.nan, index=d.index)
+    # upward reversion from lower band
+    lab[(percB < 0.10) & (fwd >  K_ATR*scale)] = 1
+    # downward reversion from upper band
+    lab[(percB > 0.90) & (fwdn < -K_ATR*scale)] = 0
+    d["label"] = lab
+    return d.reset_index(drop=True)
 
-    df['label'] = (up1 | up2 | dn1 | dn2).astype(int)
-
-    # Keep only rows where all features and the label are present
-    return df.dropna(subset=FEATURES + ['label']).reset_index(drop=True)
-
-
-def sharpe(returns: pd.Series) -> float:
-    if len(returns) == 0 or returns.std() == 0:
-        return np.nan
-    return returns.mean() / returns.std() * np.sqrt(252)
-
-
-def max_drawdown(equity: pd.Series) -> float:
-    roll_max = equity.cummax()
-    return ((equity - roll_max) / roll_max).min()
-
-
-def fit(X_train: np.ndarray, y_train: np.ndarray) -> CalibratedClassifierCV:
-    """
-    Fit a RandomForest on the provided features with fixed hyperparameters
-    and wrap it in an isotonic CalibratedClassifier using time-series CV.
-    """
-    logging.info("Running FIT on mean_reversion (fixed RF params + calibration)")
-
-    # Base RandomForest using fixed params (no GridSearch)
-    rf = RandomForestClassifier(
-        class_weight="balanced",
-        random_state=42,
-        n_jobs=-1,
-        **MODEL_PARAMS,
+def fit(X: np.ndarray, y: np.ndarray):
+    base = RandomForestClassifier(
+        n_estimators=400, max_depth=8, min_samples_leaf=5,
+        max_features="sqrt", n_jobs=-1, random_state=42, class_weight="balanced"
     )
+    splitter = PurgedTimeSeriesCV(n_splits=5, gap=1)
+    model = CalibratedClassifierCV(base, method="isotonic", cv=splitter, n_jobs=-1)
+    model.fit(X,y)
+    return model
 
-    # Calibrate probabilities with time-series CV
-    calib = CalibratedClassifierCV(
-        rf, method="isotonic", cv=TimeSeriesSplit(n_splits=3)
-    ).fit(X_train, y_train)
-
-    # Expose fixed RF params for external inspection (mirrors prior behavior of exposing best params)
-    def _get_params(deep: bool = True):
-        return MODEL_PARAMS.copy()
-
-    calib.get_params = _get_params  # type: ignore[attr-defined]
-
-    logging.info("Model trained with params ⇒ %s", MODEL_PARAMS)
-    return calib
-
-
-def predict(model: CalibratedClassifierCV, X: np.ndarray) -> np.ndarray:
-    """
-    Return calibrated probability of the positive class.
-    """
-    logging.info("Running PREDICT on mean_reversion")
-    return model.predict_proba(X)[:, 1]
+def predict(model, X: np.ndarray) -> np.ndarray:
+    return model.predict_proba(X)[:,1]

@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from dotenv import load_dotenv
+import shap
 
 from typing import Tuple, List
 
@@ -41,7 +42,7 @@ TICKERS_STR = "-".join([t.strip() for t in TICKERS if t.strip()]) or "TSLA"
 CSV_PATH = os.path.join(ROOT_DIR, f"{TICKERS_STR}_{CONVERTED_TIMEFRAME}.csv")
 MODE = ML_MODEL
 EXECUTION = globals().get("EXECUTION", "backtest")
-QUICK_TEST = os.getenv("QUICK_TEST", "false").strip().lower() == "true"
+QUICK_TEST = True
 
 HISTORY_PATH = os.path.join(RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv")
 
@@ -51,7 +52,7 @@ FORCE_STATIC_THRESHOLDS = False
 STATIC_UP = 0.55
 STATIC_DOWN = 0.45
 
-META_MODEL_TYPE = os.getenv("META_MODEL_TYPE", "logreg")
+META_MODEL_TYPE = os.getenv("META_MODEL_TYPE", "cat")
 VALID_META_MODELS = {"logreg", "lgbm", "xgb", "nn", "cat"}
 if META_MODEL_TYPE not in VALID_META_MODELS:
     raise ValueError(f"META_MODEL_TYPE must be one of {VALID_META_MODELS}")
@@ -210,7 +211,6 @@ def _compute_shap_importance(model, X: np.ndarray, feature_names: List[str]) -> 
     Falls back to permutation-like mean abs gradient if SHAP is unavailable.
     """
     try:
-        import shap
         # sample a small background to speed up KernelExplainer/Explainer
         bg = X[np.random.choice(len(X), size=min(200, len(X)), replace=False)]
         # function wrapper → proba of class 1
@@ -440,6 +440,25 @@ def walkforward_meta_backtest(cache_csv: str,
 # QUICK TEST (no history; SHAP + accuracy + PnL)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _filter_channels_for_quick(submods, use_h1_only: bool = True):
+    """
+    Build channels but optionally keep only h=1 (or the smallest horizon) for multi-horizon modules.
+    That keeps QUICK_TEST fast while still exercising each module.
+    """
+    chans = []
+    for m in submods:
+        if hasattr(m, "MULTI_HORIZONS") and isinstance(m.MULTI_HORIZONS, (list, tuple)) and len(m.MULTI_HORIZONS) > 0:
+            if use_h1_only:
+                h = int(sorted(m.MULTI_HORIZONS)[0])
+                chans.append({"mod": m, "h": h, "name": f"{m.__name__}_h{h}"})
+            else:
+                for h in m.MULTI_HORIZONS:
+                    chans.append({"mod": m, "h": int(h), "name": f"{m.__name__}_h{h}"})
+        else:
+            chans.append({"mod": m, "h": None, "name": m.__name__})
+    return chans
+
+
 def _actions_from_probs(p: np.ndarray, up: float, down: float) -> np.ndarray:
     out = np.full_like(p, "HOLD", dtype=object)
     out[p > up] = "BUY"
@@ -452,67 +471,212 @@ def _pnl_from_actions(actions: np.ndarray, rets_next: np.ndarray) -> np.ndarray:
     pnl[actions == "SELL"] = -rets_next[actions == "SELL"]
     return pnl
 
-def quick_test(df: pd.DataFrame, initial_frac: float = 0.6) -> dict:
-    """
-    Fast end-to-end evaluation:
-      1) Walk-forward submodels → back_df (m*, acc*, meta_label)
-      2) Train meta on first 60% of back_df; eval on last 40%
-      3) Report sub-model AUCs (vs meta_label), meta AUC/acc, and simple PnL
-    No history CSV is written/used.
-    """
-    back_df = backtest_submodels(df, initial_frac=initial_frac)
-    back = back_df.reset_index(drop=True)
 
-    # Submodel quick accuracy (AUC vs meta_label; note: horizons >1 are imperfectly aligned but still indicative)
+def quick_test(df: pd.DataFrame, initial_frac: float = 0.6, return_df: bool = False):
+    # ---- quick knobs (env) ----
+    quick_max_bars = 1500
+    quick_stride   = 5
+    quick_h1_only  = os.getenv("QUICK_H1_ONLY", "true").strip().lower() in {"1","true","yes","y"}
+
+    # 1) Tail slice + stride
+    df = df.copy()
+    if len(df) > quick_max_bars:
+        df = df.iloc[-quick_max_bars:].reset_index(drop=True)
+    if quick_stride > 1:
+        df = df.iloc[::quick_stride].reset_index(drop=True)
+
+    # 2) Channels (optionally keep only the smallest horizon)
+    channels = _filter_channels_for_quick(SUBMODS, use_h1_only=quick_h1_only)
+    n_ch = len(channels)
+
+    # 3) Global purge gap and split indices
+    HMAX = max_lookahead([ch["mod"] for ch in channels])
+    N = len(df)
+    if N < max(200, 3 * (HMAX + 5)):
+        raise ValueError(f"QUICK_TEST slice too small (N={N}, HMAX={HMAX}). Increase QUICK_MAX_BARS or reduce HMAX.")
+
+    cut = int(N * initial_frac)
+    # Purged split: [0, cut - HMAX) for train; [cut + HMAX, N - 1 - max(1,HMAX)] for validation rows
+    train_end = max(0, cut - HMAX)
+    val_start = min(N-1, cut + HMAX)
+    val_end   = N - 1 - max(1, HMAX)  # ensure meta_label (t+1) exists and future labels are not peeked
+
+    if val_end <= val_start or train_end < 50:
+        raise ValueError("QUICK_TEST split degenerate. Try lowering HMAX or increasing QUICK_MAX_BARS.")
+
+    tr_idx = np.arange(0, train_end, dtype=int)
+    va_idx = np.arange(val_start, val_end + 1, dtype=int)
+
+    # 4) Prepare meta_label (direction t+1) for the validation rows
+    close = pd.to_numeric(df["close"], errors="coerce").values
+    y_meta_full = (close[1:] > close[:-1]).astype(int)
+    # y_meta aligned to t; exists for t in [0, N-2]. We will take y_meta for va_idx positions.
+    y_meta_va = y_meta_full[va_idx]
+
+    # 5) Build batched predictions per channel (no per-bar training)
+    m_cols = {}
+    acc_cols = {}
+    for k, ch in enumerate(channels, start=1):
+        m, h = ch["mod"], ch["h"]
+
+        # Classifier-style modules
+        if hasattr(m, "compute_labels"):
+            d = m.compute_labels(df).reset_index(drop=True)
+            feat_cols = m.FEATURES
+            lbl_col = f"label_h{int(h)}" if (h is not None) else "label"
+
+            # Train slice (drop NAs)
+            tr = d.loc[tr_idx].dropna(subset=list(feat_cols) + [lbl_col])
+            if len(tr) < 50:
+                # fallback: constant 0.5 on val
+                m_cols[f"m{k}"] = np.full(len(va_idx), 0.5, dtype=float)
+                acc_cols[f"acc{k}"] = 0.5
+                continue
+
+            X_tr = tr[feat_cols].values
+            y_tr = tr[lbl_col].astype(int).values
+
+            # Fit once
+            model = m.fit(X_tr, y_tr, horizon=h) if h is not None else m.fit(X_tr, y_tr)
+
+            # Validation slice (keep alignment; predict only where features are finite)
+            dv = d.loc[va_idx, feat_cols]
+            mask = np.isfinite(dv.values).all(axis=1)
+            preds = np.full(len(va_idx), np.nan, dtype=float)
+            if mask.any():
+                preds[mask] = m.predict(model, dv.loc[mask].values).astype(float)
+
+            # Acc estimate on val (directional), using 0.5 threshold
+            acc_mask = mask & np.isfinite(preds)
+            if acc_mask.any():
+                acc_val = ( (preds[acc_mask] > 0.5).astype(int) == y_meta_va[acc_mask] ).mean()
+            else:
+                acc_val = 0.5
+
+            m_cols[f"m{k}"] = preds
+            acc_cols[f"acc{k}"] = float(acc_val)
+
+        # Multi-horizon regression modules (predict level or return)
+        elif hasattr(m, "compute_targets"):
+            d = m.compute_targets(df).reset_index(drop=True)
+            feat_cols = m.FEATURES
+            # choose this horizon's target column
+            tgt_col = f"target_h{int(h)}" if (h is not None) else "target"
+
+            # Train slice
+            tr = d.loc[tr_idx].dropna(subset=list(feat_cols) + [tgt_col])
+            if len(tr) < 50:
+                m_cols[f"m{k}"] = np.full(len(va_idx), np.nan, dtype=float)
+                acc_cols[f"acc{k}"] = 0.5
+                continue
+
+            X_tr = tr[feat_cols].values
+
+            # Multi-target: fit on all targets then pick index of h
+            if hasattr(m, "MULTI_HORIZONS") and (h is not None):
+                # Build Y_tr as matrix over all chosen horizons, fit once
+                tgt_cols_all = [f"target_h{int(hh)}" for hh in m.MULTI_HORIZONS]
+                tr_all = d.loc[tr_idx].dropna(subset=list(feat_cols) + tgt_cols_all)
+                X_tr = tr_all[feat_cols].values
+                Y_tr = tr_all[tgt_cols_all].values
+                model = m.fit(X_tr, Y_tr)
+                dv = d.loc[va_idx, feat_cols]
+                mask = np.isfinite(dv.values).all(axis=1)
+                preds = np.full(len(va_idx), np.nan, dtype=float)
+                if mask.any():
+                    yhat_multi = m.predict(model, dv.loc[mask].values)
+                    idx_h = m.MULTI_HORIZONS.index(h)
+                    preds_level = np.asarray(yhat_multi)[:, idx_h].astype(float)
+                    # Map to directional score via relative move vs current close
+                    c0 = close[va_idx[mask]]
+                    preds[mask] = (preds_level - c0) / c0  # a signed "return-like" score
+                # Acc estimate (sign vs meta_label)
+                acc_mask = np.isfinite(preds)
+                if acc_mask.any():
+                    acc_val = ((preds[acc_mask] > 0).astype(int) == y_meta_va[acc_mask]).mean()
+                else:
+                    acc_val = 0.5
+                m_cols[f"m{k}"] = preds
+                acc_cols[f"acc{k}"] = float(acc_val)
+            else:
+                # Legacy single-target regression
+                y_tr = tr[tgt_col].values.astype(float)
+                model = m.fit(X_tr, y_tr)
+                dv = d.loc[va_idx, feat_cols]
+                mask = np.isfinite(dv.values).all(axis=1)
+                preds = np.full(len(va_idx), np.nan, dtype=float)
+                if mask.any():
+                    preds_level = m.predict(model, dv.loc[mask].values).astype(float)
+                    c0 = close[va_idx[mask]]
+                    preds[mask] = (preds_level - c0) / c0
+                acc_mask = np.isfinite(preds)
+                acc_val = ((preds[acc_mask] > 0).astype(int) == y_meta_va[acc_mask]).mean() if acc_mask.any() else 0.5
+                m_cols[f"m{k}"] = preds
+                acc_cols[f"acc{k}"] = float(acc_val)
+
+        else:
+            # Shouldn't happen with your current modules; safe default
+            m_cols[f"m{k}"] = np.full(len(va_idx), np.nan, dtype=float)
+            acc_cols[f"acc{k}"] = 0.5
+
+    # 6) Assemble compact 'back' for the validation slice only
+    back = pd.DataFrame({**m_cols, **{f"acc{i+1}": acc_cols[f"acc{i+1}"] for i in range(n_ch)}})
+    back["meta_label"] = y_meta_va.astype(int)
+    if "timestamp" in df.columns:
+        back["timestamp"] = pd.to_datetime(df["timestamp"].values[va_idx], utc=True)
+
+    # 7) Sub-model AUCs vs meta_label (on this val slice)
     sub_auc = {}
-    n_mods = sum(1 for c in back.columns if isinstance(c, str) and c.startswith("m") and c[1:].isdigit())
-    for i in range(1, n_mods + 1):
+    for i in range(1, n_ch + 1):
         col = f"m{i}"
         x = pd.to_numeric(back[col], errors="coerce").values
-        y = back["meta_label"].astype(int).values
+        y = back["meta_label"].values
         mask = np.isfinite(x)
         auc = roc_auc_score(y[mask], x[mask]) if np.unique(y[mask]).size == 2 else np.nan
         sub_auc[col] = float(auc) if np.isfinite(auc) else np.nan
 
-    # Meta model
+    # 8) Meta model on the validation slice (60/40 of 'back')
+    #    (Keeps quick-test fast; still measures generalization inside val)
+    back = back.reset_index(drop=True)
+    n_mods = sum(1 for c in back.columns if isinstance(c, str) and c.startswith("m") and c[1:].isdigit())
     X = build_meta_features(back, n_mods=n_mods)
     y = back["meta_label"].values.astype(int)
-    split = int(len(y) * 0.6)
-    X_tr, y_tr = X[:split], y[:split]
-    X_te, y_te = X[split:], y[split:]
+    if len(y) < 100:
+        raise ValueError("QUICK_TEST: validation slice too small for meta. Increase QUICK_MAX_BARS or decrease QUICK_STRIDE.")
+    split_b = int(len(y) * 0.6)
+    X_tr, y_tr = X[:split_b], y[:split_b]
+    X_te, y_te = X[split_b:], y[split_b:]
 
     meta = make_meta_model().fit(X_tr, y_tr)
     p_tr = meta.predict_proba(X_tr)[:, 1]
     p_te = meta.predict_proba(X_te)[:, 1]
 
     up, down = optimize_asymmetric_thresholds(p_tr, y_tr, metric="profit")
+
+    # 9) PnL on the meta actions for the test slice (map to original returns)
+    # The test slice corresponds to va_idx[split_b:]
+    t_idx = va_idx[split_b:]
+    ret_next = (close[t_idx + 1] - close[t_idx]) / close[t_idx]
     actions = _actions_from_probs(p_te, up, down)
-
-    # Simple next-bar returns based on original df (aligned to back indices)
-    # back rows start at t = cut .. end-1; meta_label at row r corresponds to direction t+1
-    # We'll approximate returns from df for the same index range
-    # Construct returns aligned with back[split:]
-    cut = int(len(df) * initial_frac)
-    end = len(df) - 1 - max_lookahead(SUBMODS)
-    # back has rows mapping to t in [cut, end-1]; its test slice maps to those t indices from split onward
-    t_idx = np.arange(cut, end)  # same length as back
-    te_t_idx = t_idx[split:]
-    ret_next = (df["close"].values[te_t_idx + 1] - df["close"].values[te_t_idx]) / df["close"].values[te_t_idx]
-
     pnl_vec = _pnl_from_actions(actions, ret_next)
     pnl_sum = float(np.nansum(pnl_vec))
     pnl_avg = float(np.nanmean(pnl_vec)) if len(pnl_vec) else np.nan
 
     meta_auc = roc_auc_score(y_te, p_te) if np.unique(y_te).size == 2 else np.nan
+    from sklearn.metrics import accuracy_score
     meta_acc = accuracy_score(y_te, (p_te > 0.5).astype(int)) if len(y_te) else np.nan
 
-    # SHAP report on meta (validation slice)
+    # 10) SHAP for the meta (test slice)
     feat_names = get_meta_feature_names(back, n_mods)
-    shap_path = _save_shap_report(X_te, y_te, meta, feat_names, FEATURE_ANALYTICS_DIR, tag="quicktest")
+    shap_path = _save_shap_report(X_te, y_te, meta, feat_names, FEATURE_ANALYTICS_DIR, tag="quicktest_fast")
 
     summary = {
-        "n_rows_train": int(len(y_tr)),
-        "n_rows_test": int(len(y_te)),
+        "quick_max_bars": quick_max_bars,
+        "quick_stride": quick_stride,
+        "quick_h1_only": bool(quick_h1_only),
+        "val_rows": int(len(va_idx)),
+        "meta_train_rows": int(len(y_tr)),
+        "meta_test_rows": int(len(y_te)),
         "meta_auc": float(meta_auc) if np.isfinite(meta_auc) else np.nan,
         "meta_acc@0.5": float(meta_acc) if np.isfinite(meta_acc) else np.nan,
         "threshold_up": float(up),
@@ -522,11 +686,22 @@ def quick_test(df: pd.DataFrame, initial_frac: float = 0.6) -> dict:
         "shap_importance_csv": shap_path,
         "submodel_auc_vs_meta_label": sub_auc,
     }
-    # Save a compact CSV for quick reference
+
+    # Save compact JSON summary
     os.makedirs(RESULTS_DIR, exist_ok=True)
     pd.DataFrame([summary]).to_json(os.path.join(RESULTS_DIR, "quicktest_summary.json"), orient="records", indent=2)
-    return summary
 
+    if return_df:
+        out = pd.DataFrame({
+            "timestamp": pd.to_datetime(df["timestamp"].values[t_idx + 1], utc=True) if "timestamp" in df.columns else np.arange(len(t_idx)),
+            "meta_prob": p_te,
+            "action": actions,
+            "ret_next": ret_next,
+            "pnl": pnl_vec
+        })
+        return summary, out
+
+    return summary
 
 # ─────────────────────────────────────────────────────────────────────────────
 # History builder (angles removed)
@@ -744,34 +919,20 @@ def enforce_position_rules(actions, start_open=False):
 def run_backtest(return_df: bool = False, start_open: bool = False):
     df_orig = pd.read_csv(CSV_PATH)
 
-    # QUICK_TEST mode: no history CSV; fast evaluation with SHAP + PnL
     if QUICK_TEST:
-        summary = quick_test(df_orig, initial_frac=0.6)
-        print("[QUICK_TEST] Summary:", summary)
+        print("Quick Test is on: ", True)
+        result = quick_test(df_orig, initial_frac=0.6, return_df=return_df)
         if return_df:
-            # also return the meta actions over the test slice as a DataFrame for inspection
-            # recompute to expose timestamps
-            back_df = backtest_submodels(df_orig, initial_frac=0.6).reset_index(drop=True)
-            n_mods = sum(1 for c in back_df.columns if isinstance(c, str) and c.startswith("m") and c[1:].isdigit())
-            X = build_meta_features(back_df, n_mods=n_mods)
-            y = back_df["meta_label"].values.astype(int)
-            split = int(len(y) * 0.6)
-            meta = make_meta_model().fit(X[:split], y[:split])
-            p = meta.predict_proba(X[split:])[:, 1]
-            up, down = optimize_asymmetric_thresholds(meta.predict_proba(X[:split])[:, 1], y[:split], metric="profit")
-            actions = _actions_from_probs(p, up, down)
-            cut = int(len(df_orig) * 0.6)
-            end = len(df_orig) - 1 - max_lookahead(SUBMODS)
-            t_idx = np.arange(cut, end)
-            out = pd.DataFrame({
-                "timestamp": pd.to_datetime(df_orig["timestamp"].values[t_idx + 1]),
-                "meta_prob": p,
-                "action": actions
-            })
-            return out
-        return
+            summary, df_actions = result
+            print("[QUICK_TEST] Summary:", summary)
+            return df_actions
+        else:
+            print("[QUICK_TEST] Summary:", result)
+            return
 
-    # Non-quick path:
+    print("Quick Test is off: ", False)
+
+    # ── Non-quick paths below (unchanged) ──
     channels = expand_channels(SUBMODS)
     n_ch = len(channels)
 
@@ -779,10 +940,8 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
     ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
 
     if MODE == "sub-vote":
-        # 1) run submodel backtest (produces m*, acc*, meta_label)
         back = backtest_submodels(df_orig, initial_frac=0.6)
 
-        # 2) save a "history-like" snapshot for analytics (timestamped and latest)
         bt_hist_latest = os.path.join(
             FEATURE_ANALYTICS_DIR,
             f"subvote_backtest_history_{CONVERTED_TIMEFRAME}_latest.csv"
@@ -794,7 +953,7 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
         try:
             back.to_csv(bt_hist_latest, index=True)
             back.to_csv(bt_hist_ts, index=True)
-            # SHAP on a temporary meta trained over this snapshot (no history file)
+            # optional: SHAP on snapshot (unchanged)
             k = sum(1 for c in back.columns if isinstance(c, str) and c.startswith("m") and c[1:].isdigit())
             X = build_meta_features(back.reset_index(drop=True), n_mods=k)
             y = back["meta_label"].values.astype(int)
@@ -805,16 +964,14 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
         except Exception as e:
             print(f"[FEATURE-ANALYTICS] (sub-vote backtest) Failed to write SHAP snapshot: {e}")
 
-        # 3) voting logic
         VOTE_UP, VOTE_DOWN = 0.55, 0.45
-
         vote_cols = []
         for k, ch in enumerate(channels, start=1):
             pred_col, vote_col = f"m{k}", f"v{k}"
             m = ch["mod"]
-            if hasattr(m, "compute_labels"):          # classifier style
+            if hasattr(m, "compute_labels"):
                 back[vote_col] = back[pred_col].map(lambda p: 1 if p > VOTE_UP else (0 if p < VOTE_DOWN else 0.5))
-            else:                                     # regression style
+            else:
                 back[vote_col] = back[pred_col].map(lambda r: 1 if r > REG_UP else (0 if r < REG_DOWN else 0.5))
             vote_cols.append(vote_col)
 
@@ -832,8 +989,11 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
         df_out = back[["timestamp", *[f"m{k}" for k in range(1, n_ch + 1)], "action"]]
         df_out["action"] = df_out["action"].map({1: "BUY", 0: "SELL", 0.5: "HOLD"})
 
+        if return_df:
+            df_out["action"] = enforce_position_rules(df_out["action"].tolist(), start_open)
+            return df_out
+
     else:
-        # META backtest path with history
         cache_csv = HISTORY_PATH
         os.makedirs(RESULTS_DIR, exist_ok=True)
         update_submeta_history(CSV_PATH, cache_csv, submods=SUBMODS, verbose=True)
@@ -848,7 +1008,6 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
         df_out.to_csv(out_fn, index=False, float_format="%.8f")
         print(f"[RESULT] Walk-forward results saved to {out_fn}")
 
-        # Fit once on whole history for SHAP report
         try:
             meta_pkl   = os.path.join(RESULTS_DIR, "meta_model.pkl")
             thresh_pkl = os.path.join(RESULTS_DIR, "meta_thresholds.pkl")
@@ -856,10 +1015,6 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
             print(f"[META] BUY>{up:.2f} / SELL<{down:.2f}")
         except Exception as e:
             print(f"[META] training/report failed: {e}")
-
-    if return_df and MODE == "sub-vote":
-        df_out["action"] = enforce_position_rules(df_out["action"].tolist(), start_open)
-        return df_out
 
 
 def row(df_slice: pd.DataFrame, module, idx: int | None = None):

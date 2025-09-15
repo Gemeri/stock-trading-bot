@@ -203,7 +203,7 @@ def call_sub_main(mode, df, execution, position_open=False):
     sub_main = importlib.util.module_from_spec(spec)
     sys.modules["sub_main"] = sub_main
     spec.loader.exec_module(sub_main)
-    sub_main.MODE       = mode
+    sub_main.MODE = mode
     sub_main.EXECUTION  = execution
     if execution == "live":
         csv_path = "_sub_tmp_live.csv"
@@ -3121,11 +3121,11 @@ def console_listener():
                                 })
 
                             # timestamp alignment ---------------------------------------------------
-                            df['timestamp']           = pd.to_datetime(df['timestamp'])
+                            df['timestamp'] = pd.to_datetime(df['timestamp'])
                             trade_actions['timestamp'] = pd.to_datetime(trade_actions['timestamp'])
 
-                            df_sorted          = df.sort_values('timestamp').reset_index(drop=True)
-                            actions_sorted     = trade_actions.sort_values('timestamp').reset_index(drop=True)
+                            df_sorted = df.sort_values('timestamp').reset_index(drop=True)
+                            actions_sorted = trade_actions.sort_values('timestamp').reset_index(drop=True)
 
                             merged_actions = pd.merge_asof(
                                 actions_sorted,

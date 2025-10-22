@@ -188,7 +188,7 @@ POSSIBLE_FEATURE_COLS = [
     'lagged_close_1', 'lagged_close_2', 'lagged_close_3', 'lagged_close_5', 'lagged_close_10',
     'candle_body_ratio', 'wick_dominance', 'gap_vs_prev', 'volume_zscore', 'atr_zscore', 'rsi_zscore',
     'macd_cross', 'macd_hist_flip', 'month', 'hour_sin', 'hour_cos', 'day_of_week_sin', 
-    'day_of_week_cos', 'days_since_high', 'days_since_low',
+    'day_of_week_cos', 'days_since_high', 'days_since_low', "d_sentiment"
 ]
 
 def make_pipeline(base_est): 
@@ -197,28 +197,35 @@ def make_pipeline(base_est):
         ("cal", CalibratedClassifierCV(base_est, method="isotonic", cv=3)), 
     ])
 
-def call_sub_main(mode, df, execution, position_open=False):
+def call_sub_main(df, backtest_amount, position_open=False):
     sub_main_path = os.path.join(os.path.dirname(__file__), "sub", "main.py")
     spec = importlib.util.spec_from_file_location("sub_main", sub_main_path)
     sub_main = importlib.util.module_from_spec(spec)
     sys.modules["sub_main"] = sub_main
     spec.loader.exec_module(sub_main)
-    sub_main.MODE = mode
-    sub_main.EXECUTION  = execution
-    if execution == "live":
+    sub_main.backtest_amount  = backtest_amount
+    if backtest_amount == 0:
         csv_path = "_sub_tmp_live.csv"
         df.to_csv(csv_path, index=False)
         sub_main.CSV_PATH = csv_path
-        result = sub_main.run_live(return_result=True, position_open=position_open)
+        result = sub_main.run_live("TSLA", return_result=True, position_open=position_open)
         os.remove(csv_path)
         return result
+    elif backtest_amount == -1:
+        csv_path = "_sub_tmp_train.csv"
+        df.to_csv(csv_path, index=False)
+        sub_main.CSV_PATH = csv_path
+        analysis = sub_main.train_models()
+        os.remove(csv_path)
+        return analysis
     else:
         csv_path = "_sub_tmp_backtest.csv"
         df.to_csv(csv_path, index=False)
         sub_main.CSV_PATH = csv_path
-        results_df = sub_main.run_backtest(return_df=True)
+        results_df = sub_main.run_backtest("TSLA", backtest_amount, return_df=True)
         os.remove(csv_path)
         return results_df
+    
 
 if DISCORD_MODE == "on":
 
@@ -1231,6 +1238,25 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
         wick_dom = np.maximum(upper_wick_len, lower_wick_len) / candle_range
         df['wick_dominance'] = wick_dom.replace([np.inf, -np.inf], 0).fillna(0)
 
+    if 'sentiment' in df.columns:
+        # raw one-bar change Δ_t
+        delta = df['sentiment'].diff()
+
+        # rolling standardization over window w
+        roll = delta.rolling(window=63, min_periods=63)
+        mean = roll.mean()
+        std  = roll.std().replace(0, np.nan)
+
+        z = (delta - mean) / std
+        # Before we have enough history, set 0; also clean inf/nan
+        z = z.where(roll.count() >= 63, 0.0)
+        z = z.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+        # clip extremes
+        df['d_sentiment'] = z.clip(-float(3.0), float(3.0))
+    else:
+        df['d_sentiment'] = 0.0
+
     # 3. Gap vs Previous Close: open - lagged_close_1
     if 'open' in df.columns and 'lagged_close_1' in df.columns:
         df['gap_vs_prev'] = df['open'] - df['lagged_close_1']
@@ -1519,7 +1545,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                 position_open = abs(pos_qty) > 0
             except Exception:
                 position_open = False
-        result  = call_sub_main(mode, df_full, execution="live", position_open=position_open)
+        result  = call_sub_main(df_full, 0, position_open=position_open)
         logging.info(f"Sub-{mode} run_live returned: {result!r}")
 
         # ── decide what we pass back upstream ───────────────────────────────
@@ -2861,46 +2887,45 @@ def console_listener():
                 logging.info(f"[{ticker}] Saved candle data + advanced features (minus disabled) to {csv_filename}.")
 
         elif cmd == "predict-next":
-            for ticker in BACKTEST_TICKER:
-                tf_code = timeframe_to_code(BAR_TIMEFRAME)
-                csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
-                if skip_data:
-                    logging.info(f"[{ticker}] predict-next -r: Using existing CSV {csv_filename}")
-                    if not os.path.exists(csv_filename):
-                        logging.error(f"[{ticker}] CSV does not exist, skipping.")
-                        continue
-                    df = read_csv_limited(csv_filename)
-                    if df.empty:
-                        logging.error(f"[{ticker}] CSV is empty, skipping.")
-                        continue
-                else:
-                    df = fetch_candles_plus_features_and_predclose(
-                        ticker,
-                        bars=N_BARS,
-                        timeframe=BAR_TIMEFRAME,
-                        rewrite_mode=REWRITE
-                    )
-                    df.to_csv(csv_filename, index=False)
-                    logging.info(f"[{ticker}] Fetched new data + advanced features (minus disabled), saved to {csv_filename}")
-
-                allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
-                df = df.loc[:, [c for c in df.columns if c in allowed]]
-
-                pred_close = train_and_predict(df, ticker)
-                if isinstance(pred_close, tuple):
-                    pred_close = pred_close[0]
-                if pred_close is None:
-                    logging.error(f"[{ticker}] No prediction generated.")
+            tf_code = timeframe_to_code(BAR_TIMEFRAME)
+            csv_filename = os.path.join(DATA_DIR, f"{BACKTEST_TICKER}_{tf_code}.csv")
+            if skip_data:
+                logging.info(f"[{BACKTEST_TICKER}] predict-next -r: Using existing CSV {csv_filename}")
+                if not os.path.exists(csv_filename):
+                    logging.error(f"[{BACKTEST_TICKER}] CSV does not exist, skipping.")
                     continue
-                current_price = float(df.iloc[-1]['close'])
-                try:
-                    pred_val = float(pred_close)
-                except Exception:
-                    logging.error(f"[{ticker}] Prediction not numeric: {pred_close}")
+                df = read_csv_limited(csv_filename)
+                if df.empty:
+                    logging.error(f"[{BACKTEST_TICKER}] CSV is empty, skipping.")
                     continue
-                logging.info(
-                    f"[{ticker}] Current Price={current_price:.2f}, Predicted Next Close={pred_val:.2f}"
+            else:
+                df = fetch_candles_plus_features_and_predclose(
+                    BACKTEST_TICKER,
+                    bars=N_BARS,
+                    timeframe=BAR_TIMEFRAME,
+                    rewrite_mode=REWRITE
                 )
+                df.to_csv(csv_filename, index=False)
+                logging.info(f"[{BACKTEST_TICKER}] Fetched new data + advanced features (minus disabled), saved to {csv_filename}")
+
+            allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+            df = df.loc[:, [c for c in df.columns if c in allowed]]
+
+            pred_close = train_and_predict(df, BACKTEST_TICKER)
+            if isinstance(pred_close, tuple):
+                pred_close = pred_close[0]
+            if pred_close is None:
+                logging.error(f"[{BACKTEST_TICKER}] No prediction generated.")
+                continue
+            current_price = float(df.iloc[-1]['close'])
+            try:
+                pred_val = float(pred_close)
+            except Exception:
+                logging.error(f"[{BACKTEST_TICKER}] Prediction not numeric: {pred_close}")
+                continue
+            logging.info(
+                f"[{BACKTEST_TICKER}] Current Price={current_price:.2f}, Predicted Next Close={pred_val:.2f}"
+            )
 
         elif cmd == "force-run":
             logging.info("Force-running job now (ignoring market open check).")
@@ -3086,7 +3111,7 @@ def console_listener():
                             continue
                         if "sub-vote" in ml_models or "sub-meta" in ml_models:
                             mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-                            signal_df  = call_sub_main(mode, df, execution="backtest")
+                            signal_df  = call_sub_main(df, 500)
 
                             # --- keep only actionable rows and order chronologically ---------------
                             trade_actions = (

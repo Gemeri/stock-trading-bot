@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import matplotlib
 import importlib
+import hashlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone
@@ -100,6 +101,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 TICKERLIST_PATH = os.path.join(DATA_DIR, "tickerlist.txt")
 BEST_TICKERS_CACHE = os.path.join(DATA_DIR, "best_tickers_cache.json")
 
+BACKTEST_CACHE_VERSION = 1
+BACKTEST_CACHE_DIR = os.path.join(DATA_DIR, "backtest_cache")
+os.makedirs(BACKTEST_CACHE_DIR, exist_ok=True)
+
 USE_FULL_SHARES = os.getenv("USE_FULL_SHARES", "true").strip().lower() == "true"
 
 TICKERLIST_TOP_N = 3
@@ -177,6 +182,166 @@ def read_csv_limited(path: str) -> pd.DataFrame:
     return limit_df_rows(df)
 
 
+def _timestamp_to_str(value):
+    if value is None:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    try:
+        return pd.to_datetime(value).isoformat()
+    except Exception:
+        return str(value)
+
+
+def _deserialize_timestamp(value):
+    if value is None:
+        return None
+    try:
+        return pd.to_datetime(value)
+    except Exception:
+        return value
+
+
+def _serialize_records(records):
+    serialized = []
+    for rec in records or []:
+        new_rec = {}
+        for key, val in rec.items():
+            if key == "timestamp":
+                new_rec[key] = _timestamp_to_str(val)
+            elif isinstance(val, (np.integer, np.int64)):
+                new_rec[key] = int(val)
+            elif isinstance(val, (np.floating, np.float32, np.float64)):
+                new_rec[key] = float(val)
+            else:
+                new_rec[key] = val
+        serialized.append(new_rec)
+    return serialized
+
+
+def _deserialize_records(records):
+    restored = []
+    for rec in records or []:
+        new_rec = rec.copy()
+        if "timestamp" in new_rec:
+            new_rec["timestamp"] = _deserialize_timestamp(new_rec["timestamp"])
+        restored.append(new_rec)
+    return restored
+
+
+def get_backtest_cache_path(meta: dict) -> str:
+    key_str = json.dumps(meta, sort_keys=True)
+    cache_key = hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(BACKTEST_CACHE_DIR, f"backtest_{cache_key}.json")
+
+
+def load_backtest_cache(path: str):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"Failed to load backtest cache {path}: {e}")
+        return None
+
+
+def save_backtest_cache(path: str, state: dict) -> None:
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        logging.warning(f"Failed to save backtest cache {path}: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def clear_backtest_cache(path: str) -> None:
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logging.warning(f"Unable to remove backtest cache {path}: {e}")
+
+
+def backtest_cache_matches(state, meta: dict) -> bool:
+    if not state or state.get("version") != BACKTEST_CACHE_VERSION:
+        return False
+    for key, val in meta.items():
+        if state.get(key) != val:
+            return False
+    return True
+
+
+def restore_backtest_state(state, *, mode: str, total_iterations: int,
+                           start_balance: float):
+    if not state or state.get("mode") != mode:
+        return None
+    cached_total = state.get("total_iterations")
+    if cached_total is not None and cached_total != total_iterations:
+        return None
+
+    predictions = [float(x) for x in state.get("predictions", [])]
+    actuals = [float(x) for x in state.get("actuals", [])]
+    timestamps = [_deserialize_timestamp(ts) for ts in state.get("timestamps", [])]
+    trade_records = _deserialize_records(state.get("trade_records", []))
+    portfolio_records = _deserialize_records(state.get("portfolio_records", []))
+
+    cash = float(state.get("cash", start_balance))
+    position_qty = state.get("position_qty", 0)
+    try:
+        position_qty = int(position_qty)
+    except Exception:
+        position_qty = float(position_qty)
+    avg_entry_price = float(state.get("avg_entry_price", 0.0))
+    next_index = int(state.get("next_index", 0))
+    last_action = state.get("last_action")
+
+    return (
+        predictions,
+        actuals,
+        timestamps,
+        trade_records,
+        portfolio_records,
+        cash,
+        position_qty,
+        avg_entry_price,
+        next_index,
+        last_action,
+    )
+
+
+def update_backtest_cache(path: str, meta: dict, *, mode: str, total_iterations: int,
+                          next_index: int, predictions: list, actuals: list,
+                          timestamps: list, trade_records: list, portfolio_records: list,
+                          cash: float, position_qty, avg_entry_price: float,
+                          last_action) -> None:
+    remaining = max(0, total_iterations - next_index)
+    state = {
+        "version": BACKTEST_CACHE_VERSION,
+        "mode": mode,
+        "total_iterations": total_iterations,
+        "next_index": next_index,
+        "remaining_candles": remaining,
+        "predictions": [float(x) for x in predictions],
+        "actuals": [float(x) for x in actuals],
+        "timestamps": [_timestamp_to_str(ts) for ts in timestamps],
+        "trade_records": _serialize_records(trade_records),
+        "portfolio_records": _serialize_records(portfolio_records),
+        "cash": float(cash),
+        "position_qty": float(position_qty),
+        "avg_entry_price": float(avg_entry_price),
+        "last_action": last_action,
+    }
+    state.update(meta)
+    save_backtest_cache(path, state)
 # ----------------------------------------------------
 # list of every feature column your models know about
 # ----------------------------------------------------
@@ -2984,6 +3149,22 @@ def console_listener():
                         logging.error(f"Unable to import logic module {logic_module_name}: {e}")
                         continue
 
+                    cache_meta = {
+                        "ticker": BACKTEST_TICKER,
+                        "approach": approach,
+                        "timeframe": timeframe_for_backtest,
+                        "test_size": test_size,
+                        "logic_module": logic_module_name,
+                        "ml_models": sorted(ml_models),
+                    }
+                    cache_path = get_backtest_cache_path(cache_meta)
+                    cache_state = load_backtest_cache(cache_path)
+                    if cache_state and not backtest_cache_matches(cache_state, cache_meta):
+                        logging.info(
+                            f"[{BACKTEST_TICKER}] Ignoring cached backtest state due to configuration change."
+                        )
+                        cache_state = None
+
                     classifier_names = {"forest_cls", "xgboost_cls",
                                         "lightgbm_cls", "catboost_cls"}
 
@@ -3044,6 +3225,8 @@ def console_listener():
                     cash = start_balance
                     position_qty = 0
                     avg_entry_price = 0.0
+                    last_action = None
+                    start_iter = 0
 
                     def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
                         trade_records.append({
@@ -3109,6 +3292,30 @@ def console_listener():
                         if len(df.iloc[:train_end]) < 70:
                             logging.error(f"[{BACKTEST_TICKER}] Not enough training rows for {approach} approach.")
                             continue
+                        total_iterations = len(idx_list)
+                        resume_data = restore_backtest_state(
+                            cache_state,
+                            mode="ml",
+                            total_iterations=total_iterations,
+                            start_balance=start_balance,
+                        )
+                        if resume_data:
+                            (
+                                predictions,
+                                actuals,
+                                timestamps,
+                                trade_records,
+                                portfolio_records,
+                                cash,
+                                position_qty,
+                                avg_entry_price,
+                                start_iter,
+                                last_action,
+                            ) = resume_data
+                            logging.info(
+                                f"[{BACKTEST_TICKER}] Resuming backtest at candle {start_iter} "
+                                f"of {total_iterations}."
+                            )
                         if "sub-vote" in ml_models or "sub-meta" in ml_models:
                             mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
                             signal_df  = call_sub_main(df, 500)
@@ -3159,10 +3366,40 @@ def console_listener():
                                 direction='backward'
                             )
 
+                            total_iterations = len(merged_actions)
+                            resume_data = restore_backtest_state(
+                                cache_state,
+                                mode="signal",
+                                total_iterations=total_iterations,
+                                start_balance=START_BALANCE,
+                            )
+                            if resume_data:
+                                (
+                                    predictions,
+                                    actuals,
+                                    timestamps,
+                                    trade_records,
+                                    portfolio_records,
+                                    cash,
+                                    position_qty,
+                                    avg_entry_price,
+                                    start_iter,
+                                    last_action,
+                                ) = resume_data
+                                logging.info(
+                                    f"[{BACKTEST_TICKER}] Resuming signal backtest at step {start_iter} "
+                                    f"of {total_iterations}."
+                                )
+                            else:
+                                start_iter = 0
+                                last_action = None
+
                             # -----------------------------------------------------------------------
                             #  Iterate over each (action, candle) row – enforce position sanity
                             # -----------------------------------------------------------------------
-                            for _, row in merged_actions.iterrows():
+                            for iter_idx, (_, row) in enumerate(merged_actions.iterrows()):
+                                if iter_idx < start_iter:
+                                    continue
                                 raw_act = row["action"]
                                 ts      = row["timestamp"]
                                 price   = row["close"]
@@ -3206,6 +3443,24 @@ def console_listener():
                                 )
                                 portfolio_records.append({"timestamp": ts, "portfolio_value": port_val})
 
+                                last_action = raw_act
+                                update_backtest_cache(
+                                    cache_path,
+                                    cache_meta,
+                                    mode="signal",
+                                    total_iterations=total_iterations,
+                                    next_index=iter_idx + 1,
+                                    predictions=predictions,
+                                    actuals=actuals,
+                                    timestamps=timestamps,
+                                    trade_records=trade_records,
+                                    portfolio_records=portfolio_records,
+                                    cash=cash,
+                                    position_qty=position_qty,
+                                    avg_entry_price=avg_entry_price,
+                                    last_action=last_action,
+                                )
+
                             # -----------------------------------------------------------------------
                             #  Ensure results directory exists (unchanged)
                             # -----------------------------------------------------------------------
@@ -3218,6 +3473,9 @@ def console_listener():
                             ROLL_WIN = test_size
 
                             for i_, row_idx in enumerate(idx_list):
+
+                                if i_ < start_iter:
+                                    continue
 
                                 if approach == "simple":
                                     if row_idx == 0:
@@ -3338,6 +3596,24 @@ def console_listener():
                                 val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
                                 portfolio_records.append(
                                     {"timestamp": row_data["timestamp"], "portfolio_value": val}
+                                )
+
+                                last_action = action
+                                update_backtest_cache(
+                                    cache_path,
+                                    cache_meta,
+                                    mode="ml",
+                                    total_iterations=total_iterations,
+                                    next_index=i_ + 1,
+                                    predictions=predictions,
+                                    actuals=actuals,
+                                    timestamps=timestamps,
+                                    trade_records=trade_records,
+                                    portfolio_records=portfolio_records,
+                                    cash=cash,
+                                    position_qty=position_qty,
+                                    avg_entry_price=avg_entry_price,
+                                    last_action=last_action,
                                 )
                         # ----------------- END inner loop ---------------------------------
 
@@ -3461,6 +3737,8 @@ def console_listener():
                         plt.close()
 
                         logging.info(f"[{BACKTEST_TICKER}] Saved portfolio plot → {port_png}")
+
+                    clear_backtest_cache(cache_path)
 
         elif cmd == "get-best-tickers":
             n = 1

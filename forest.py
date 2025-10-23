@@ -13,7 +13,7 @@ import importlib
 import hashlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error
@@ -347,6 +347,7 @@ def update_backtest_cache(path: str, meta: dict, *, mode: str, total_iterations:
 # ----------------------------------------------------
 POSSIBLE_FEATURE_COLS = [
     'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions', 'sentiment',
+    'news_count', 'news_volume_z',
     'price_change', 'high_low_range', 'log_volume', 'macd_line', 'macd_signal', 'macd_histogram',
     'rsi', 'roc', 'atr', 'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx', 'obv', 'bollinger_upper', 
     'bollinger_lower', 'bollinger_percB', 'returns_1', 'returns_3', 'returns_5', 'std_5', 'std_10',
@@ -922,6 +923,20 @@ def fetch_candles_plus_features_and_predclose(
             logging.info(f"[{ticker}] No candles newer than {last_ts}.")
             return df_existing.copy()
 
+    df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment', 'news_count'])
+    last_sentiment_known = None
+    if os.path.exists(sentiment_csv):
+        try:
+            df_sent_old = pd.read_csv(sentiment_csv, parse_dates=['timestamp'])
+            if 'sentiment' in df_sent_old.columns:
+                df_sent_old['sentiment'] = pd.to_numeric(df_sent_old['sentiment'], errors='coerce')
+                series = df_sent_old['sentiment'].dropna()
+                if not series.empty:
+                    last_sentiment_known = float(series.iloc[-1])
+        except Exception as e:
+            logging.error(f"[{ticker}] Problem loading old sentiment CSV: {e}")
+            df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment', 'news_count'])
+
     # ───── 4) attach incremental sentiment only when adding new candles ─────
     if has_new:
         if last_ts is not None:
@@ -930,20 +945,35 @@ def fetch_candles_plus_features_and_predclose(
             news_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650); start_dt = None
 
         articles_per_day = ARTICLES_PER_DAY_MAPPING.get(BAR_TIMEFRAME, 1)
-        news_list = fetch_news_sentiments(ticker, news_days, articles_per_day, start_dt=start_dt)
-        sentiments = assign_sentiment_to_candles(df_candles_new, news_list)
+        candle_days: set[date] = set()
+        for ts in df_candles_new['timestamp']:
+            stamp = pd.Timestamp(ts)
+            if stamp.tzinfo is None:
+                stamp = stamp.tz_localize('UTC')
+            else:
+                stamp = stamp.tz_convert('UTC')
+            candle_days.add(stamp.date())
+        news_list = fetch_news_sentiments(
+            ticker,
+            news_days,
+            articles_per_day,
+            start_dt=start_dt,
+            days_of_interest=candle_days
+        )
+        sentiments, news_counts = assign_sentiment_to_candles(
+            df_candles_new,
+            news_list,
+            last_sentiment_fallback=last_sentiment_known
+        )
         df_candles_new['sentiment'] = sentiments
+        df_candles_new['news_count'] = news_counts
 
     if has_new:
         try:
-            if os.path.exists(sentiment_csv):
-                df_sent_old = pd.read_csv(sentiment_csv, parse_dates=['timestamp'])
-            else:
-                df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment'])
-
             df_sent_new = pd.DataFrame({
                 "timestamp": df_candles_new['timestamp'],
-                "sentiment": [f"{s:.15f}" for s in sentiments]
+                "sentiment": [f"{s:.15f}" for s in sentiments],
+                "news_count": news_counts
             })
             (pd.concat([df_sent_old, df_sent_new])
             .drop_duplicates(subset=['timestamp'])
@@ -1089,7 +1119,8 @@ def fetch_news_sentiments(
     num_days: int,
     articles_per_day: int,
     start_dt: datetime | None = None,
-    base_url: str = "https://data.alpaca.markets/v1beta1/news"
+    base_url: str = "https://data.alpaca.markets/v1beta1/news",
+    days_of_interest: set[date] | None = None,
 ):
     """
     Pulls Alpaca v1beta1 news via REST (no api.get_news), including full content,
@@ -1098,15 +1129,20 @@ def fetch_news_sentiments(
     news_list = []
 
     # --------- date range setup ----------
-    if start_dt is not None:
-        start_date_news = pd.to_datetime(start_dt, utc=True)
-        logging.info(f"[{ticker}] Incremental news pull from {start_date_news}.")
+    if days_of_interest:
+        day_sequence = sorted(days_of_interest)
+        logging.info(f"[{ticker}] News pull limited to {len(day_sequence)} day(s) from candle timestamps.")
     else:
-        start_date_news = datetime.now(timezone.utc) - timedelta(days=num_days)
-        logging.info(f"[{ticker}] Full-range news pull (≈{num_days} days).")
+        if start_dt is not None:
+            start_date_news = pd.to_datetime(start_dt, utc=True).normalize()
+            logging.info(f"[{ticker}] Incremental news pull from {start_date_news.date()} (full days).")
+        else:
+            start_date_news = (datetime.now(timezone.utc) - timedelta(days=num_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+            logging.info(f"[{ticker}] Full-range news pull (≈{num_days} days).")
 
-    today_dt = datetime.now(timezone.utc)
-    total_days = (today_dt.date() - start_date_news.date()).days + 1
+        today_dt = datetime.now(timezone.utc)
+        total_days = (today_dt.date() - start_date_news.date()).days + 1
+        day_sequence = [(start_date_news + timedelta(days=offset)).date() for offset in range(total_days)]
 
     # --------- headers (use keys if available) ----------
     headers = {"accept": "application/json"}
@@ -1122,9 +1158,9 @@ def fetch_news_sentiments(
 
     session = requests.Session()
 
-    for day_offset in range(total_days):
-        current_day = start_date_news + timedelta(days=day_offset)
-        if current_day > today_dt:
+    for day_item in day_sequence:
+        current_day = datetime.combine(day_item, datetime.min.time(), tzinfo=timezone.utc)
+        if current_day > datetime.now(timezone.utc):
             break
         next_day = current_day + timedelta(days=1)
 
@@ -1133,88 +1169,129 @@ def fetch_news_sentiments(
         logging.info(f"[{ticker}]   ↳ {current_day.date()} …")
 
         # --------- query Alpaca News (REST) ----------
-        params = {
-            "start": start_str,
-            "end": end_str,
-            "sort": "desc",
-            "symbols": ticker,
-            "limit": int(articles_per_day),
-            "include_content": "true",
-            "exclude_contentless": "true",
-        }
+        per_request_limit = max(int(articles_per_day), 50)
+        page_token = None
+        fetched_for_day = 0
 
-        try:
-            resp = session.get(base_url, headers=headers, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
+        while True:
+            params = {
+                "start": start_str,
+                "end": end_str,
+                "sort": "desc",
+                "symbols": ticker,
+                "limit": per_request_limit,
+                "include_content": "true",
+                "exclude_contentless": "true",
+            }
+            if page_token:
+                params["page_token"] = page_token
 
-            # API generally returns {"news": [...], "next_page_token": "..."}
-            items = []
-            if isinstance(data, dict) and "news" in data:
-                items = data["news"]
-            elif isinstance(data, list):
-                items = data  # just in case an SDK/proxy returns a raw list
+            try:
+                resp = session.get(base_url, headers=headers, params=params, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
 
-            if not items:
-                continue
+                items = []
+                if isinstance(data, dict) and "news" in data:
+                    items = data["news"]
+                elif isinstance(data, list):
+                    items = data
 
-            # Keep just the first N (limit already enforced, but be defensive)
-            for article in items[:articles_per_day]:
-                headline = article.get("headline", "") or ""
-                summary  = article.get("summary", "") or ""
-                content  = article.get("content", "") or ""
+                if not items:
+                    break
 
-                combined = " ".join([seg for seg in (headline, content, summary) if seg]).strip()
+                for article in items:
+                    headline = article.get("headline", "") or ""
+                    summary  = article.get("summary", "") or ""
+                    content  = article.get("content", "") or ""
 
-                # Prefer created_at; fall back to updated_at; fallback to current_day
-                created_at_raw = article.get("created_at") or article.get("updated_at")
-                created_at = pd.to_datetime(created_at_raw, utc=True, errors="coerce") if created_at_raw else None
-                if created_at is None or pd.isna(created_at):
-                    created_at = current_day
+                    combined = " ".join([seg for seg in (headline, content, summary) if seg]).strip()
 
-                _, _, sentiment_score = predict_sentiment(combined)
+                    created_at_raw = article.get("created_at") or article.get("updated_at")
+                    created_at = pd.to_datetime(created_at_raw, utc=True, errors="coerce") if created_at_raw else None
+                    if created_at is None or pd.isna(created_at):
+                        created_at = current_day
 
-                news_list.append({
-                    "created_at": created_at,
-                    "sentiment": sentiment_score,
-                    "headline": headline,
-                    "summary": summary,
-                    "content": content,
-                    "url": article.get("url", ""),
-                    "source": (article.get("source") or {}).get("name") if isinstance(article.get("source"), dict) else article.get("source", "")
-                })
+                    _, _, sentiment_score = predict_sentiment(combined)
 
-        except Exception as e:
-            logging.error(f"Error fetching news for {ticker}: {e}")
+                    news_list.append({
+                        "created_at": created_at,
+                        "sentiment": sentiment_score,
+                        "headline": headline,
+                        "summary": summary,
+                        "content": content,
+                        "url": article.get("url", ""),
+                        "source": (article.get("source") or {}).get("name") if isinstance(article.get("source"), dict) else article.get("source", "")
+                    })
+                    fetched_for_day += 1
+
+                page_token = data.get("next_page_token") if isinstance(data, dict) else None
+                if not page_token:
+                    break
+
+            except Exception as e:
+                logging.error(f"Error fetching news for {ticker}: {e}")
+                break
+
+        logging.info(f"[{ticker}]     ↳ fetched {fetched_for_day} article(s) on {current_day.date()}.")
 
     news_list.sort(key=lambda x: x['created_at'])
     logging.info(f"[{ticker}] Total new articles: {len(news_list)}")
     return news_list
 
-def assign_sentiment_to_candles(df: pd.DataFrame, news_list: list):
-    logging.info("Assigning sentiment to candles...")
-    sentiments = []
-    last_sentiment = 0.0
-    for _, row in df.iterrows():
+def assign_sentiment_to_candles(
+    df: pd.DataFrame,
+    news_list: list,
+    *,
+    last_sentiment_fallback: float | None = None,
+):
+    logging.info("Assigning sentiment to candles (daily average)...")
+
+    day_to_scores: dict[date, list[float]] = {}
+    for article in news_list:
+        created_at = pd.to_datetime(article.get('created_at'), utc=True, errors='coerce')
+        if created_at is None or pd.isna(created_at):
+            continue
+        day_key = created_at.date()
+        score = article.get('sentiment', 0.0)
         try:
-            candle_time = pd.to_datetime(row['timestamp']).replace(tzinfo=timezone.utc)
-        except Exception:
-            candle_time = datetime.now(timezone.utc)
-        best = None
-        best_diff = None
-        for article in news_list:
-            diff = abs((article['created_at'] - candle_time).total_seconds())
-            if best is None or diff < best_diff:
-                best = article
-                best_diff = diff
-        if best is not None:
-            sentiment = best['sentiment']
-            last_sentiment = sentiment
+            score = float(score)
+        except (TypeError, ValueError):
+            score = 0.0
+        day_to_scores.setdefault(day_key, []).append(score)
+
+    day_to_avg = {day_key: float(np.mean(scores)) for day_key, scores in day_to_scores.items()}
+    day_to_count = {day_key: len(scores) for day_key, scores in day_to_scores.items()}
+
+    sentiments: list[float] = []
+    news_counts: list[int] = []
+    fallback = None
+    if last_sentiment_fallback is not None and not math.isnan(last_sentiment_fallback):
+        fallback = float(last_sentiment_fallback)
+
+    for ts in df['timestamp']:
+        stamp = pd.Timestamp(ts)
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize('UTC')
         else:
-            sentiment = last_sentiment
+            stamp = stamp.tz_convert('UTC')
+        day_key = stamp.date()
+
+        if day_key in day_to_avg:
+            sentiment = day_to_avg[day_key]
+            fallback = sentiment
+            count = day_to_count.get(day_key, 0)
+        else:
+            if fallback is None:
+                fallback = 0.0
+            sentiment = fallback
+            count = 0
+
         sentiments.append(sentiment)
+        news_counts.append(int(count))
+
     logging.info("Finished assigning sentiment to candles.")
-    return sentiments
+    return sentiments, news_counts
 
 def save_news_to_csv(ticker: str, news_list: list):
     """
@@ -1257,16 +1334,19 @@ def merge_sentiment_from_csv(df, ticker):
     df_sentiment['timestamp'] = pd.to_datetime(df_sentiment['timestamp'])
     df['timestamp'] = pd.to_datetime(df['timestamp'])
 
-    news_list = []
-    for _, row in df_sentiment.iterrows():
-        news_list.append({
-            "created_at": row['timestamp'],
-            "sentiment": float(row['sentiment'])
-        })
-    
-    new_sentiments = assign_sentiment_to_candles(df, news_list)
-    df["sentiment"] = new_sentiments
-    df["sentiment"] = df["sentiment"].apply(lambda x: f"{x:.15f}")
+    df_sentiment = (df_sentiment
+                    .sort_values('timestamp')
+                    .drop_duplicates(subset=['timestamp'], keep='last'))
+    if 'sentiment' in df_sentiment.columns:
+        df_sentiment['sentiment'] = pd.to_numeric(df_sentiment['sentiment'], errors='coerce')
+    if 'news_count' not in df_sentiment.columns:
+        df_sentiment['news_count'] = 0
+    df_sentiment['news_count'] = pd.to_numeric(df_sentiment['news_count'], errors='coerce').fillna(0).astype(int)
+
+    df = df.merge(df_sentiment[['timestamp', 'sentiment', 'news_count']], on='timestamp', how='left')
+    df['sentiment'] = df['sentiment'].fillna(method='ffill').fillna(0.0)
+    df['news_count'] = df['news_count'].fillna(0).astype(int)
+    df['sentiment'] = df['sentiment'].apply(lambda x: f"{float(x):.15f}")
     logging.info(f"Merged sentiment from {sentiment_csv_filename} into latest data for {ticker}.")
     return df
 
@@ -1402,6 +1482,21 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
         candle_range = (df['high'] - df['low']).replace(0, np.nan)
         wick_dom = np.maximum(upper_wick_len, lower_wick_len) / candle_range
         df['wick_dominance'] = wick_dom.replace([np.inf, -np.inf], 0).fillna(0)
+
+    if 'news_count' in df.columns:
+        counts = pd.to_numeric(df['news_count'], errors='coerce').fillna(0.0)
+        df['news_count'] = counts.round().astype(int)
+        log_counts = np.log1p(df['news_count'].astype(float))
+        window = 63
+        roll = log_counts.rolling(window=window, min_periods=window)
+        mean = roll.mean()
+        std = roll.std().clip(lower=1e-6)
+        z = (log_counts - mean) / std
+        z = z.where(roll.count() >= window, 0.0)
+        z = z.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        df['news_volume_z'] = z.clip(-3.0, 3.0)
+    else:
+        df['news_volume_z'] = 0.0
 
     if 'sentiment' in df.columns:
         # raw one-bar change Δ_t

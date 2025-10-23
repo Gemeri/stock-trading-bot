@@ -11,6 +11,7 @@ import pandas as pd
 import matplotlib
 import importlib
 import hashlib
+import io
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone, date
@@ -154,6 +155,9 @@ load_tickerlist()
 
 TRADE_LOG_FILENAME = os.path.join(DATA_DIR, "trade_log.csv")
 
+CNN_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+ALTERNATIVE_FNG_CSV_URL = "https://api.alternative.me/fng/?limit=0&format=csv"
+
 # misc ---------------------------------------------------------------------------------------
 N_ESTIMATORS = 100
 RANDOM_SEED  = 42
@@ -180,6 +184,213 @@ def read_csv_limited(path: str) -> pd.DataFrame:
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
     return limit_df_rows(df)
+
+
+def _load_primary_greed_series() -> pd.DataFrame:
+    """Fetch the CNN Fear & Greed time series."""
+    try:
+        response = requests.get(CNN_FEAR_GREED_URL, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as e:
+        logging.error(f"Failed to fetch CNN fear & greed data: {e}")
+        return pd.DataFrame(columns=["timestamp", "value"])
+
+    historical = payload.get("fear_and_greed_historical", {}) if isinstance(payload, dict) else {}
+    data = historical.get("data", []) if isinstance(historical, dict) else []
+    if not isinstance(data, list) or not data:
+        return pd.DataFrame(columns=["timestamp", "value"])
+
+    df = pd.DataFrame(data)
+    if "x" not in df.columns or "y" not in df.columns:
+        return pd.DataFrame(columns=["timestamp", "value"])
+
+    df = df.rename(columns={"x": "timestamp", "y": "value"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True, errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["timestamp", "value"])
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp", "value"])
+
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+    return df[["timestamp", "value"]].reset_index(drop=True)
+
+
+def _load_local_greed_map() -> dict:
+    """Load locally cached fear & greed values keyed by date."""
+    path = os.path.join(DATA_DIR, "greed-index.csv")
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        logging.error(f"Failed to read local greed index CSV {path}: {e}")
+        return {}
+
+    if df.empty:
+        return {}
+
+    date_col = None
+    value_col = None
+    for col in df.columns:
+        lowered = str(col).strip().lower()
+        if lowered in {"date", "timestamp"} and date_col is None:
+            date_col = col
+        elif lowered in {"greed", "value", "index", "fear_and_greed", "fng"} and value_col is None:
+            value_col = col
+
+    if date_col is None:
+        date_col = df.columns[0]
+    if value_col is None:
+        value_col = df.columns[-1]
+
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce")
+    df["date"] = df["date"].dt.date
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=["date", value_col])
+    if df.empty:
+        return {}
+
+    grouped = df.groupby("date")[value_col].mean()
+    return {idx: float(val) for idx, val in grouped.items()}
+
+
+def _load_alt_greed_map() -> dict:
+    """Fetch the Alternative.me fear & greed CSV as a fallback."""
+    try:
+        response = requests.get(ALTERNATIVE_FNG_CSV_URL, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        logging.error(f"Failed to fetch Alternative.me fear & greed CSV: {e}")
+        return {}
+
+    raw_text = response.text.strip()
+    text = raw_text
+
+    if raw_text.startswith("{"):
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            data_field = payload.get("data")
+            if isinstance(data_field, list):
+                text = "\n".join(str(line) for line in data_field if line)
+            else:
+                text = ""
+
+    if not text:
+        return {}
+
+    try:
+        df = pd.read_csv(io.StringIO(text))
+    except Exception as e:
+        logging.error(f"Failed to parse Alternative.me fear & greed CSV: {e}")
+        return {}
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    if "date" not in df.columns:
+        return {}
+
+    value_col = None
+    for cand in ("fng_value", "value", "fear_and_greed", "fear_and_greed_index"):
+        if cand in df.columns:
+            value_col = cand
+            break
+    if value_col is None:
+        # fall back to the first non-date column
+        value_col = next((c for c in df.columns if c != "date"), None)
+    if value_col is None:
+        return {}
+
+    df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
+    if df["date"].isna().all():
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["date"] = df["date"].dt.date
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=["date", value_col])
+    if df.empty:
+        return {}
+
+    grouped = df.groupby("date")[value_col].mean()
+    return {idx: float(val) for idx, val in grouped.items()}
+
+
+def attach_greed_index(df_existing: pd.DataFrame, df_new: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Attach greed_index feature to candle data using multiple data sources."""
+    if (df_existing is None or df_existing.empty) and (df_new is None or df_new.empty):
+        return df_existing, df_new
+
+    frames: list[pd.Series] = []
+    if df_existing is not None and not df_existing.empty and 'timestamp' in df_existing.columns:
+        df_existing['timestamp'] = pd.to_datetime(df_existing['timestamp'], utc=True, errors='coerce')
+        frames.append(df_existing['timestamp'])
+    if df_new is not None and not df_new.empty and 'timestamp' in df_new.columns:
+        df_new['timestamp'] = pd.to_datetime(df_new['timestamp'], utc=True, errors='coerce')
+        frames.append(df_new['timestamp'])
+
+    if not frames:
+        return df_existing, df_new
+
+    timestamps = pd.concat(frames).dropna().drop_duplicates().sort_values()
+    if timestamps.empty:
+        return df_existing, df_new
+
+    primary_df = _load_primary_greed_series()
+    if not primary_df.empty:
+        primary_df = primary_df[primary_df['timestamp'] >= timestamps.iloc[0]].reset_index(drop=True)
+
+    primary_times = primary_df['timestamp'].tolist() if not primary_df.empty else []
+    primary_values = primary_df['value'].tolist() if not primary_df.empty else []
+    primary_idx = 0
+
+    local_map = _load_local_greed_map()
+    alt_map = None
+
+    greed_mapping: dict[pd.Timestamp, float] = {}
+    prev_ts: pd.Timestamp | None = None
+    last_value: float | None = None
+
+    for ts in timestamps:
+        interval_values: list[float] = []
+        while primary_idx < len(primary_times) and primary_times[primary_idx] <= ts:
+            candidate_time = primary_times[primary_idx]
+            candidate_value = primary_values[primary_idx]
+            if (prev_ts is None or candidate_time > prev_ts) and pd.notna(candidate_value):
+                interval_values.append(float(candidate_value))
+            primary_idx += 1
+
+        value: float | None = None
+        if interval_values:
+            value = float(np.mean(interval_values))
+        else:
+            date_key = ts.date()
+            fallback = local_map.get(date_key)
+            if fallback is None:
+                if alt_map is None:
+                    alt_map = _load_alt_greed_map()
+                fallback = alt_map.get(date_key) if alt_map else None
+            if fallback is not None and pd.notna(fallback):
+                try:
+                    value = float(fallback)
+                except (TypeError, ValueError):
+                    value = None
+
+        if value is None and last_value is not None:
+            value = last_value
+
+        greed_mapping[ts] = float(value) if value is not None else np.nan
+        if value is not None:
+            last_value = value
+        prev_ts = ts
+
+    if df_existing is not None and not df_existing.empty and 'timestamp' in df_existing.columns:
+        df_existing['greed_index'] = df_existing['timestamp'].map(greed_mapping)
+    if df_new is not None and not df_new.empty and 'timestamp' in df_new.columns:
+        df_new['greed_index'] = df_new['timestamp'].map(greed_mapping)
+
+    return df_existing, df_new
 
 
 def _timestamp_to_str(value):
@@ -347,6 +558,7 @@ def update_backtest_cache(path: str, meta: dict, *, mode: str, total_iterations:
 # ----------------------------------------------------
 POSSIBLE_FEATURE_COLS = [
     'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions', 'sentiment',
+    'greed_index',
     'news_count', 'news_volume_z',
     'price_change', 'high_low_range', 'log_volume', 'macd_line', 'macd_signal', 'macd_histogram',
     'rsi', 'roc', 'atr', 'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx', 'obv', 'bollinger_upper', 
@@ -922,6 +1134,12 @@ def fetch_candles_plus_features_and_predclose(
         if not has_new and not is_backfill_only:
             logging.info(f"[{ticker}] No candles newer than {last_ts}.")
             return df_existing.copy()
+
+    if has_new or is_backfill_only:
+        try:
+            df_existing, df_candles_new = attach_greed_index(df_existing, df_candles_new)
+        except Exception as e:
+            logging.error(f"[{ticker}] Failed to attach greed index feature: {e}")
 
     df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment', 'news_count'])
     last_sentiment_known = None

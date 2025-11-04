@@ -54,6 +54,7 @@ from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import importlib.util
+import shap
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -185,35 +186,98 @@ def read_csv_limited(path: str) -> pd.DataFrame:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
     return limit_df_rows(df)
 
-
 def _load_primary_greed_series() -> pd.DataFrame:
-    """Fetch the CNN Fear & Greed time series."""
-    try:
-        response = requests.get(CNN_FEAR_GREED_URL, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as e:
-        logging.error(f"Failed to fetch CNN fear & greed data: {e}")
-        return pd.DataFrame(columns=["timestamp", "value"])
+    """Fetch the CNN Fear & Greed time series from production.dataviz.cnn.io,
+    robust to 418/anti-bot blocks and minor schema variations."""
+    import time
 
-    historical = payload.get("fear_and_greed_historical", {}) if isinstance(payload, dict) else {}
-    data = historical.get("data", []) if isinstance(historical, dict) else []
+    empty = pd.DataFrame(columns=["timestamp", "value"])
+
+    headers = {
+        # CNN’s CDN often blocks "botty" clients; use a realistic UA + typical headers.
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://money.cnn.com/data/fear-and-greed/",
+        "Origin": "https://money.cnn.com",
+        "Connection": "keep-alive",
+    }
+
+    session = requests.Session()
+    url = CNN_FEAR_GREED_URL  # expected: https://production.dataviz.cnn.io/index/fearandgreed/graphdata
+
+    payload = None
+    for attempt in range(3):
+        try:
+            # small cache-buster on retries
+            params = {"_": int(time.time())} if attempt else None
+            resp = session.get(url, headers=headers, timeout=12, params=params)
+            if resp.status_code == 418:
+                # backoff and try again
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            payload = resp.json()
+            break
+        except Exception as e:
+            logging.error(f"Failed to fetch CNN fear & greed data (try {attempt+1}/3): {e}")
+            if attempt == 2:
+                return empty
+            time.sleep(0.6 * (attempt + 1))
+
+    if not isinstance(payload, dict):
+        return empty
+
+    # Historical series can appear either as a dict containing "data": [{x,y},...]
+    # or directly as a list of {x,y}/{"timestamp","score"}/etc.
+    hist = payload.get("fear_and_greed_historical", [])
+    if isinstance(hist, dict):
+        data = hist.get("data", hist.get("timeline", []))
+    else:
+        data = hist
+
     if not isinstance(data, list) or not data:
-        return pd.DataFrame(columns=["timestamp", "value"])
+        return empty
 
-    df = pd.DataFrame(data)
-    if "x" not in df.columns or "y" not in df.columns:
-        return pd.DataFrame(columns=["timestamp", "value"])
+    rows = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        # Timestamp field candidates
+        ts_val = item.get("x", item.get("timestamp", item.get("date")))
+        # Value field candidates
+        v_val = item.get("y", item.get("score", item.get("value")))
+        # Parse timestamp
+        ts_parsed = pd.NaT
+        if ts_val is not None:
+            try:
+                if isinstance(ts_val, (int, float)) and not isinstance(ts_val, bool):
+                    # Heuristic: ms vs s
+                    unit = "ms" if float(ts_val) > 1e11 else "s"
+                    ts_parsed = pd.to_datetime(ts_val, unit=unit, utc=True, errors="coerce")
+                else:
+                    ts_parsed = pd.to_datetime(ts_val, utc=True, errors="coerce")
+            except Exception:
+                ts_parsed = pd.NaT
 
-    df = df.rename(columns={"x": "timestamp", "y": "value"})
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True, errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["timestamp", "value"])
+        # Parse value
+        v_num = pd.to_numeric(v_val, errors="coerce")
+
+        if pd.notna(ts_parsed) and pd.notna(v_num):
+            rows.append((ts_parsed, float(v_num)))
+
+    if not rows:
+        return empty
+
+    df = pd.DataFrame(rows, columns=["timestamp", "value"]).dropna()
     if df.empty:
-        return pd.DataFrame(columns=["timestamp", "value"])
+        return empty
 
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
-    return df[["timestamp", "value"]].reset_index(drop=True)
+    return df.reset_index(drop=True)
 
 
 def _load_local_greed_map() -> dict:
@@ -223,7 +287,8 @@ def _load_local_greed_map() -> dict:
         return {}
 
     try:
-        df = pd.read_csv(path)
+        # Be tolerant of ragged rows or stray delimiters.
+        df = pd.read_csv(path, on_bad_lines="skip")
     except Exception as e:
         logging.error(f"Failed to read local greed index CSV {path}: {e}")
         return {}
@@ -245,8 +310,7 @@ def _load_local_greed_map() -> dict:
     if value_col is None:
         value_col = df.columns[-1]
 
-    df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-    df["date"] = df["date"].dt.date
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce").dt.date
     df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
     df = df.dropna(subset=["date", value_col])
     if df.empty:
@@ -257,68 +321,63 @@ def _load_local_greed_map() -> dict:
 
 
 def _load_alt_greed_map() -> dict:
-    """Fetch the Alternative.me fear & greed CSV as a fallback."""
+    """Fetch the Alternative.me Fear & Greed (CRYPTO) as a fallback, using JSON (not CSV)."""
+    # JSON endpoint: https://api.alternative.me/fng/?limit=0
+    # Docs: https://alternative.me/crypto/fear-and-greed-index/  (see API section)
+    alt_url = "https://api.alternative.me/fng/?limit=0"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+    }
+
     try:
-        response = requests.get(ALTERNATIVE_FNG_CSV_URL, timeout=15)
+        response = requests.get(alt_url, headers=headers, timeout=15)
         response.raise_for_status()
+        payload = response.json()
     except Exception as e:
-        logging.error(f"Failed to fetch Alternative.me fear & greed CSV: {e}")
+        logging.error(f"Failed to fetch Alternative.me fear & greed JSON: {e}")
         return {}
 
-    raw_text = response.text.strip()
-    text = raw_text
-
-    if raw_text.startswith("{"):
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-        if isinstance(payload, dict):
-            data_field = payload.get("data")
-            if isinstance(data_field, list):
-                text = "\n".join(str(line) for line in data_field if line)
-            else:
-                text = ""
-
-    if not text:
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    if not isinstance(data, list) or not data:
         return {}
 
-    try:
-        df = pd.read_csv(io.StringIO(text))
-    except Exception as e:
-        logging.error(f"Failed to parse Alternative.me fear & greed CSV: {e}")
+    # Build date -> values map, averaging same-day duplicates.
+    day_to_vals: dict[datetime.date, list] = {}
+
+    for rec in data:
+        if not isinstance(rec, dict):
+            continue
+        ts = rec.get("timestamp")
+        val = rec.get("value")
+        ts_num = pd.to_numeric(ts, errors="coerce")
+        v_num = pd.to_numeric(val, errors="coerce")
+        if pd.isna(ts_num) or pd.isna(v_num):
+            continue
+        # Alt.me timestamp is seconds since epoch.
+        dt = pd.to_datetime(int(ts_num), unit="s", utc=True, errors="coerce")
+        if pd.isna(dt):
+            continue
+        d = dt.date()
+        day_to_vals.setdefault(d, []).append(float(v_num))
+
+    if not day_to_vals:
         return {}
 
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    if "date" not in df.columns:
-        return {}
-
-    value_col = None
-    for cand in ("fng_value", "value", "fear_and_greed", "fear_and_greed_index"):
-        if cand in df.columns:
-            value_col = cand
-            break
-    if value_col is None:
-        # fall back to the first non-date column
-        value_col = next((c for c in df.columns if c != "date"), None)
-    if value_col is None:
-        return {}
-
-    df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
-    if df["date"].isna().all():
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["date"] = df["date"].dt.date
-    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-    df = df.dropna(subset=["date", value_col])
-    if df.empty:
-        return {}
-
-    grouped = df.groupby("date")[value_col].mean()
-    return {idx: float(val) for idx, val in grouped.items()}
+    return {d: float(np.mean(vals)) for d, vals in day_to_vals.items()}
 
 
 def attach_greed_index(df_existing: pd.DataFrame, df_new: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Attach greed_index feature to candle data using multiple data sources."""
+    """Attach greed_index feature to candle data using multiple data sources.
+
+    Uses CNN time series when available; falls back to local CSV (by date) and then
+    Alternative.me (JSON) daily values keyed by date. Forward-fills across gaps.
+    """
     if (df_existing is None or df_existing.empty) and (df_new is None or df_new.empty):
         return df_existing, df_new
 
@@ -391,7 +450,6 @@ def attach_greed_index(df_existing: pd.DataFrame, df_new: pd.DataFrame) -> tuple
         df_new['greed_index'] = df_new['timestamp'].map(greed_mapping)
 
     return df_existing, df_new
-
 
 def _timestamp_to_str(value):
     if value is None:
@@ -558,15 +616,14 @@ def update_backtest_cache(path: str, meta: dict, *, mode: str, total_iterations:
 # ----------------------------------------------------
 POSSIBLE_FEATURE_COLS = [
     'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions', 'sentiment',
-    'greed_index',
-    'news_count', 'news_volume_z',
-    'price_change', 'high_low_range', 'log_volume', 'macd_line', 'macd_signal', 'macd_histogram',
-    'rsi', 'roc', 'atr', 'ema_9', 'ema_21', 'ema_50', 'ema_200', 'adx', 'obv', 'bollinger_upper', 
-    'bollinger_lower', 'bollinger_percB', 'returns_1', 'returns_3', 'returns_5', 'std_5', 'std_10',
-    'lagged_close_1', 'lagged_close_2', 'lagged_close_3', 'lagged_close_5', 'lagged_close_10',
-    'candle_body_ratio', 'wick_dominance', 'gap_vs_prev', 'volume_zscore', 'atr_zscore', 'rsi_zscore',
-    'macd_cross', 'macd_hist_flip', 'month', 'hour_sin', 'hour_cos', 'day_of_week_sin', 
-    'day_of_week_cos', 'days_since_high', 'days_since_low', "d_sentiment"
+    'greed_index', 'news_count', 'news_volume_z', 'price_change', 'high_low_range', 
+    'macd_line', 'macd_signal', 'macd_histogram', 'rsi', 'roc', 'atr', 'ema_9', 'ema_21', 
+    'ema_50', 'ema_200', 'adx', 'obv', 'bollinger_percB', 'returns_1', 
+    'returns_3', 'returns_5', 'std_5', 'std_10', 'lagged_close_1', 'lagged_close_2', 
+    'lagged_close_3', 'lagged_close_5', 'lagged_close_10', 'candle_body_ratio', 
+    'wick_dominance', 'gap_vs_prev', 'volume_zscore', 'atr_zscore', 'rsi_zscore',
+    'month', 'hour_sin', 'hour_cos', 'day_of_week_sin',  'day_of_week_cos', 
+    'days_since_high', 'days_since_low', "d_sentiment"
 ]
 
 def make_pipeline(base_est): 
@@ -790,8 +847,7 @@ TRADE_LOGIC = os.getenv("TRADE_LOGIC", "15").strip()
 
 MAIN_FEATURES = {
     "timestamp","open","high","low","close","vwap",
-    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10",
-    "bollinger_upper","bollinger_lower","momentum","obv"
+    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10","momentum","obv"
 }
 BASE_FEATURES = {
     "timestamp","open","high","low","close","volume","vwap","transactions"
@@ -1574,13 +1630,11 @@ def merge_sentiment_from_csv(df, ticker):
 # -------------------------------
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    logging.info("Adding features (price_change, high_low_range, log_volume)...")
+    logging.info("Adding features (price_change, high_low_range)...")
     if 'close' in df.columns and 'open' in df.columns:
         df['price_change'] = df['close'] - df['open']
     if 'high' in df.columns and 'low' in df.columns:
         df['high_low_range'] = df['high'] - df['low']
-    if 'volume' in df.columns:
-        df['log_volume'] = np.log1p(df['volume'])
     return df
 
 def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -1669,10 +1723,15 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
     if 'close' in df.columns:
         ma20  = df['close'].rolling(window=20, min_periods=1).mean()
         std20 = df['close'].rolling(window=20, min_periods=1).std()
-        df['bollinger_upper'] = (ma20 + 2 * std20).fillna(0.0)
-        df['bollinger_lower'] = (ma20 - 2 * std20).fillna(0.0)
-        band_width = (df['bollinger_upper'] - df['bollinger_lower']).replace(0, np.nan)
-        df['bollinger_percB'] = ((df['close'] - df['bollinger_lower']) / band_width).fillna(0.0)
+
+        # Temporary (not written to df)
+        bollinger_upper = (ma20 + 2 * std20).fillna(0.0)
+        bollinger_lower = (ma20 - 2 * std20).fillna(0.0)
+
+        # Only this is written to df
+        band_width = (bollinger_upper - bollinger_lower).replace(0, np.nan)
+        df['bollinger_percB'] = ((df['close'] - bollinger_lower) / band_width).fillna(0.0)
+
         df['returns_1'] = df['close'].pct_change()
         df['returns_3'] = df['close'].pct_change(3)
         df['returns_5'] = df['close'].pct_change(5)
@@ -1746,28 +1805,6 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
             mean = roll.mean()
             std = roll.std().replace(0, np.nan)
             df[z_feat] = ((df[feat] - mean) / std).fillna(0)
-
-    # 6A. MACD crossing (signal): 1 if crossing up (MACD crosses above signal), -1 if crossing below, 0 otherwise
-    if 'macd_line' in df.columns and 'macd_signal' in df.columns:
-        macd_cross = np.where(
-            (df['macd_line'].shift(1) < df['macd_signal'].shift(1)) &
-            (df['macd_line'] >= df['macd_signal']), 1,
-            np.where(
-                (df['macd_line'].shift(1) > df['macd_signal'].shift(1)) &
-                (df['macd_line'] <= df['macd_signal']), -1, 0
-            )
-        )
-        df['macd_cross'] = macd_cross
-
-        # 6B. MACD histogram sign change
-        macd_hist_flip = np.where(
-            (df['macd_histogram'].shift(1) * df['macd_histogram']) < 0,
-            1, 0
-        )
-        df['macd_hist_flip'] = macd_hist_flip
-    else:
-        df['macd_cross'] = 0
-        df['macd_hist_flip'] = 0
 
     if 'timestamp' in df.columns:
         ts = pd.to_datetime(df['timestamp'], errors='coerce')
@@ -4065,87 +4102,235 @@ def console_listener():
             logging.info(f"Best tickers: {result}")
 
         elif cmd == "feature-importance":
-            if skip_data:
-                logging.info("feature-importance -r: Will use existing CSV data for each ticker.")
-            else:
-                logging.info("feature-importance: Will fetch fresh data for each ticker, then compute importance.")
 
-                tf_code  = timeframe_to_code(BAR_TIMEFRAME)
-                csv_file = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
+            # ──────────────────────────────────────────────────────────────────────────
+            # Configs
+            # ──────────────────────────────────────────────────────────────────────────
+            TRAIN_PCT           = 0.80  # percentage of rows used as the expanding-window start
+            MIN_TRAIN_SAMPLES   = 50    # minimum samples required to fit a model at any step
+            RANDOM_STATE        = 42
+            SAVE_DIR_ROOT       = os.path.join(DATA_DIR, "feature-importance")
+            os.makedirs(SAVE_DIR_ROOT, exist_ok=True)
 
-                # ─── FETCH OR LOAD ──────────────────────────────────────────────────────
-                if not skip_data:
-                    df = fetch_candles_plus_features_and_predclose(
-                        ticker,
-                        bars=N_BARS,
-                        timeframe=BAR_TIMEFRAME,
-                        rewrite_mode=REWRITE
+            def _clean_and_select_features(df: pd.DataFrame):
+                # If your pipeline normally engineers features from raw OHLCV, you may call them here.
+                # Comment these in if needed in your project:
+                # df = add_features(df)
+                # df = compute_custom_features(df)
+
+                # Select usable features
+                feats = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
+                if not feats:
+                    raise RuntimeError("No overlap between POSSIBLE_FEATURE_COLS and CSV columns.")
+                X = df[feats].copy()
+
+                # Replace inf with nan, then we'll handle nan at train/test time
+                X.replace([np.inf, -np.inf], np.nan, inplace=True)
+                return X, feats
+
+            def _make_labels(df: pd.DataFrame):
+                # Regression labels
+                y_reg_h1  = df['close'].shift(-1)
+                y_reg_h50 = df['close'].shift(-50)
+
+                # Classification labels: 1 if next close rises relative to current close, else 0
+                y_clf_h1  = (df['close'].shift(-1)  > df['close']).astype(float)
+                y_clf_h50 = (df['close'].shift(-50) > df['close']).astype(float)
+
+                # Ensure proper NaN handling for trailing rows
+                return y_reg_h1, y_clf_h1, y_reg_h50, y_clf_h50
+
+            def _walkforward_shap_importance(X: pd.DataFrame,
+                                             y: pd.Series,
+                                             problem: str,
+                                             horizon_gap: int) -> np.ndarray:
+                """
+                Expanding-window walk-forward SHAP importance with XGBoost.
+                For horizon_gap=0: train[:i], predict[i]
+                For horizon_gap=50: train[:i-50], predict[i]
+                Accumulate mean |SHAP| across steps.
+                """
+                n = len(X)
+                start_idx = int(n * TRAIN_PCT)
+                start_idx = max(start_idx, horizon_gap + 1)  # ensure train_end will be >= 1
+                end_idx   = n - horizon_gap  # last index with a non-NaN label
+
+                if problem == "reg":
+                    model_kwargs = dict(
+                        n_estimators=300,
+                        max_depth=6,
+                        learning_rate=0.05,
+                        subsample=0.9,
+                        colsample_bytree=0.9,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        tree_method="hist",
+                        eval_metric="rmse",
                     )
-                    df.to_csv(csv_file, index=False)
-                    logging.info(f"[{ticker}] Fetched data & saved CSV for feature-importance.")
                 else:
-                    if not os.path.exists(csv_file):
-                        logging.error(f"[{ticker}] CSV {csv_file} not found, skipping.")
-                        continue
-                    df = read_csv_limited(csv_file)
-                    if df.empty:
-                        logging.error(f"[{ticker}] CSV is empty, skipping.")
-                        continue
-
-                # ─── CLEAN & ENGINEER ───────────────────────────────────────────────────
-                if 'sentiment' in df.columns and df['sentiment'].dtype == object:
-                    try:
-                        df['sentiment'] = df['sentiment'].astype(float)
-                    except Exception as e:
-                        logging.error(f"[{ticker}] Could not convert sentiment: {e}")
-                        continue
-
-                df = add_features(df)
-                df = compute_custom_features(df)
-
-                # ─── DEFINE TARGET AS NEXT-DAY RETURN ───────────────────────────────────
-                df['target'] = df['close'].pct_change().shift(-1)
-                df.dropna(inplace=True)
-                if len(df) < 30:
-                    logging.error(f"[{ticker}] Not enough data after shift, skipping.")
-                    continue
-
-                # ─── PREPARE FEATURES (INCLUDING RAW CLOSE) ─────────────────────────────
-                features = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
-                X_all   = df[features]
-                y_all   = df['target']
-
-                # ─── EXPANDING-WINDOW ROLLING FORECAST & IMPORTANCE ACCUMULATION ────────
-                train_size = int(len(df) * 0.8)
-                imp_accum  = np.zeros(len(features))
-                n_models   = 0
-
-                for i in range(train_size, len(df)):
-                    X_train = X_all.iloc[:i]
-                    y_train = y_all.iloc[:i]
-                    X_test  = X_all.iloc[i:i+1]
-                    y_test  = y_all.iloc[i]
-
-                    model = RandomForestRegressor(
-                        n_estimators=N_ESTIMATORS,
-                        random_state=RANDOM_SEED,
-                        n_jobs=-1
+                    model_kwargs = dict(
+                        n_estimators=300,
+                        max_depth=6,
+                        learning_rate=0.05,
+                        subsample=0.9,
+                        colsample_bytree=0.9,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        tree_method="hist",
+                        eval_metric="logloss",
+                        use_label_encoder=False,
                     )
+
+                accum = np.zeros(X.shape[1], dtype=float)
+                steps = 0
+
+                # Progress bar
+                pbar = tqdm(range(start_idx, end_idx),
+                            desc=f"SHAP ({problem}, h={horizon_gap})",
+                            leave=False)
+
+                for i in pbar:
+                    train_end = i - horizon_gap  # exclusive end for training
+                    if train_end < MIN_TRAIN_SAMPLES:
+                        continue
+
+                    # Prepare train split; drop rows with NaNs in features or label
+                    X_train = X.iloc[:train_end]
+                    y_train = y.iloc[:train_end]
+                    mask_tr = X_train.notna().all(axis=1) & y_train.notna()
+                    X_train = X_train[mask_tr]
+                    y_train = y_train[mask_tr]
+
+                    # Ensure enough samples after NaN filtering
+                    if len(X_train) < MIN_TRAIN_SAMPLES:
+                        continue
+
+                    # For classifiers, labels should be ints (0/1)
+                    if problem == "clf":
+                        y_train = y_train.astype(int)
+
+                    # Prepare single test row; skip if NaN present
+                    X_test = X.iloc[i:i+1]
+                    if (not X_test.notna().all(axis=1).iloc[0]) or (not pd.notna(y.iloc[i])):
+                        continue
+
+                    # Fit fresh XGBoost model at this step
+                    if problem == "reg":
+                        model = xgb.XGBRegressor(**model_kwargs)
+                    else:
+                        model = xgb.XGBClassifier(**model_kwargs)
+
                     model.fit(X_train, y_train)
 
-                    y_pred = model.predict(X_test)[0]
-                    # (could store y_pred vs y_test here for metrics but dont feel like doing that now)
+                    # SHAP for the single test row
+                    try:
+                        explainer = shap.TreeExplainer(model)
+                        shap_vals = explainer.shap_values(X_test)
+                    except Exception:
+                        # Fallback to model-agnostic Explainer if needed
+                        explainer = shap.Explainer(model.predict, X_train, seed=RANDOM_STATE)
+                        sv_exp = explainer(X_test)
+                        shap_vals = sv_exp.values
 
-                    imp_accum += model.feature_importances_
-                    n_models  += 1
+                    # Normalize various SHAP return types to a 1D feature vector for this sample
+                    if isinstance(shap_vals, list):
+                        # list per class -> take positive class (1)
+                        sv = np.array(shap_vals[1])[0]
+                    elif hasattr(shap_vals, "values"):
+                        sv_arr = np.array(shap_vals.values)
+                        sv = sv_arr[0] if sv_arr.ndim > 1 else sv_arr
+                    else:
+                        sv = np.array(shap_vals)
+                        sv = sv[0] if sv.ndim > 1 else sv
 
-                # ─── AVERAGE IMPORTANCES & LOG ─────────────────────────────────────────
-                avg_imps = imp_accum / n_models
-                ranked   = sorted(zip(features, avg_imps), key=lambda x: x[1], reverse=True)
+                    accum += np.abs(sv)
+                    steps += 1
 
-                logging.info(f"[{ticker}] Rolling-window feature importances (avg over {n_models} models):")
-                for feat, imp in ranked:
-                    logging.info(f"   {feat}: {imp:.4f}")
+                if steps == 0:
+                    raise RuntimeError("Walk-forward produced 0 valid steps; check data/labels.")
+                return accum / steps  # mean absolute SHAP per feature
+
+            def _save_rankings_and_plot(out_dir: str, label_name: str, features: list, importances: np.ndarray):
+                os.makedirs(out_dir, exist_ok=True)
+                ranking = sorted(zip(features, importances), key=lambda x: x[1], reverse=True)
+
+                # Save text ranking
+                txt_path = os.path.join(out_dir, f"{label_name}.txt")
+                with open(txt_path, "w") as f:
+                    for idx, (feat, imp) in enumerate(ranking, 1):
+                        f.write(f"{idx:>2}. {feat}: {imp:.10f}\n")
+
+                # Save bar chart
+                plt.figure(figsize=(12, max(4, len(features) * 0.25)))
+                ordered_feats = [r[0] for r in ranking][::-1]
+                ordered_imps  = [r[1] for r in ranking][::-1]
+                plt.barh(ordered_feats, ordered_imps)
+                plt.xlabel("Mean |SHAP value| (walk-forward)")
+                plt.title(f"Feature Importance — {label_name}")
+                plt.tight_layout()
+                png_path = os.path.join(out_dir, f"{label_name}.png")
+                plt.savefig(png_path, dpi=200)
+                plt.close()
+
+            # ──────────────────────────────────────────────────────────────────────────
+            # Main per-ticker loop (expects 'ticker' variable to be defined in your outer loop)
+            # ──────────────────────────────────────────────────────────────────────────
+            tf_code = timeframe_to_code(BAR_TIMEFRAME)
+            csv_file = os.path.join(DATA_DIR, f"{BACKTEST_TICKER}_{tf_code}.csv")
+            out_dir  = os.path.join(SAVE_DIR_ROOT, BACKTEST_TICKER)
+            os.makedirs(out_dir, exist_ok=True)
+
+            if not os.path.exists(csv_file):
+                logging.error(f"[{BACKTEST_TICKER}] CSV {csv_file} not found. Aborting feature-importance for this ticker.")
+            else:
+                # Load CSV
+                try:
+                    df = pd.read_csv(csv_file)
+                except Exception as e:
+                    logging.error(f"[{BACKTEST_TICKER}] Failed to read CSV: {e}")
+                    df = pd.DataFrame()
+
+                if df.empty or 'close' not in df.columns:
+                    logging.error(f"[{BACKTEST_TICKER}] CSV empty or missing 'close' column. Skipping.")
+                else:
+                    # Prepare features and labels
+                    X, features = _clean_and_select_features(df)
+                    y_reg_h1, y_clf_h1, y_reg_h50, y_clf_h50 = _make_labels(df)
+
+                    # Ensure alignment
+                    y_reg_h1  = y_reg_h1.reindex(X.index)
+                    y_clf_h1  = y_clf_h1.reindex(X.index)
+                    y_reg_h50 = y_reg_h50.reindex(X.index)
+                    y_clf_h50 = y_clf_h50.reindex(X.index)
+
+                    # 1) Regressor i+1
+                    logging.info(f"[{BACKTEST_TICKER}] Running SHAP feature-importance (XGBoost): Regressor next close (i+1).")
+                    imp_reg_h1 = _walkforward_shap_importance(X, y_reg_h1, problem="reg", horizon_gap=0)
+                    _save_rankings_and_plot(out_dir, f"{tf_code}_reg_next_close_i+1", features, imp_reg_h1)
+
+                    # 2) Classifier i+1 (up/down)
+                    logging.info(f"[{BACKTEST_TICKER}] Running SHAP feature-importance (XGBoost): Classifier next close up/down (i+1).")
+                    imp_clf_h1 = _walkforward_shap_importance(X, y_clf_h1, problem="clf", horizon_gap=0)
+                    _save_rankings_and_plot(out_dir, f"{tf_code}_clf_next_close_updown_i+1", features, imp_clf_h1)
+
+                    # 3) Regressor i+50  (train up to i-50)
+                    logging.info(f"[{BACKTEST_TICKER}] Running SHAP feature-importance (XGBoost): Regressor next close (i+50), train up to i-50.")
+                    imp_reg_h50 = _walkforward_shap_importance(X, y_reg_h50, problem="reg", horizon_gap=50)
+                    _save_rankings_and_plot(out_dir, f"{tf_code}_reg_next_close_i+50", features, imp_reg_h50)
+
+                    # 4) Classifier i+50 (train up to i-50)
+                    logging.info(f"[{BACKTEST_TICKER}] Running SHAP feature-importance (XGBoost): Classifier next close up/down (i+50), train up to i-50.")
+                    imp_clf_h50 = _walkforward_shap_importance(X, y_clf_h50, problem="clf", horizon_gap=50)
+                    _save_rankings_and_plot(out_dir, f"{tf_code}_clf_next_close_updown_i+50", features, imp_clf_h50)
+
+                    # 5) Average across all four tests
+                    logging.info(f"[{BACKTEST_TICKER}] Aggregating average importance across all four tests.")
+                    all_imps = np.vstack([imp_reg_h1, imp_clf_h1, imp_reg_h50, imp_clf_h50])
+                    imp_avg  = all_imps.mean(axis=0)
+                    _save_rankings_and_plot(out_dir, f"{tf_code}_AVERAGE_of_all_tests", features, imp_avg)
+
+                    logging.info(f"[{BACKTEST_TICKER}] SHAP feature-importance done. Outputs in: {out_dir}")
+
 
         elif cmd == "commands":
             logging.info("Available commands:")
@@ -4404,4 +4589,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+

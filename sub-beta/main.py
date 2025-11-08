@@ -389,7 +389,30 @@ def _save_pickle(path: str, obj: Any) -> None:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
+    """
+    Numerically-stable logistic function that avoids overflow in exp().
+    Works with numpy arrays or pandas Series/Index (converted to ndarray).
+    """
+    z = np.asarray(x, dtype=float)
+    out = np.empty_like(z, dtype=float)
+
+    # For z >= 0:  1 / (1 + exp(-z))
+    pos = z >= 0
+    if np.any(pos):
+        zp = np.clip(z[pos], None, 709.0)  # guard huge positives (exp(>709) overflows in float64)
+        out[pos] = 1.0 / (1.0 + np.exp(-zp))
+
+    # For z < 0: exp(z) / (1 + exp(z))  (avoids exp(-z) on big |z|)
+    neg = ~pos
+    if np.any(neg):
+        zn = np.clip(z[neg], -709.0, None)  # guard huge negatives
+        ez = np.exp(zn)
+        out[neg] = ez / (1.0 + ez)
+
+    # Handle any accidental NaNs/Infs robustly
+    out = np.where(np.isfinite(out), out, 0.5)
+    return out
+
 
 def _entropy_std_from_proba(p: pd.Series) -> pd.Series:
     return np.sqrt(np.clip(p, 1e-9, 1-1e-9) * np.clip(1-p, 1e-9, 1-1e-9))
@@ -1039,13 +1062,27 @@ CONTEXT_MODELS = {"macro_regime", "vol_timing"}  # used as gates/priors
 
 class MetaModel:
     def __init__(self, meta_type: Optional[str] = None):
-        self.meta_type = (meta_type or os.getenv("META_MODEL_TYPE", "ridge")).strip().lower()
+        # normalize aliases
+        mt = (meta_type or os.getenv("META_MODEL_TYPE", "ridge")).strip().lower()
+        alias_map = {
+            "cat": "catboost",
+            "cb": "catboost",
+            "xgb": "xgboost",
+            "lgb": "lightgbm",
+            "lgbm": "lightgbm",
+        }
+        self.meta_type = alias_map.get(mt, mt)
+
         self._init_models()
         self.resid_span = 60
         self.reg_scaler = None
         self.cls_calibrator = None
         self.feature_list_reg: List[str] = []
         self.feature_list_cls: List[str] = []
+
+        # learned fill values for inference-time imputation
+        self.reg_fill_values: Optional[pd.Series] = None
+        self.cls_fill_values: Optional[pd.Series] = None
 
     def _init_models(self):
         self.reg_model = None
@@ -1086,44 +1123,109 @@ class MetaModel:
             )
         elif mt == "catboost" and cat is not None:
             self.reg_model = cat.CatBoostRegressor(
-                depth=6, iterations=700, learning_rate=0.05, loss_function="RMSE", verbose=False, random_seed=42,
+                depth=6, iterations=700, learning_rate=0.05, loss_function="RMSE",
+                verbose=False, random_seed=42,
             )
             self.cls_model = cat.CatBoostClassifier(
-                depth=6, iterations=700, learning_rate=0.05, loss_function="Logloss", verbose=False, random_seed=42,
+                depth=6, iterations=700, learning_rate=0.05, loss_function="Logloss",
+                verbose=False, random_seed=42,
             )
         elif mt == "elasticnet":
             self.reg_model = self.ElasticNet(alpha=0.02, l1_ratio=0.3, random_state=42, max_iter=10000)
-            self.cls_model = self.LogisticRegression(C=1.0, solver="lbfgs", max_iter=2000, class_weight="balanced")
+            self.cls_model = self.LogisticRegression(C=1.0, solver="lbfgs", max_iter=5000, class_weight="balanced")
         else:
+            # default: linear models
             self.reg_model = self.Ridge(alpha=1.0)
-            self.cls_model = self.LogisticRegression(C=1.0, solver="lbfgs", max_iter=2000, class_weight="balanced")
+            self.cls_model = self.LogisticRegression(C=1.0, solver="lbfgs", max_iter=5000, class_weight="balanced")
+
+        # If a requested library wasn't available, we already fell back above.
+        if (mt in {"lightgbm", "xgboost", "catboost"} and self.reg_model is not None and self.cls_model is not None):
+            return
+        if mt in {"lightgbm", "xgboost", "catboost"}:
+            _log(f"WARNING: '{mt}' not available; falling back to Ridge/Logit.")
+
+    @staticmethod
+    def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
+        """Replace ±inf with NaN to prepare for imputation."""
+        return df.replace([np.inf, -np.inf], np.nan)
+
+    @staticmethod
+    def _align_and_impute(
+        X: pd.DataFrame,
+        cols: List[str],
+        fill_values: Optional[pd.Series],
+        default_fill: float = 0.0,
+    ) -> pd.DataFrame:
+        """Ensure all required columns exist (in order) and impute NaNs."""
+        X2 = X.copy()
+        # add missing columns
+        miss = [c for c in cols if c not in X2.columns]
+        for m in miss:
+            X2[m] = np.nan
+        # drop extras
+        extra = [c for c in X2.columns if c not in cols]
+        if extra:
+            X2.drop(columns=extra, inplace=True)
+        # column order
+        X2 = X2.loc[:, cols]
+        # sanitize and impute
+        X2 = MetaModel._sanitize(X2)
+        if fill_values is not None and not fill_values.empty:
+            # use learned medians where available
+            for c in cols:
+                fv = fill_values.get(c, default_fill)
+                if not np.isfinite(fv):
+                    fv = default_fill
+                X2[c] = X2[c].fillna(fv)
+        else:
+            X2 = X2.fillna(default_fill)
+        return X2
 
     def fit(self, X_reg: pd.DataFrame, y_reg_bps: pd.Series, X_cls: pd.DataFrame, y_cls_bin: pd.Series):
+        # sanitize
+        X_reg = self._sanitize(X_reg)
+        X_cls = self._sanitize(X_cls)
+
+        # keep rows fully observed for training
         reg_mask = X_reg.notna().all(axis=1) & y_reg_bps.notna()
         cls_mask = X_cls.notna().all(axis=1) & y_cls_bin.notna()
         Xr, yr = X_reg.loc[reg_mask], y_reg_bps.loc[reg_mask]
         Xc, yc = X_cls.loc[cls_mask], y_cls_bin.loc[cls_mask]
+
+        # remember feature sets
         self.feature_list_reg = list(Xr.columns)
         self.feature_list_cls = list(Xc.columns)
+
+        # learn fill values (medians) from the training frame for inference-time imputation
+        self.reg_fill_values = Xr.median(numeric_only=True)
+        self.cls_fill_values = Xc.median(numeric_only=True)
+
+        # fit models
         self.reg_model.fit(Xr.values, yr.values)
         self.cls_model.fit(Xc.values, yc.values)
+
+        # residual volatility proxy for pred std
         yhat = pd.Series(self.reg_model.predict(Xr.values), index=Xr.index)
         resid = (yr - yhat)
         self.resid_ewm_std = resid.ewm(span=self.resid_span, adjust=False, min_periods=10).std()
 
     def predict(self, X_reg: pd.DataFrame, X_cls: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        Xr = X_reg.copy()
-        Xc = X_cls.copy()
-        for cols, X in [(self.feature_list_reg, Xr), (self.feature_list_cls, Xc)]:
-            miss = [c for c in cols if c not in X.columns]
-            for m in miss:
-                X[m] = 0.0
-            extra = [c for c in X.columns if c not in cols]
-            if extra:
-                X.drop(columns=extra, inplace=True)
-            X = X.loc[:, cols]
+        # Align and impute using training-time medians
+        Xr = self._align_and_impute(X_reg, self.feature_list_reg, self.reg_fill_values, default_fill=0.0)
+        Xc = self._align_and_impute(X_cls, self.feature_list_cls, self.cls_fill_values, default_fill=0.0)
+
+        # sklearn / most libs expect ndarray
         y_pred_net_bps = pd.Series(self.reg_model.predict(Xr.values), index=Xr.index)
-        proba_profit = pd.Series(self.cls_model.predict_proba(Xc.values)[:, 1], index=Xc.index)
+
+        # classification probas
+        if hasattr(self.cls_model, "predict_proba"):
+            proba_profit = pd.Series(self.cls_model.predict_proba(Xc.values)[:, 1], index=Xc.index)
+        else:
+            # fallback for libs without predict_proba (unlikely here)
+            logits = pd.Series(self.cls_model.predict(Xc.values), index=Xc.index)
+            proba_profit = pd.Series(_sigmoid(logits.values), index=Xc.index)
+
+        # std blend
         pred_std_reg = pd.Series(np.nan, index=y_pred_net_bps.index)
         try:
             resid_std_last = float(self.resid_ewm_std.iloc[-1])
@@ -1131,9 +1233,12 @@ class MetaModel:
                 pred_std_reg = pd.Series(resid_std_last, index=y_pred_net_bps.index)
         except Exception:
             pass
+
         entropy_std = _entropy_std_from_proba(proba_profit)
-        pred_std = 0.6 * entropy_std + 0.4 * (pred_std_reg / (np.abs(y_pred_net_bps).rolling(50).median() + 1e-6))
+        denom = (np.abs(y_pred_net_bps).rolling(50, min_periods=5).median() + 1e-6)
+        pred_std = 0.6 * entropy_std + 0.4 * (pred_std_reg / denom)
         pred_std = pred_std.replace([np.inf, -np.inf], np.nan).fillna(entropy_std)
+
         return y_pred_net_bps, proba_profit, pred_std
 
     def dump_state(self) -> Dict[str, Any]:
@@ -1145,6 +1250,9 @@ class MetaModel:
             "resid_ewm_std": getattr(self, "resid_ewm_std", None),
             "feature_list_reg": self.feature_list_reg,
             "feature_list_cls": self.feature_list_cls,
+            # persist fill values to keep inference deterministic after reload
+            "reg_fill_values": self.reg_fill_values,
+            "cls_fill_values": self.cls_fill_values,
         }
 
     @staticmethod
@@ -1156,6 +1264,8 @@ class MetaModel:
         mm.resid_ewm_std = state.get("resid_ewm_std", None)
         mm.feature_list_reg = state.get("feature_list_reg", [])
         mm.feature_list_cls = state.get("feature_list_cls", [])
+        mm.reg_fill_values = state.get("reg_fill_values", None)
+        mm.cls_fill_values = state.get("cls_fill_values", None)
         return mm
 
 
@@ -1580,7 +1690,7 @@ def meta_infer_on_slice(
         zero = pd.Series(0.0, index=idx)
         return MetaResult(
             y_pred_net_bps=zero, proba_profit=zero, pred_std=zero,
-            signal=zero, position_suggested=zero, trade_mask=zero.astype(bool),
+            signal=zero, position_suggested=zero, trade_mask=pd.Series(True, index=idx),
             submodel_weights={}, costs_est=zero, diagnostics={"note": "no_submodels_available"}
         )
 
@@ -1612,10 +1722,10 @@ def meta_infer_on_slice(
     pos_suggested = pos_suggested.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-float(thresholds["Q_max"]), float(thresholds["Q_max"]))
 
     trade_mask_series = pd.Series(True, index=idx)
-    for name, res in subs_effective.items():
-        if res.trade_mask is not None:
-            trade_mask_series &= res.trade_mask.reindex(idx).fillna(True)
-    trade_mask_series &= (np.abs(y_pred_net_bps) > (costs_est + float(thresholds["cost_buffer_bps"])))
+    # for name, res in subs_effective.items():
+    #     if res.trade_mask is not None:
+    #         trade_mask_series &= res.trade_mask.reindex(idx).fillna(True)
+    # trade_mask_series &= (np.abs(y_pred_net_bps) > (costs_est + float(thresholds["cost_buffer_bps"])))
 
     diagnostics = {"note": "ok", "sigma_target_bar": sigma_target_bar, "k_bps_signal": k_bps}
     return MetaResult(
@@ -2027,7 +2137,6 @@ def _ensure_history_up_to_date(
 # ========================================================
 # NEW: Build SubmodelResult dict directly from HISTORY CSV
 # ========================================================
-
 def _subresults_from_history_on_slice(history_df: pd.DataFrame, df_slice: pd.DataFrame) -> Dict[str, SubmodelResult]:
     """
     Recreate per-sub SubmodelResult using timeseries from history on the slice index.
@@ -2036,6 +2145,7 @@ def _subresults_from_history_on_slice(history_df: pd.DataFrame, df_slice: pd.Dat
     idx = df_slice.index
     hist = history_df.reindex(idx)  # align to slice
     out: Dict[str, SubmodelResult] = {}
+
     for name in SUBMODELS_REGISTRY.keys():
         pfx = f"{name}__"
         cols = {
@@ -2046,8 +2156,9 @@ def _subresults_from_history_on_slice(history_df: pd.DataFrame, df_slice: pd.Dat
             "confidence":  pfx + "confidence",
             "trade_mask":  pfx + "trade_mask",
         }
+
+        # If this submodel wasn't persisted (e.g., disabled), skip it
         if not any(c in hist.columns for c in cols.values()):
-            # this submodel wasn't persisted (e.g., disabled) — skip
             continue
 
         def get_series(key: str) -> Optional[pd.Series]:
@@ -2057,20 +2168,39 @@ def _subresults_from_history_on_slice(history_df: pd.DataFrame, df_slice: pd.Dat
             s = pd.to_numeric(hist[col], errors="coerce")
             s.index = idx
             if key == "trade_mask":
+                # trade_mask stored as 0/1; coerce to bool with NaNs treated as True (tradable)
                 return s.fillna(1.0).astype(bool)
             return s
 
+        # Explicit None checks (avoid using `or` with Series)
+        y_pred_s = get_series("y_pred")
+        if y_pred_s is None:
+            y_pred_s = pd.Series(np.nan, index=idx)
+
+        signal_s = get_series("signal")
+        if signal_s is None:
+            signal_s = pd.Series(0.0, index=idx)
+
+        proba_up_s = get_series("proba_up")  # can remain None
+        pred_std_s = get_series("pred_std")  # can remain None
+        confidence_s = get_series("confidence")  # can remain None
+
+        trade_mask_s = get_series("trade_mask")
+        if trade_mask_s is None:
+            trade_mask_s = pd.Series(True, index=idx)
+
         res = SubmodelResult(
-            y_pred      = get_series("y_pred")     or pd.Series(np.nan, index=idx),
-            signal      = get_series("signal")     or pd.Series(0.0, index=idx),
-            proba_up    = get_series("proba_up"),
-            pred_std    = get_series("pred_std"),
-            confidence  = get_series("confidence"),
-            trade_mask  = get_series("trade_mask") or pd.Series(True, index=idx),
-            model_name  = name,
-            warmup_bars = 0
+            y_pred=y_pred_s,
+            signal=signal_s,
+            proba_up=proba_up_s,
+            pred_std=pred_std_s,
+            confidence=confidence_s,
+            trade_mask=trade_mask_s,
+            model_name=name,
+            warmup_bars=0,
         )
         out[name] = res
+
     return out
 
 def meta_infer_on_slice_from_history(
@@ -2087,7 +2217,7 @@ def meta_infer_on_slice_from_history(
         zero = pd.Series(0.0, index=idx)
         return MetaResult(
             y_pred_net_bps=zero, proba_profit=zero, pred_std=zero,
-            signal=zero, position_suggested=zero, trade_mask=zero.astype(bool),
+            signal=zero, position_suggested=zero, trade_mask=pd.Series(True, index=idx),
             submodel_weights={}, costs_est=zero, diagnostics={"note": "no_submodels_available_from_history"}
         )
 
@@ -2119,10 +2249,10 @@ def meta_infer_on_slice_from_history(
     pos_suggested = pos_suggested.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-float(thresholds["Q_max"]), float(thresholds["Q_max"]))
 
     trade_mask_series = pd.Series(True, index=idx)
-    for name, res in subs_effective.items():
-        if res.trade_mask is not None:
-            trade_mask_series &= res.trade_mask.reindex(idx).fillna(True)
-    trade_mask_series &= (np.abs(y_pred_net_bps) > (costs_est + float(thresholds["cost_buffer_bps"])))
+    # for name, res in subs_effective.items():
+    #     if res.trade_mask is not None:
+    #        trade_mask_series &= res.trade_mask.reindex(idx).fillna(True)
+    # trade_mask_series &= (np.abs(y_pred_net_bps) > (costs_est + float(thresholds["cost_buffer_bps"])))
 
     diagnostics = {"note": "ok_from_history", "sigma_target_bar": sigma_target_bar, "k_bps_signal": k_bps}
     return MetaResult(
@@ -2300,15 +2430,11 @@ def run_live(return_result: bool = True, position_open: bool = False):
     return None
 
 
-# ============================================================
-# Backtest (UPDATED: optional pretrain of meta on pre-backtest window)
-# ============================================================
-
 def run_backtest(
     ticker: str,
     backtest_amount: int,
     return_df: bool = True,
-    pretrain_meta: Optional[bool] = None
+    pretrain_meta: Optional[bool] = True
 ) -> Optional[pd.DataFrame]:
     """
     Backtest = iterate i over the selected window.
@@ -2317,6 +2443,10 @@ def run_backtest(
         then runs inference using HISTORY at each step (no submodel refits).
       - For backtest, the meta model trains strictly on predictions/outputs
         *before* the ones it is asked to predict (no leakage).
+
+    UPDATED:
+      - Adds a 'timestamp' column (UTC) mirroring the DatetimeIndex ('ts') so external
+        listeners that call .sort_values("timestamp") won't raise KeyError.
     """
     thresholds = load_thresholds()
     df_full = _load_df_for_ticker(ticker)
@@ -2324,7 +2454,12 @@ def run_backtest(
         return pd.DataFrame() if return_df else None
 
     # Ensure we have current history for this ticker
-    hist = _ensure_history_up_to_date(ticker, df_full, thresholds, min_coverage=float(os.getenv("HISTORY_MIN_COVERAGE", "0.95")))
+    hist = _ensure_history_up_to_date(
+        ticker,
+        df_full,
+        thresholds,
+        min_coverage=float(os.getenv("HISTORY_MIN_COVERAGE", "0.95")),
+    )
 
     # Determine evaluation window
     start_i = 1
@@ -2355,7 +2490,15 @@ def run_backtest(
     for i in range(start_i, len(df_full)):
         df_slice = df_full.iloc[: i + 1]
         meta_res = meta_infer_on_slice_from_history(df_slice, thresholds, meta_model, hist)
-
+        # right after meta_res = meta_infer_on_slice_from_history(...)
+        ts = pd.to_datetime(df_slice.index[-1], utc=True)
+        print(
+            f"[META] {ts}  y_pred_bps={float(meta_res.y_pred_net_bps.iloc[-1]):+.2f}  "
+            f"proba={float(meta_res.proba_profit.iloc[-1]):.3f}  "
+            f"signal={float(meta_res.signal.iloc[-1]):+.3f}  "
+            f"pred_std={float(meta_res.pred_std.iloc[-1]) if meta_res.pred_std is not None else float('nan'):.3f}  "
+            f"trade_mask={bool(meta_res.trade_mask.iloc[-1])}"
+        )
         sig = float(meta_res.signal.iloc[-1])
         tm = bool(meta_res.trade_mask.iloc[-1])
         action = decide_action(
@@ -2370,7 +2513,7 @@ def run_backtest(
         elif action == "SELL":
             position_open = False
 
-        ts = df_slice.index[-1]
+        ts = pd.to_datetime(df_slice.index[-1], utc=True)
         rec = {
             "ts": ts,
             "action": action,
@@ -2388,7 +2531,15 @@ def run_backtest(
                     rec[k] = meta_res.diagnostics[k]
         records.append(rec)
 
-    out_df = pd.DataFrame.from_records(records).set_index("ts")
+    out_df = pd.DataFrame.from_records(records)
+
+    # Ensure DatetimeIndex named 'ts' (UTC), keep a 'timestamp' column for external sorters
+    if not out_df.empty:
+        out_df["ts"] = pd.to_datetime(out_df["ts"], utc=True, errors="coerce")
+        out_df = out_df.set_index("ts").sort_index()
+        out_df.index.name = "ts"
+        # Provide a real column that mirrors the index for consumers expecting 'timestamp'
+        out_df["timestamp"] = out_df.index  # this is UTC
     return out_df if return_df else None
 
 def _extract_feature_importance_from_state(state: Any, feature_names: List[str]) -> Optional[pd.Series]:

@@ -1933,6 +1933,7 @@ def _upgrade_history_header_if_needed(path: str, desired_cols: List[str]) -> Lis
             if c not in df.columns:
                 df[c] = np.nan
         df = df.reindex(columns=cols_union)
+        df = df.fillna(0.0)
         df.to_csv(path, index=False)
         _log(f"[history] header upgraded with {len(cols_union)} columns.")
         return cols_union
@@ -2396,7 +2397,65 @@ def train_meta_state_offline(exclude_last_n: int = 0) -> Optional[MetaModel]:
 
     return train_meta_model_from_history(df_full, thresholds, train_end_i=train_end_i)
 
+def _backtest_cache_path(ticker: str) -> str:
+    """Path for the per-ticker backtest cache JSON."""
+    safe = "".join(ch for ch in ticker.upper() if ch.isalnum() or ch in (":", ".", "_"))
+    return os.path.join(_ARTIFACTS_DIR, f"{safe}_BACKTEST_CACHE.json")
 
+def _init_or_load_backtest_cache(
+    ticker: str,
+    backtest_amount: int,
+    retrain_every_steps: int,
+    reset_cache: bool = False,
+) -> Dict[str, Any]:
+    """
+    Initialize or load the persistent backtest cache.
+
+    Fields:
+      - ticker
+      - backtest_amount
+      - retrain_every_steps
+      - steps_until_retrain
+      - candles_so_far
+      - created_at
+    """
+    path = _backtest_cache_path(ticker)
+    if reset_cache or (not os.path.exists(path)):
+        cache = {
+            "ticker": ticker,
+            "backtest_amount": int(backtest_amount),
+            "retrain_every_steps": int(retrain_every_steps),
+            "steps_until_retrain": int(retrain_every_steps),
+            "candles_so_far": 0,
+            "created_at": time.time(),
+        }
+        _save_json(path, cache)
+        return cache
+
+    cache = _load_json(path, default={})
+    # If knobs changed between runs, restart the counters
+    if (
+        int(cache.get("backtest_amount", -1)) != int(backtest_amount)
+        or int(cache.get("retrain_every_steps", -1)) != int(retrain_every_steps)
+    ):
+        cache.update({
+            "backtest_amount": int(backtest_amount),
+            "retrain_every_steps": int(retrain_every_steps),
+            "steps_until_retrain": int(retrain_every_steps),
+            "candles_so_far": 0,
+        })
+        _save_json(path, cache)
+    # Ensure required keys exist
+    for k, v in {
+        "steps_until_retrain": int(cache.get("steps_until_retrain", retrain_every_steps)),
+        "candles_so_far": int(cache.get("candles_so_far", 0)),
+    }.items():
+        cache[k] = v
+    return cache
+
+def _save_backtest_cache(ticker: str, cache: Dict[str, Any]) -> None:
+    """Persist the cache after each step."""
+    _save_json(_backtest_cache_path(ticker), cache)
 
 # ============================================================
 # Public API
@@ -2434,26 +2493,38 @@ def run_backtest(
     ticker: str,
     backtest_amount: int,
     return_df: bool = True,
-    pretrain_meta: Optional[bool] = True
+    pretrain_meta: Optional[bool] = True,
+    retrain_every_steps: Optional[int] = 10,
+    reset_cache: bool = False,
 ) -> Optional[pd.DataFrame]:
     """
-    Backtest = iterate i over the selected window.
-      - Ensures (ticker)_HISTORY.csv is up-to-date for df_full.
-      - Optionally pretrains meta on the **pre-backtest** window (history-only),
-        then runs inference using HISTORY at each step (no submodel refits).
-      - For backtest, the meta model trains strictly on predictions/outputs
-        *before* the ones it is asked to predict (no leakage).
+    Backtest loop using HISTORY for submodel predictions, and **meta model**
+    retraining every X steps, where X is:
+      - `retrain_every_steps` arg if provided
+      - else env META_RETRAIN_EVERY (int)
+      - else default 20
 
-    UPDATED:
-      - Adds a 'timestamp' column (UTC) mirroring the DatetimeIndex ('ts') so external
-        listeners that call .sort_values("timestamp") won't raise KeyError.
+    Retrain timing & windowing:
+      - We keep a JSON cache that tracks:
+          steps_until_retrain (countdown), candles_so_far
+      - After each step's inference/decision, we decrement the countdown and
+        increment candles_so_far. When countdown hits 0, we retrain the meta
+        model on data up to and including the **current** candle, computed as:
+            train_end_i = len(df_full) - (backtest_amount - candles_so_far) - 1
+        (the '-1' converts count to 0-based index; this equals "including current candle")
+      - The newly trained meta model is then used on the **next** candle.
+
+    Returns a DataFrame with per-candle action and diagnostics (same schema as before).
     """
+    # -----------------
+    # Setup & loading
+    # -----------------
     thresholds = load_thresholds()
     df_full = _load_df_for_ticker(ticker)
     if len(df_full) < 200:
         return pd.DataFrame() if return_df else None
 
-    # Ensure we have current history for this ticker
+    # Ensure HISTORY (submodel outputs) is up to date
     hist = _ensure_history_up_to_date(
         ticker,
         df_full,
@@ -2461,44 +2532,77 @@ def run_backtest(
         min_coverage=float(os.getenv("HISTORY_MIN_COVERAGE", "0.95")),
     )
 
-    # Determine evaluation window
+    # Determine evaluation window (respect warmup)
     start_i = 1
     if backtest_amount and backtest_amount > 0 and backtest_amount < len(df_full):
         start_i = len(df_full) - backtest_amount
-    start_i = max(start_i, _default_history_start_index(df_full))  # obey warmup
+    start_i = max(start_i, _default_history_start_index(df_full))
 
-    # Should we pretrain the meta model on the *pre-backtest* segment?
+    # X: retrain cadence
+    if retrain_every_steps is None:
+        env_x = os.getenv("META_RETRAIN_EVERY", "").strip()
+        retrain_every_steps = int(env_x) if env_x.isdigit() else 20
+    retrain_every_steps = max(1, int(retrain_every_steps))
+
+    # Load/init countdown cache
+    cache = _init_or_load_backtest_cache(
+        ticker=ticker,
+        backtest_amount=backtest_amount,
+        retrain_every_steps=retrain_every_steps,
+        reset_cache=reset_cache,
+    )
+
+    # Number of steps already done in a prior interrupted run (resume)
+    already_done = int(cache.get("candles_so_far", 0))
+    loop_start_i = start_i + already_done
+    loop_start_i = min(loop_start_i, len(df_full) - 1)
+
+    # Decide whether to pretrain meta model before first step
     if pretrain_meta is None:
         pretrain_meta = os.getenv("META_PRETRAIN_IN_BACKTEST", "1") == "1"
 
     meta_model = None
-    if pretrain_meta and start_i > 50:
-        # Train meta using only data up to start_i-1, from HISTORY
-        meta_model = train_meta_model_from_history(
-            df_full=df_full,
-            thresholds=thresholds,
-            train_end_i=start_i - 1,
-            history_df=hist,
-        )
+    if pretrain_meta:
+        # Train up to "current training frontier" before entering loop:
+        # N - (backtest_amount - candles_so_far) - 1  (inclusive index)
+        N = len(df_full)
+        candles_so_far = int(cache.get("candles_so_far", 0))
+        train_end_i = N - (backtest_amount - candles_so_far) - 1
+        # Clip to pre-loop frontier
+        train_end_i = min(train_end_i, loop_start_i - 1)
+        if train_end_i >= 50:
+            meta_model = train_meta_model_from_history(
+                df_full=df_full,
+                thresholds=thresholds,
+                train_end_i=train_end_i,
+                history_df=hist,
+            )
     if meta_model is None:
-        meta_model = load_meta_model()  # may be None => prior-weighted blend
+        meta_model = load_meta_model()  # may be None -> prior-weighted blend
 
-    # Walk forward and infer using history at each step
+    # -----------------
+    # Walk-forward loop
+    # -----------------
     records: List[Dict[str, Any]] = []
     position_open = False
 
-    for i in range(start_i, len(df_full)):
+    for i in range(loop_start_i, len(df_full)):
         df_slice = df_full.iloc[: i + 1]
+
+        # Inference for current candle using HISTORY-based submodel outputs
         meta_res = meta_infer_on_slice_from_history(df_slice, thresholds, meta_model, hist)
-        # right after meta_res = meta_infer_on_slice_from_history(...)
-        ts = pd.to_datetime(df_slice.index[-1], utc=True)
+
+        # Log for visibility
+        ts_i = pd.to_datetime(df_slice.index[-1], utc=True)
         print(
-            f"[META] {ts}  y_pred_bps={float(meta_res.y_pred_net_bps.iloc[-1]):+.2f}  "
+            f"[META] {ts_i}  y_pred_bps={float(meta_res.y_pred_net_bps.iloc[-1]):+.2f}  "
             f"proba={float(meta_res.proba_profit.iloc[-1]):.3f}  "
             f"signal={float(meta_res.signal.iloc[-1]):+.3f}  "
             f"pred_std={float(meta_res.pred_std.iloc[-1]) if meta_res.pred_std is not None else float('nan'):.3f}  "
             f"trade_mask={bool(meta_res.trade_mask.iloc[-1])}"
         )
+
+        # Decision
         sig = float(meta_res.signal.iloc[-1])
         tm = bool(meta_res.trade_mask.iloc[-1])
         action = decide_action(
@@ -2513,9 +2617,9 @@ def run_backtest(
         elif action == "SELL":
             position_open = False
 
-        ts = pd.to_datetime(df_slice.index[-1], utc=True)
+        # Record
         rec = {
-            "ts": ts,
+            "ts": ts_i,
             "action": action,
             "signal": sig,
             "position_suggested": float(meta_res.position_suggested.iloc[-1]),
@@ -2531,15 +2635,48 @@ def run_backtest(
                     rec[k] = meta_res.diagnostics[k]
         records.append(rec)
 
-    out_df = pd.DataFrame.from_records(records)
+        # -----------------------------
+        # Countdown update & retrain
+        # -----------------------------
+        cache["candles_so_far"] = int(cache.get("candles_so_far", 0)) + 1
+        cache["steps_until_retrain"] = int(cache.get("steps_until_retrain", retrain_every_steps)) - 1
 
-    # Ensure DatetimeIndex named 'ts' (UTC), keep a 'timestamp' column for external sorters
+        do_retrain = cache["steps_until_retrain"] <= 0
+        if do_retrain:
+            # Compute inclusive train_end_i per spec:
+            # train_end_i = N - (backtest_amount - candles_so_far) - 1
+            N = len(df_full)
+            candles_so_far = int(cache["candles_so_far"])
+            train_end_i = N - (backtest_amount - candles_so_far) - 1
+            # Safety: never exceed the current index i
+            train_end_i = min(train_end_i, i)
+            if train_end_i >= 50:
+                print(f"[META] retraining at {ts_i} (candles_so_far={candles_so_far}, train_end_i={train_end_i})")
+                mm_new = train_meta_model_from_history(
+                    df_full=df_full,
+                    thresholds=thresholds,
+                    train_end_i=train_end_i,
+                    history_df=hist,
+                )
+                if mm_new is not None:
+                    meta_model = mm_new
+            # Reset the countdown
+            cache["steps_until_retrain"] = int(cache["retrain_every_steps"])
+
+        # Persist cache each step
+        _save_backtest_cache(ticker, cache)
+
+        # Early exit if we’ve completed the requested window
+        if cache["candles_so_far"] >= backtest_amount:
+            break
+
+    # Build output DataFrame
+    out_df = pd.DataFrame.from_records(records)
     if not out_df.empty:
         out_df["ts"] = pd.to_datetime(out_df["ts"], utc=True, errors="coerce")
         out_df = out_df.set_index("ts").sort_index()
         out_df.index.name = "ts"
-        # Provide a real column that mirrors the index for consumers expecting 'timestamp'
-        out_df["timestamp"] = out_df.index  # this is UTC
+        out_df["timestamp"] = out_df.index  # mirror for external consumers
     return out_df if return_df else None
 
 def _extract_feature_importance_from_state(state: Any, feature_names: List[str]) -> Optional[pd.Series]:
@@ -2723,3 +2860,4 @@ def train_models(ticker: str) -> pd.DataFrame:
     if not out.empty:
         out.sort_values(["model","feature"], inplace=True)
     return out
+    

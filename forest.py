@@ -66,7 +66,7 @@ load_dotenv()
 
 # trading / model selection ------------------------------------------------------------------
 ML_MODEL  = os.getenv("ML_MODEL", "forest")
-
+SUB_VERSION = os.getenv("SUB_VERSION", "beta")
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
@@ -633,33 +633,56 @@ def make_pipeline(base_est):
     ])
 
 def call_sub_main(df, backtest_amount, position_open=False):
-    sub_main_path = os.path.join(os.path.dirname(__file__), "sub", "main.py")
-    spec = importlib.util.spec_from_file_location("sub_main", sub_main_path)
-    sub_main = importlib.util.module_from_spec(spec)
-    sys.modules["sub_main"] = sub_main
-    spec.loader.exec_module(sub_main)
-    sub_main.backtest_amount  = backtest_amount
-    if backtest_amount == 0:
-        csv_path = "_sub_tmp_live.csv"
-        df.to_csv(csv_path, index=False)
-        sub_main.CSV_PATH = csv_path
-        result = sub_main.run_live("TSLA", return_result=True, position_open=position_open)
-        os.remove(csv_path)
-        return result
-    elif backtest_amount == -1:
-        csv_path = "_sub_tmp_train.csv"
-        df.to_csv(csv_path, index=False)
-        sub_main.CSV_PATH = csv_path
-        analysis = sub_main.train_models()
-        os.remove(csv_path)
-        return analysis
+    if SUB_VERSION == "beta":
+        sub_main_path = os.path.join(os.path.dirname(__file__), "sub", "main.py")
+        spec = importlib.util.spec_from_file_location("sub_main", sub_main_path)
+        sub_main = importlib.util.module_from_spec(spec)
+        sys.modules["sub_main"] = sub_main
+        spec.loader.exec_module(sub_main)
+        sub_main.backtest_amount  = backtest_amount
+        if backtest_amount == 0:
+            csv_path = "_sub_tmp_live.csv"
+            df.to_csv(csv_path, index=False)
+            sub_main.CSV_PATH = csv_path
+            result = sub_main.run_live("TSLA", return_result=True, position_open=position_open)
+            os.remove(csv_path)
+            return result
+        elif backtest_amount == -1:
+            csv_path = "_sub_tmp_train.csv"
+            df.to_csv(csv_path, index=False)
+            sub_main.CSV_PATH = csv_path
+            analysis = sub_main.train_models()
+            os.remove(csv_path)
+            return analysis
+        else:
+            csv_path = "_sub_tmp_backtest.csv"
+            df.to_csv(csv_path, index=False)
+            sub_main.CSV_PATH = csv_path
+            results_df = sub_main.run_backtest("TSLA", backtest_amount, return_df=True)
+            os.remove(csv_path)
+            return results_df
     else:
-        csv_path = "_sub_tmp_backtest.csv"
-        df.to_csv(csv_path, index=False)
-        sub_main.CSV_PATH = csv_path
-        results_df = sub_main.run_backtest("TSLA", backtest_amount, return_df=True)
-        os.remove(csv_path)
-        return results_df
+        sub_main_path = os.path.join(os.path.dirname(__file__), "sub", "main.py")
+        spec = importlib.util.spec_from_file_location("sub_main", sub_main_path)
+        sub_main = importlib.util.module_from_spec(spec)
+        sys.modules["sub_main"] = sub_main
+        spec.loader.exec_module(sub_main)
+        sub_main.backtest_amount = backtest_amount
+        if backtest_amount == 0:
+            csv_path = "_sub_tmp_live.csv"
+            df.to_csv(csv_path, index=False)
+            sub_main.CSV_PATH = csv_path
+            result = sub_main.run_live(return_result=True, position_open=position_open)
+            os.remove(csv_path)
+            return result
+        else:
+            csv_path = "_sub_tmp_backtest.csv"
+            df.to_csv(csv_path, index=False)
+            sub_main.CSV_PATH = csv_path
+            results_df = sub_main.run_backtest(return_df=True)
+            os.remove(csv_path)
+            return results_df
+
     
 
 if DISCORD_MODE == "on":
@@ -1836,7 +1859,7 @@ def compute_custom_features(df: pd.DataFrame) -> pd.DataFrame:
         last_low = lows.apply(lambda x: np.argmax(x[::-1]), raw=True)
         df['days_since_low'] = last_low
 
-    return df
+    return df.fillna(0.0)
 
 def series_to_supervised(Xvalues: np.ndarray,
                          yvalues: np.ndarray,
@@ -4557,8 +4580,36 @@ def console_listener():
                     continue
                 sell_shares(ticker_use, amount, live_price, live_price)
                 logging.info(f"Attempted to sell {amount}×{ticker_use} @ {live_price}")
+                
+        elif cmd == "train-sub":
+            if SUB_VERSION == "beta":
+                if len(parts) < 2:
+                    logging.info("Usage: train-sub <ticker/all>")
+                else:
+                    ticker_or_all = parts[1].lower()
+                    logging.info("Training submodel...")
+                    if ticker_or_all == "all":
+                        for ticker in load_tickerlist:
+                            logging.info(f"Now training {ticker}...")
+                            csv_path = os.path.join("data", f"{ticker}_{timeframe_to_code(BAR_TIMEFRAME)}.csv")
+                            if not os.path.exists(csv_path):
+                                logging.info(f"CSV '{csv_path}' does not exist. Skipping {ticker}.")
+                                continue
+                            df = pd.read_csv(csv_path)
+                            call_sub_main(df, -1)
+                    else:
+                        csv_path = os.path.join("data", f"{ticker_or_all}_{timeframe_to_code(BAR_TIMEFRAME)}.csv")
+                        if not os.path.exists(csv_path):
+                            logging.info(f"CSV '{csv_path}' does not exist")
+                        else:
+                            df = pd.read_csv(csv_path)
+                            call_sub_main(df, -1)
+            else:
+                logging.info("This functionality only exists for the beta version")
+
         else:
             logging.warning(f"Unrecognized command: {cmd_line}")
+
 
 def main():
     _update_logic_json()
@@ -4567,7 +4618,7 @@ def main():
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")
-    logging.info("Commands: turnoff, api-test, get-data [timeframe], predict-next [-r], force-run [-r], backtest <N> [simple|complex] [timeframe?] [-r?], get-best-tickers <N> [-r], feature-importance [-r], commands, set-timeframe, set-nbars, set-news, trade-logic <1..15>, set-ntickers (Number), ai-tickers, create-script (name), buy (ticker) <N|$dollars>, sell (ticker) <N|$dollars>")
+    logging.info("Write 'commands' for command list")
     try:
         account = api.get_account()
         positions = api.list_positions()
@@ -4589,4 +4640,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
+    

@@ -37,16 +37,16 @@ TB_THETA_UP = float(os.getenv("TB_THETA_UP", "0.01"))     # +1% default
 TB_THETA_DN = float(os.getenv("TB_THETA_DN", "0.01"))     # -1% default
 
 TRAIN_FRAC = float(os.getenv("TRAIN_FRAC", "0.8"))        # 80/20 split
-
+META_POLICY = False
 # Composite objective weights (validation-based)
 LAMBDA_MDD        = float(os.getenv("LAMBDA_MDD", "0.10"))
 LAMBDA_TURNOVER   = float(os.getenv("LAMBDA_TURNOVER", "0.01"))
 LAMBDA_COMPLEXITY = float(os.getenv("LAMBDA_COMPLEXITY", "0.001"))
 
 # Complexity decomposition
-ALPHA_COMPLEXITY = float(os.getenv("ALPHA_COMPLEXITY", "0.5"))  # nodes
-BETA_COMPLEXITY  = float(os.getenv("BETA_COMPLEXITY", "2.5"))   # depth
-GAMMA_FEATURES   = float(os.getenv("GAMMA_FEATURES", "0.1"))   # distinct features
+ALPHA_COMPLEXITY = float(os.getenv("ALPHA_COMPLEXITY", "1.0"))  # nodes
+BETA_COMPLEXITY  = float(os.getenv("BETA_COMPLEXITY", "5.0"))   # depth
+GAMMA_FEATURES   = float(os.getenv("GAMMA_FEATURES", "0.25"))   # distinct features
 
 # Diversity filter among elites
 DIVERSITY_TOPK      = int(os.getenv("DIVERSITY_TOPK", "10"))
@@ -314,11 +314,17 @@ def logic_to_live_code(node, indent=1, meta_cfg: Optional[dict]=None):
     logistic meta-gate that decides whether to TAKE the trade.
 
         if  <BUY_expr>:
-            if meta_gate(+1): BUY-block
-            else: log skip
+            if meta_policy:         # NEW: runtime toggle
+                if _meta_should_take_trade(+1): BUY-block
+                else: log skip
+            else:
+                BUY-block
         elif <SELL_expr>:
-            if meta_gate(-1): SELL-block
-            else: log skip
+            if meta_policy:
+                if _meta_should_take_trade(-1): SELL-block
+                else: log skip
+            else:
+                SELL-block
         else:
             NONE-block
 
@@ -385,8 +391,8 @@ def logic_to_live_code(node, indent=1, meta_cfg: Optional[dict]=None):
 
     # ---- Optional meta-gate emitter ----
     meta_lines = []
-    use_meta = bool(meta_cfg and meta_cfg.get("enabled", False))
-    if use_meta:
+    has_meta = bool(meta_cfg and meta_cfg.get("enabled", False))
+    if has_meta:
         feat_names: List[str] = meta_cfg["feature_names"]
         coef = meta_cfg["coef"]
         intercept = meta_cfg["intercept"]
@@ -412,27 +418,36 @@ def logic_to_live_code(node, indent=1, meta_cfg: Optional[dict]=None):
         meta_lines.append(f"{i1}return p >= 0.5")
     else:
         meta_lines.append(f"{space}def _meta_should_take_trade(direction:int):")
-        meta_lines.append(f"{i1}# Meta disabled; always take")
+        meta_lines.append(f"{i1}# No trained meta-model baked; accept all if asked to use it")
         meta_lines.append(f"{i1}return True")
 
-    # ---- Concrete action blocks (ensure correct nesting under meta gate) ----
+    # ---- Concrete action blocks (now respect meta_policy at runtime) ----
     def _buy_block():
-        if use_meta:
-            # Guard line, then core indented one extra level
-            guard_open = f"{i1}if _meta_should_take_trade(1):\n"
+        if has_meta:
             core = (
+                f"{i3}if position_qty == 0:\n"
+                f"{i4}max_shares = int(cash // current_price)\n"
+                f"{i4}if max_shares > 0:\n"
+                f"{i4}    logger.info(f\"[{{ticker}}] Buying {{max_shares}} shares at {{current_price}}.\")\n"
+                f"{i4}    buy_shares(ticker, max_shares, current_price, predicted_price)\n"
+                f"{i3}else:\n"
+                f"{i4}logger.info(f\"[{{ticker}}] Insufficient cash to purchase shares.\")\n"
+            )
+            return (
+                f"{i1}if meta_policy:\n"
+                f"{i2}if _meta_should_take_trade(1):\n" + core +
+                f"{i2}else:\n"
+                f"{i3}logger.info(f\"[{{ticker}}] Meta-gate rejected BUY.\")\n"
+                f"{i1}else:\n"
                 f"{i2}if position_qty == 0:\n"
                 f"{i3}max_shares = int(cash // current_price)\n"
                 f"{i3}if max_shares > 0:\n"
                 f"{i4}logger.info(f\"[{{ticker}}] Buying {{max_shares}} shares at {{current_price}}.\")\n"
                 f"{i4}buy_shares(ticker, max_shares, current_price, predicted_price)\n"
                 f"{i2}else:\n"
-                f"{i3}logger.info(f\"[{{ticker}}] Insufficient cash to purchase shares.\")\n"
+                f"{i3}logger.info(f\"[{{ticker}}] Insufficient cash to purchase shares.\")"
             )
-            guard_else = f"{i1}else:\n{i2}logger.info(f\"[{{ticker}}] Meta-gate rejected BUY.\")"
-            return guard_open + core + guard_else
         else:
-            # No meta: core starts at i1
             return (
                 f"{i1}if position_qty == 0:\n"
                 f"{i2}max_shares = int(cash // current_price)\n"
@@ -444,17 +459,26 @@ def logic_to_live_code(node, indent=1, meta_cfg: Optional[dict]=None):
             )
 
     def _sell_block():
-        if use_meta:
-            guard_open = f"{i1}if _meta_should_take_trade(-1):\n"
+        if has_meta:
             core = (
+                f"{i3}if position_qty > 0:\n"
+                f"{i4}logger.info(f\"[{{ticker}}] Selling {{position_qty}} shares at {{current_price}}.\")\n"
+                f"{i4}sell_shares(ticker, position_qty, current_price, predicted_price)\n"
+                f"{i3}else:\n"
+                f"{i4}logger.info(f\"[{{ticker}}] No long position to sell; no action taken.\")\n"
+            )
+            return (
+                f"{i1}if meta_policy:\n"
+                f"{i2}if _meta_should_take_trade(-1):\n" + core +
+                f"{i2}else:\n"
+                f"{i3}logger.info(f\"[{{ticker}}] Meta-gate rejected SELL.\")\n"
+                f"{i1}else:\n"
                 f"{i2}if position_qty > 0:\n"
                 f"{i3}logger.info(f\"[{{ticker}}] Selling {{position_qty}} shares at {{current_price}}.\")\n"
                 f"{i3}sell_shares(ticker, position_qty, current_price, predicted_price)\n"
                 f"{i2}else:\n"
-                f"{i3}logger.info(f\"[{{ticker}}] No long position to sell; no action taken.\")\n"
+                f"{i3}logger.info(f\"[{{ticker}}] No long position to sell; no action taken.\")"
             )
-            guard_else = f"{i1}else:\n{i2}logger.info(f\"[{{ticker}}] Meta-gate rejected SELL.\")"
-            return guard_open + core + guard_else
         else:
             return (
                 f"{i1}if position_qty > 0:\n"
@@ -481,6 +505,7 @@ def logic_to_live_code(node, indent=1, meta_cfg: Optional[dict]=None):
 
     # Ensure spaces-only indentation (no tabs)
     return "\n".join(lines).replace("\t", "    ")
+
 
 # ---- Candidate (Algorithm) Representation ---- #
 
@@ -572,30 +597,127 @@ class Candidate:
             self._used_feats = {u for u in used if isinstance(u, str)}
         return self._nodes, self._depth, len(self._used_feats)
 
-    # --------------- Code emitters --------------------- #
     def get_backtest_code(self):
-        code = "def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles):\n"
+        """
+        Emit a run_backtest(...) that can optionally apply the meta gate
+        at runtime via meta_policy (default False). This keeps evolution unchanged
+        because callers that omit meta_policy get ungated signals.
+        """
+        # ----- Build BUY/SELL expressions from the GP tree (compile-time) -----
+        def _and(a: str, b: str) -> str:
+            if a in (None, "", "True"):
+                return f"({b})"
+            return f"(({a}) and ({b}))"
+
+        def _collect_action_conditions(n, path_cond="True", acc=None):
+            if acc is None:
+                acc = {"BUY": [], "SELL": [], "NONE": []}
+            if n is None:
+                acc["NONE"].append(path_cond); return acc
+            if getattr(n, "value", None) == "IF":
+                cond_code = expr_to_code(n.left) or "False"
+                then_node = n.right
+                if not then_node or getattr(then_node, "value", None) != "THEN":
+                    acc["NONE"].append(_and(path_cond, cond_code))
+                    acc["NONE"].append(_and(path_cond, f"not ({cond_code})"))
+                    return acc
+                _collect_action_conditions(then_node.left,  _and(path_cond, cond_code), acc)
+                _collect_action_conditions(then_node.right, _and(path_cond, f"not ({cond_code})"), acc)
+                return acc
+            if getattr(n, "value", None) == "THEN":
+                _collect_action_conditions(n.left, path_cond, acc)
+                _collect_action_conditions(n.right, path_cond, acc)
+                return acc
+            if isinstance(n.value, str) and n.value.replace('"','') in ("BUY","SELL","NONE"):
+                acc[n.value.replace('"','')].append(path_cond); return acc
+            acc["NONE"].append(path_cond); return acc
+
+        def _or_join(conds):
+            if not conds: return "False"
+            seen = set(); uniq = []
+            for c in conds:
+                if c not in seen:
+                    seen.add(c); uniq.append(c)
+            if len(uniq) == 1: return uniq[0]
+            return " or ".join(f"({c})" for c in uniq)
+
+        acc = _collect_action_conditions(self.logic_tree, "True", None)
+        buy_expr  = _or_join(acc.get("BUY", []))
+        sell_expr = _or_join(acc.get("SELL", []))
+
+        # ----- Start emitting function source -----
+        lines = []
+        lines.append("def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles, meta_policy:")
+        lines.append("    import numpy as np")
+        # unpack features
         for feat in FEATURES:
             if feat in ["current_price", "predicted_price"]:
                 continue
-            code += (
-                f"    {feat} = candles.get('{feat}', None)\n"
-                f"    if {feat} is None:\n"
-                f"        {feat} = 0\n"
-            )
-        code += node_to_code(self.logic_tree, indent=1)
-        if "return" not in code:
-            code += "\n    return \"NONE\""
-        return code
+            lines.append(f"    {feat} = candles.get('{feat}', 0)")
+        lines.append("")  # spacing
+
+        # meta helper (baked parameters or pass-through)
+        if self.meta_enabled and self.meta_feature_names:
+            feat_names = self.meta_feature_names
+            coef       = self.meta_coef
+            intercept  = self.meta_intercept
+            means      = self.meta_means
+            stds       = self.meta_stds
+
+            lines.append("    def _meta_should_take_trade(direction:int):")
+            lines.append("        x = []")
+            for nm in feat_names:
+                if nm == "__direction__":
+                    lines.append("        x.append(direction)")
+                else:
+                    mu = means.get(nm, 0.0)
+                    sd = stds.get(nm, 1.0) or 1.0
+                    lines.append(f"        x.append(((candles.get('{nm}', 0)) - ({mu})) / ({sd}))")
+            lines.append(f"        lin = ({intercept})")
+            for j in range(len(feat_names)):
+                cj = coef[j]
+                lines.append(f"        lin += ({cj}) * x[{j}]")
+            lines.append("        p = 1.0 / (1.0 + np.exp(-lin))")
+            lines.append("        return p >= 0.5")
+        else:
+            lines.append("    def _meta_should_take_trade(direction:int):")
+            lines.append("        # No trained meta; accept all if asked to use it")
+            lines.append("        return True")
+        lines.append("")
+
+        # priority chain with runtime meta_policy
+        lines.append(f"    if {buy_expr}:")
+        lines.append( "        if meta_policy:")
+        lines.append( "            if _meta_should_take_trade(+1):")
+        lines.append( "                return \"BUY\"")
+        lines.append( "            else:")
+        lines.append( "                return \"NONE\"")
+        lines.append( "        else:")
+        lines.append( "            return \"BUY\"")
+        lines.append(f"    elif {sell_expr}:")
+        lines.append( "        if meta_policy:")
+        lines.append( "            if _meta_should_take_trade(-1):")
+        lines.append( "                return \"SELL\"")
+        lines.append( "            else:")
+        lines.append( "                return \"NONE\"")
+        lines.append( "        else:")
+        lines.append( "            return \"SELL\"")
+        lines.append("    else:")
+        lines.append("        return \"NONE\"")
+
+        return "\n".join(lines)
+
 
     def get_logic_code(self):
         """
         Generates a fully-self-contained run_logic() function for live trading.
         No fees, no lagging, execution at bar i.
+
+        NEW: meta_policy: bool = False parameter toggles meta-gate usage at runtime.
         """
         lines = []
 
-        lines.append("def run_logic(current_price, predicted_price, ticker):")
+        lines.append("def run_logic(current_price, predicted_price, ticker, meta_policy:")
         lines.append("    \"\"\"")
         lines.append("    Auto-generated live-trading logic with optional meta-gate.")
         lines.append("    Loads the latest feature row from the CSV each call.")
@@ -660,7 +782,7 @@ class Candidate:
         lines.append("        f\"Position: {position_qty}, Cash: {cash}\"")
         lines.append("    )")
         lines.append("")
-        # Assign features straight (no lagging, per user request)
+        # feature assignments
         lines.append("    # ---------------- feature assignments ----------------")
         for feat in FEATURES:
             if feat in ("current_price", "predicted_price"):
@@ -669,8 +791,7 @@ class Candidate:
         lines.append("")
         lines.append("    # -------------- decision logic --------------")
 
-        # meta configuration injection
-        meta_cfg = None
+        # meta configuration injection (baked parameters)
         if self.meta_enabled and self.meta_feature_names:
             meta_cfg = {
                 "enabled": True,
@@ -690,6 +811,7 @@ class Candidate:
         lines.append(decision_block.rstrip("\n"))
         code = "\n".join(lines) + "\n"
         return code
+
 
     def __str__(self):
         return self.get_backtest_code()
@@ -1428,7 +1550,7 @@ def _refresh_if_needed(ticker: str, current_timestamp=None) -> None:
 
 def run_logic(current_price: float, predicted_price: float, ticker: str):
     _refresh_if_needed(ticker)
-    return _gp_run_logic_map[ticker](current_price, predicted_price, ticker)
+    return _gp_run_logic_map[ticker](current_price, predicted_price, ticker, meta_policy=META_POLICY)
 
 
 def run_backtest(
@@ -1456,6 +1578,7 @@ def run_backtest(
         position_qty=position_qty,
         current_timestamp=current_timestamp,
         candles=candle_dict,
+        meta_policy=META_POLICY
     )
 
 def _load_tickerlist_file() -> Path:

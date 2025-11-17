@@ -69,7 +69,7 @@ ML_MODEL  = config.ML_MODEL
 SUB_VERSION = config.SUB_VERSION
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
-API_BASE_URL = config.API_BASE_URL
+API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 SUBMETA_USE_ACTION = os.getenv("SUBMETA_USE_ACTION", "false").strip().lower() == "true"
 
 # scheduling & run‑mode ----------------------------------------------------------------------

@@ -1,20 +1,3 @@
-# sub/main.py
-# ============================================================
-# Meta Orchestrator for Multi-Model Trading Stack
-# - Live: returns BUY/SELL/NONE (with on-the-fly, leakage-safe training)
-# - Backtest: walk-forward training at every step (fit up to i-h; predict at i)
-# - Pretrain/Analysis: train_models() -> returns per-model importance + AUC/RMSE
-#
-# PUBLIC ENTRYPOINTS (used by caller):
-#   - run_live(return_result=True, position_open=False)
-#   - run_backtest(return_df=True)                # respects global `backtest_amount`
-#   - train_models() -> pd.DataFrame              # SHAP-like importances + metrics
-#
-# Meta model:
-#   - If a trained meta state exists, it's used; otherwise we degrade to a
-#     robust prior-weighted average combiner.
-# ============================================================
-
 from __future__ import annotations
 
 import os
@@ -25,6 +8,7 @@ import time
 import pickle
 import importlib
 import requests
+import config
 import importlib.util
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, Tuple, Callable
@@ -1063,7 +1047,7 @@ CONTEXT_MODELS = {"macro_regime", "vol_timing"}  # used as gates/priors
 class MetaModel:
     def __init__(self, meta_type: Optional[str] = None):
         # normalize aliases
-        mt = (meta_type or os.getenv("META_MODEL_TYPE", "ridge")).strip().lower()
+        mt = (meta_type or config.META_MODEL_TYPE).strip().lower()
         alias_map = {
             "cat": "catboost",
             "cb": "catboost",
@@ -2370,7 +2354,7 @@ def train_meta_model_from_history(
         _log("Meta: training frame empty after NA filtering.")
         return None
 
-    mm = MetaModel(os.getenv("META_MODEL_TYPE", "ridge"))
+    mm = MetaModel(config.META_MODEL_TYPE)
     mm.fit(Xr, y_reg, Xc, y_cls)
     _save_pickle(save_path, mm.dump_state())
     _log(f"Meta: trained on {len(Xr)} rows, {Xr.shape[1]} reg feats / {Xc.shape[1]} cls feats. Saved -> {save_path}")
@@ -2769,7 +2753,7 @@ def train_models(ticker: str) -> pd.DataFrame:
     mm = None
     meta_auc, meta_rmse = np.nan, np.nan
     if not Xr_tr.empty and not Xc_tr.empty:
-        mm = MetaModel(os.getenv("META_MODEL_TYPE", "ridge"))
+        mm = MetaModel(config.META_MODEL_TYPE)
         mm.fit(Xr_tr, y_reg_tr, Xc_tr, y_cls_tr)
         try:
             _save_pickle(_DEFAULT_META_STATE_PATH, mm.dump_state())
@@ -2860,4 +2844,3 @@ def train_models(ticker: str) -> pd.DataFrame:
     if not out.empty:
         out.sort_values(["model","feature"], inplace=True)
     return out
-    

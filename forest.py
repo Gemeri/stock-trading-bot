@@ -4372,7 +4372,6 @@ def console_listener():
             logging.info("  trade-logic <logic>")
             logging.info("  set-ntickers (Number)")
             logging.info("  ai-tickers")
-            logging.info("  create-script (name)")
             logging.info("  buy (ticker) <amount|$dollars>")
             logging.info("  sell (ticker) <amount|$dollars>")
             logging.info("  commands")
@@ -4446,52 +4445,6 @@ def console_listener():
                 logging.info("No AI tickers returned or an error occurred.")
             else:
                 logging.info(f"AI recommended tickers: {new_ai_list}")
-
-        elif cmd == "create-script":
-            if len(parts) < 2:
-                logging.info("Usage: create-script <name>")
-                continue
-
-            user_provided_name = parts[1]
-            pattern_name = re.compile(r'^[a-z0-9_]+$')
-            if not pattern_name.match(user_provided_name):
-                logging.error("Invalid script name. Use only lowercase letters, digits, or underscores.")
-                continue
-
-            logic_dir, _ = get_logic_dir_and_json()
-            if not os.path.isdir(logic_dir):
-                os.makedirs(logic_dir)
-
-            existing_nums = []
-            for fname in os.listdir(logic_dir):
-                match = re.match(r'^logic_(\d+)_.*\.py$', fname)
-                if match:
-                    try:
-                        existing_nums.append(int(match.group(1)))
-                    except ValueError:
-                        pass
-
-            highest_num = max(existing_nums) if existing_nums else 0
-            new_num = highest_num + 1
-            new_script_name = f"logic_{new_num}_{user_provided_name}.py"
-            new_script_path = os.path.join(logic_dir, new_script_name)
-
-            template_content = """def run_logic(current_price, predicted_price, ticker):
-            from forest import api, buy_shares, sell_shares, short_shares, close_short
-
-            def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles):
-                return "NONE"
-        """
-            try:
-                with open(new_script_path, "w") as f:
-                    f.write(template_content)
-                logging.info(f"Created new logic script: {new_script_path}")
-            except Exception as e:
-                logging.error(f"Unable to create new logic script: {e}")
-                continue
-
-            _update_logic_json()
-            logging.info("Updated logic_scripts.json to include the newly created script.")
 
         elif cmd == "buy":
             if len(parts) < 3:

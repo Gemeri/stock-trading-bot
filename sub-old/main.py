@@ -1,4 +1,3 @@
-# main.py (updated)
 import os
 import pickle
 import numpy as np
@@ -14,7 +13,6 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score, accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
 
-# Sub-models (always include classifier; no USE_CLASSIFIER branching)
 import sub.momentum as mod1
 import sub.trend_continuation as mod2
 import sub.mean_reversion as mod3
@@ -22,6 +20,7 @@ import sub.lagged_return as mod4
 import sub.sentiment_volume as mod5
 import sub.regressor as modR
 import sub.classifier as mod6
+import config
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config & paths
@@ -33,17 +32,14 @@ RESULTS_DIR = os.path.join(BASE_DIR, "sub-results")
 FEATURE_ANALYTICS_DIR = os.path.join(RESULTS_DIR, "feature-analytics")
 
 load_dotenv()
-BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
-TICKERS = os.getenv("TICKERS", "TSLA").split(",")
-ML_MODEL = os.getenv("ML_MODEL", "sub-vote")  # or "sub-meta"
+BAR_TIMEFRAME = config.BAR_TIMEFRAME
+ML_MODEL = config.ML_MODEL
 TIMEFRAME_MAP = {"4Hour": "H4", "2Hour": "H2", "1Hour": "H1", "30Min": "M30", "15Min": "M15"}
 CONVERTED_TIMEFRAME = TIMEFRAME_MAP.get(BAR_TIMEFRAME, BAR_TIMEFRAME)
-TICKERS_STR = "-".join([t.strip() for t in TICKERS if t.strip()]) or "TSLA"
-CSV_PATH = os.path.join(ROOT_DIR, f"{TICKERS_STR}_{CONVERTED_TIMEFRAME}.csv")
 MODE = ML_MODEL
 EXECUTION = globals().get("EXECUTION", "backtest")
 QUICK_TEST = True
-
+CSV_PATH = None
 HISTORY_PATH = os.path.join(RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv")
 
 REG_UP, REG_DOWN = 0.003, -0.003  # for regression vote mapping → direction
@@ -52,14 +48,13 @@ FORCE_STATIC_THRESHOLDS = False
 STATIC_UP = 0.55
 STATIC_DOWN = 0.45
 
-META_MODEL_TYPE = os.getenv("META_MODEL_TYPE", "cat")
+META_MODEL_TYPE = config.META_MODEL_TYPE
 VALID_META_MODELS = {"logreg", "lgbm", "xgb", "nn", "cat"}
 if META_MODEL_TYPE not in VALID_META_MODELS:
     raise ValueError(f"META_MODEL_TYPE must be one of {VALID_META_MODELS}")
 
 # The sub-mod set is fixed (no USE_CLASSIFIER flag)
 SUBMODS = [mod1, mod2, mod3, mod4, mod5, modR, mod6]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers (multi-horizon utilities, meta features, thresholds, SHAP)
@@ -1167,5 +1162,6 @@ def run_live(return_result: bool = True, position_open: bool = False):
     action = "BUY" if prob > up else ("SELL" if prob < down else "HOLD")
     action = enforce_position_rules([action], position_open)[0]
     print(f"[LIVE] P(up)={prob:.3f}  →  {action}  (BUY>{up:.2f} / SELL<{down:.2f})")
+
 
     return (prob, action) if return_result else None

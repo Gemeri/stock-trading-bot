@@ -55,9 +55,9 @@ import torch
 import torch.nn as nn
 import importlib.util
 import shap
+import config
 
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 # -------------------------------
 # 1. Load Configuration (from .env)
@@ -65,38 +65,38 @@ from sklearn.preprocessing import StandardScaler
 load_dotenv()
 
 # trading / model selection ------------------------------------------------------------------
-ML_MODEL  = os.getenv("ML_MODEL", "forest")
-SUB_VERSION = os.getenv("SUB_VERSION", "beta")
+ML_MODEL  = config.ML_MODEL
+SUB_VERSION = config.SUB_VERSION
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
-API_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+API_BASE_URL = config.API_BASE_URL
 SUBMETA_USE_ACTION = os.getenv("SUBMETA_USE_ACTION", "false").strip().lower() == "true"
 
 # scheduling & run‑mode ----------------------------------------------------------------------
-RUN_SCHEDULE            = os.getenv("RUN_SCHEDULE", "on").lower().strip()
-SENTIMENT_OFFSET_MINUTES= int(os.getenv("SENTIMENT_OFFSET_MINUTES", "20"))
-BACKTEST_TICKER =  os.getenv("BACKTEST_TICKER", "TSLA")
-DISABLE_PRED_CLOSE = os.getenv("DISABLE_PRED_CLOSE", "True")
+RUN_SCHEDULE = config.RUN_SCHEDULE
+SENTIMENT_OFFSET_MINUTES = config.SENTIMENT_OFFSET_MINUTES
+BACKTEST_TICKER = config.BACKTEST_TICKER
+DISABLE_PRED_CLOSE = config.DISABLE_PRED_CLOSE
 
-_raw = os.getenv("STATIC_TICKERS", "")
+_raw = config.STATIC_TICKERS
 STATIC_TICKERS = {t.strip().upper()
                   for t in _raw.split(",") 
                   if t.strip()}      
-BAR_TIMEFRAME = os.getenv("BAR_TIMEFRAME", "4Hour")
-N_BARS        = int(os.getenv("N_BARS", "5000"))
-ROLLING_CANDLES = int(os.getenv("ROLLING_CANDLES", "0"))
+BAR_TIMEFRAME = config.BAR_TIMEFRAME
+N_BARS = config.N_BARS
+ROLLING_CANDLES = config.ROLLING_CANDLES
 
 # discord / ai / news ------------------------------------------------------------------------
-DISCORD_MODE  = os.getenv("DISCORD_MODE", "off").lower().strip()
+DISCORD_MODE  = config.DISCORD_MODE
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DISCORD_USER_ID = os.getenv("DISCORD_USER_ID", "")
 BING_API_KEY  = os.getenv("BING_API_KEY", "")
 OPENAI_API_KEY= os.getenv("OPENAI_API_KEY", "")
-AI_TICKER_COUNT = int(os.getenv("AI_TICKER_COUNT", "0"))
+AI_TICKER_COUNT = config.AI_TICKER_COUNT
 AI_TICKERS: list[str] = []
 
 # maximum number of distinct tickers allowed in portfolio (0=unlimited)
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "0"))
+MAX_TICKERS = config.MAX_TICKERS
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -107,7 +107,7 @@ BACKTEST_CACHE_VERSION = 1
 BACKTEST_CACHE_DIR = os.path.join(DATA_DIR, "backtest_cache")
 os.makedirs(BACKTEST_CACHE_DIR, exist_ok=True)
 
-USE_FULL_SHARES = os.getenv("USE_FULL_SHARES", "true").strip().lower() == "true"
+USE_FULL_SHARES = config.USE_FULL_SHARES
 
 TICKERLIST_TOP_N = 3
 TICKERS: list[str] = []
@@ -164,8 +164,8 @@ N_ESTIMATORS = 100
 RANDOM_SEED  = 42
 NY_TZ = pytz.timezone("America/New_York")
 
-NEWS_MODE = os.getenv("NEWS_MODE", "on").lower().strip()
-REWRITE = os.getenv("REWRITE", "off").strip().lower()
+NEWS_MODE = config.NEWS_MODE
+REWRITE = config.REWRITE
 
 
 def limit_df_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -866,7 +866,7 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
         return RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
     
 
-TRADE_LOGIC = os.getenv("TRADE_LOGIC", "15").strip()
+TRADE_LOGIC = config.TRADE_LOGIC
 
 MAIN_FEATURES = {
     "timestamp","open","high","low","close","vwap",
@@ -1389,6 +1389,8 @@ def fetch_candles_plus_features_and_predclose(
     except Exception as e:
         logging.error(f"[{ticker}] Unable to write {csv_filename}: {e}")
 
+    if DISABLE_PRED_CLOSE:
+        df_combined = df_combined.drop(columns=['predicted_close'], errors='ignore')
     return df_combined
 
 # -------------------------------
@@ -4580,7 +4582,7 @@ def console_listener():
                     continue
                 sell_shares(ticker_use, amount, live_price, live_price)
                 logging.info(f"Attempted to sell {amount}×{ticker_use} @ {live_price}")
-                
+
         elif cmd == "train-sub":
             if SUB_VERSION == "beta":
                 if len(parts) < 2:

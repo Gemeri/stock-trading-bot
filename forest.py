@@ -2844,13 +2844,22 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
                     extra_info="Auto-covering short before BUY."
                 )
             else:
-                api.submit_order(
-                    symbol=ticker,
-                    qty=int(abs_short_qty),
-                    side='buy',
-                    type='market',
-                    time_in_force='gtc'
-                )
+                if USE_FULL_SHARES:
+                    api.submit_order(
+                        symbol=ticker,
+                        qty=int(abs_short_qty),
+                        side='buy',
+                        type='market',
+                        time_in_force='gtc'
+                    )
+                else:
+                    api.submit_order(
+                        symbol=ticker,
+                        qty=int(abs_short_qty),
+                        side='buy',
+                        type='market',
+                        time_in_force='day'
+                    )
                 logging.info(f"[{ticker}] Auto-COVER {int(abs_short_qty)} at {buy_price:.2f} before BUY")
                 log_trade("COVER", ticker, abs_short_qty, buy_price, None, None)
             pos_qty = 0.0
@@ -2878,13 +2887,22 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
             if final_qty <= 0:
                 logging.info(f"[{ticker}] Not enough split cash to buy any shares. Skipping.")
                 return
-            api.submit_order(
-                symbol=ticker,
-                qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
-                side='buy',
-                type='market',
-                time_in_force='gtc'
-            )
+            if USE_FULL_SHARES:
+                api.submit_order(
+                    symbol=ticker,
+                    qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
+                    side='buy',
+                    type='market',
+                    time_in_force='gtc'
+                )
+            else:
+                api.submit_order(
+                    symbol=ticker,
+                    qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
+                    side='buy',
+                    type='market',
+                    time_in_force='day'
+                )     
             log_qty = int(final_qty) if USE_FULL_SHARES else round(final_qty, 4)
             logging.info(f"[{ticker}] BUY {log_qty} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
             log_trade("BUY", ticker, final_qty, buy_price, predicted_price, None)
@@ -2929,13 +2947,22 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
             )
         else:
             avg_entry = float(pos.avg_entry_price) if pos else 0.0
-            api.submit_order(
-                symbol=ticker,
-                qty=int(sellable_qty) if USE_FULL_SHARES else round(sellable_qty, 4),
-                side='sell',
-                type='market',
-                time_in_force='gtc'
-            )
+            if USE_FULL_SHARES:
+                api.submit_order(
+                    symbol=ticker,
+                    qty=int(sellable_qty) if USE_FULL_SHARES else round(sellable_qty, 4),
+                    side='sell',
+                    type='market',
+                    time_in_force='gtc'
+                )
+            else:
+                api.submit_order(
+                    symbol=ticker,
+                    qty=int(sellable_qty) if USE_FULL_SHARES else round(sellable_qty, 4),
+                    side='sell',
+                    type='market',
+                    time_in_force='day'
+                )
             pl = (sell_price - avg_entry) * sellable_qty
             log_qty = int(sellable_qty) if USE_FULL_SHARES else round(sellable_qty, 4)
             logging.info(f"[{ticker}] SELL {log_qty} at {sell_price:.2f} (Predicted: {predicted_price:.2f}, P/L: {pl:.2f})")
@@ -3476,202 +3503,386 @@ def console_listener():
             logging.info("Force-run job finished.")
 
         elif cmd == "backtest":
-                    if len(parts) < 2:
-                        logging.warning("Usage: backtest <N> [simple|complex] [timeframe?] [-r?]")
-                        continue
+            if len(parts) < 2:
+                logging.warning(
+                    "Usage: backtest <N> [simple|complex] [timeframe?] [-r?] "
+                    "or backtest all <N> [simple|complex] [timeframe?] [-r?]"
+                )
+                continue
 
-                    test_size_str = parts[1]
-                    approach = "simple"
-                    timeframe_for_backtest = BAR_TIMEFRAME
-                    possible_approaches = ["simple", "complex"]
-                    skip_data = ('-r' in parts)
-                    idx = 2
+            # --------------------------------------------------------------
+            #  Detect "backtest all" vs single-logic backtest
+            # --------------------------------------------------------------
+            run_all = False
+            arg_offset = 0
 
-                    while idx < len(parts):
-                        val = parts[idx]
-                        if val in possible_approaches:
-                            approach = val
-                        elif val != '-r':
-                            timeframe_for_backtest = val
-                        idx += 1
+            if parts[1].lower() == "all":
+                run_all = True
+                arg_offset = 1
+                if len(parts) < 3:
+                    logging.warning(
+                        "Usage: backtest all <N> [simple|complex] [timeframe?] [-r?]"
+                    )
+                    continue
+                test_size_str = parts[2]
+            else:
+                test_size_str = parts[1]
 
+            approach = "simple"
+            timeframe_for_backtest = BAR_TIMEFRAME
+            possible_approaches = ["simple", "complex"]
+            skip_data = ('-r' in parts)
+
+            # start parsing optional args after "all" + <N> or just <N>
+            idx = 2 + arg_offset
+            while idx < len(parts):
+                val = parts[idx]
+                if val in possible_approaches:
+                    approach = val
+                elif val != '-r':
+                    timeframe_for_backtest = val
+                idx += 1
+
+            try:
+                test_size = int(test_size_str)
+            except ValueError:
+                logging.error("Invalid test_size for 'backtest' command.")
+                continue
+
+            logic_dir, json_path = get_logic_dir_and_json()
+            if not os.path.isfile(json_path):
+                _update_logic_json()
+
+            with open(json_path, "r") as f:
+                LOGIC_MODULE_MAP = json.load(f) if os.path.getsize(json_path) else {}
+
+            # Precompute ML models for ticker once (still reused below)
+            ml_models = get_ml_models_for_ticker(BACKTEST_TICKER)
+
+            # --------------------------------------------------------------
+            #  Determine which logic module(s) to run
+            # --------------------------------------------------------------
+            if run_all:
+                if not LOGIC_MODULE_MAP:
+                    logging.error("No logic scripts available for 'backtest all'.")
+                    continue
+
+                numbered = []
+                for key, module_name in LOGIC_MODULE_MAP.items():
                     try:
-                        test_size = int(test_size_str)
-                    except ValueError:
-                        logging.error("Invalid test_size for 'backtest' command.")
+                        num = int(key)
+                    except (TypeError, ValueError):
                         continue
+                    if isinstance(module_name, str) and module_name:
+                        numbered.append((num, module_name))
 
-                    logic_dir, json_path = get_logic_dir_and_json()
-                    if not os.path.isfile(json_path):
-                        _update_logic_json()
+                if not numbered:
+                    logging.error(
+                        "No numbered logic scripts found in LOGIC_MODULE_MAP for 'backtest all'."
+                    )
+                    continue
 
-                    with open(json_path, "r") as f:
-                        LOGIC_MODULE_MAP = json.load(f) if os.path.getsize(json_path) else {}
+                numbered.sort(key=lambda x: x[0])
+                logic_modules_to_run = [m for _, m in numbered]
 
-                    ml_models = get_ml_models_for_ticker(BACKTEST_TICKER)
-                    if {"forest_cls", "xgboost_cls", "lightgbm_cls",
+                logging.info(
+                    f"[{BACKTEST_TICKER}] backtest all: running logic scripts in order: "
+                    f"{', '.join(logic_modules_to_run)}"
+                )
+            else:
+                # Original single-logic behaviour
+                if {
+                    "forest_cls", "xgboost_cls", "lightgbm_cls",
                     "transformer_cls", "sub-vote", "sub_meta",
-                    "sub-meta", "sub_vote", "catboost_cls"} & set(ml_models):
-                        logic_module_name = "classifier"
+                    "sub-meta", "sub_vote", "catboost_cls"
+                } & set(ml_models):
+                    logic_modules_to_run = ["classifier"]
+                else:
+                    logic_modules_to_run = [_get_logic_script_name(str(TRADE_LOGIC))]
+
+            # --------------------------------------------------------------
+            #  Prepare / load data ONCE, reused for all logic scripts
+            # --------------------------------------------------------------
+            tf_code = timeframe_to_code(timeframe_for_backtest)
+            csv_filename = os.path.join(DATA_DIR, f"{BACKTEST_TICKER}_{tf_code}.csv")
+
+            if skip_data:
+                logging.info(
+                    f"[{BACKTEST_TICKER}] backtest -r: using existing CSV {csv_filename}"
+                )
+                if not os.path.exists(csv_filename):
+                    logging.error(
+                        f"[{BACKTEST_TICKER}] CSV file {csv_filename} does not exist, skipping."
+                    )
+                    continue
+                df = read_csv_limited(csv_filename)
+                if df.empty:
+                    logging.error(f"[{BACKTEST_TICKER}] CSV is empty, skipping.")
+                    continue
+            else:
+                df = fetch_candles_plus_features_and_predclose(
+                    BACKTEST_TICKER,
+                    bars=N_BARS,
+                    timeframe=BAR_TIMEFRAME,
+                    rewrite_mode=REWRITE
+                )
+                df.to_csv(csv_filename, index=False)
+                logging.info(
+                    f"[{BACKTEST_TICKER}] Saved updated CSV with sentiment & features "
+                    f"(minus disabled) to {csv_filename} before backtest."
+                )
+
+            allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+            df = df.loc[:, [col for col in df.columns if col in allowed]]
+
+            if 'close' not in df.columns:
+                logging.error(
+                    f"[{BACKTEST_TICKER}] No 'close' column after feature processing. Cannot backtest."
+                )
+                continue
+
+            df['target'] = df['close'].shift(-1)
+            df.dropna(subset=['target'], inplace=True)
+
+            if len(df) <= test_size + 1:
+                logging.error(
+                    f"[{BACKTEST_TICKER}] Not enough rows for backtest split. Need more data than test_size."
+                )
+                continue
+
+            total_len = len(df)
+            train_end = total_len - test_size
+            if train_end < 1:
+                logging.error(
+                    f"[{BACKTEST_TICKER}] train_end < 1. Not enough data for that test_size."
+                )
+                continue
+
+            # ==============================================================
+            #  MAIN LOOP: run the backtest for each requested logic module
+            # ==============================================================
+            for logic_module_name in logic_modules_to_run:
+                logging.info("Trading logic: " + logic_module_name)
+                try:
+                    logic_module = importlib.import_module(f"{logic_dir}.{logic_module_name}")
+                except Exception as e:
+                    logging.error(
+                        f"Unable to import logic module {logic_module_name}: {e}"
+                    )
+                    continue
+
+                # Per-logic cache meta/state (so each logic has its own cache file)
+                cache_meta = {
+                    "ticker": BACKTEST_TICKER,
+                    "approach": approach,
+                    "timeframe": timeframe_for_backtest,
+                    "test_size": test_size,
+                    "logic_module": logic_module_name,
+                    "ml_models": sorted(ml_models),
+                }
+                cache_path = get_backtest_cache_path(cache_meta)
+                cache_state = load_backtest_cache(cache_path)
+                if cache_state and not backtest_cache_matches(cache_state, cache_meta):
+                    logging.info(
+                        f"[{BACKTEST_TICKER}] Ignoring cached backtest state for "
+                        f"{logic_module_name} due to configuration change."
+                    )
+                    cache_state = None
+
+                classifier_names = {
+                    "forest_cls", "xgboost_cls",
+                    "lightgbm_cls", "catboost_cls"
+                }
+
+                # Only treat as "classifier" result dir when the logic module itself is "classifier"
+                if (
+                    logic_module_name == "classifier"
+                    and classifier_names & set(ml_models)
+                ):
+                    logic_num_str = ",".join(ml_models)
+                    results_dir   = os.path.join("results", logic_num_str)
+                else:
+                    match_script  = re.match(r"^logic_(\d+)_", logic_module_name)
+                    logic_num_str = match_script.group(1) if match_script else "unknown"
+                    results_dir   = os.path.join("results", logic_num_str)
+
+                os.makedirs(results_dir, exist_ok=True)
+
+                # ----------------------------------------------------------
+                #  Per-logic backtest state variables
+                # ----------------------------------------------------------
+                predictions = []
+                actuals = []
+                timestamps = []
+                trade_records = []
+                portfolio_records = []
+                start_balance = 10000.0
+                cash = start_balance
+                position_qty = 0
+                avg_entry_price = 0.0
+                last_action = None
+                start_iter = 0
+
+                def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
+                    trade_records.append({
+                        "timestamp": tstamp,
+                        "action": action,
+                        "shares": shares,
+                        "current_price": curr_price,
+                        "predicted_price": pred_price,
+                        "profit_loss": pl
+                    })
+
+                def get_portfolio_value(pos_qty, csh, c_price, avg_price):
+                    if pos_qty > 0:
+                        return csh + (c_price - avg_price) * pos_qty
+                    elif pos_qty < 0:
+                        return csh + (avg_price - c_price) * abs(pos_qty)
                     else:
-                        logic_module_name = _get_logic_script_name(str(TRADE_LOGIC))
+                        return csh
 
-                    logging.info("Trading logic: " + logic_module_name)
-                    try:
-                        logic_module = importlib.import_module(f"{logic_dir}.{logic_module_name}")
-                    except Exception as e:
-                        logging.error(f"Unable to import logic module {logic_module_name}: {e}")
-                        continue
+                if approach in ["simple", "complex"]:
+                    # (Re)fetch ml models inside approach block, as original code did
+                    ml_models = get_ml_models_for_ticker(BACKTEST_TICKER)
+                    if approach == "simple":
+                        train_df = df.iloc[:train_end]
+                        test_df  = df.iloc[train_end:]
+                        idx_list = list(test_df.index)
 
-                    cache_meta = {
-                        "ticker": BACKTEST_TICKER,
-                        "approach": approach,
-                        "timeframe": timeframe_for_backtest,
-                        "test_size": test_size,
-                        "logic_module": logic_module_name,
-                        "ml_models": sorted(ml_models),
-                    }
-                    cache_path = get_backtest_cache_path(cache_meta)
-                    cache_state = load_backtest_cache(cache_path)
-                    if cache_state and not backtest_cache_matches(cache_state, cache_meta):
-                        logging.info(
-                            f"[{BACKTEST_TICKER}] Ignoring cached backtest state due to configuration change."
-                        )
-                        cache_state = None
+                        feature_cols = [c for c in POSSIBLE_FEATURE_COLS if c in train_df.columns]
+                        X_train = train_df[feature_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                        y_train = train_df['target']
 
-                    classifier_names = {"forest_cls", "xgboost_cls",
-                                        "lightgbm_cls", "catboost_cls"}
-
-                    if classifier_names & set(ml_models):
-                        logic_num_str = ",".join(ml_models)
-                        results_dir   = os.path.join("results", logic_num_str)
-                    else:
-                        match_script  = re.match(r"^logic_(\d+)_", logic_module_name)
-                        logic_num_str = match_script.group(1) if match_script else "unknown"
-                        results_dir   = os.path.join("results", logic_num_str)
-
-                    os.makedirs(results_dir, exist_ok=True)
-                    tf_code = timeframe_to_code(timeframe_for_backtest)
-                    csv_filename = os.path.join(DATA_DIR, f"{BACKTEST_TICKER}_{tf_code}.csv")
-                    if skip_data:
-                        logging.info(f"[{BACKTEST_TICKER}] backtest -r: using existing CSV {BACKTEST_TICKER}")
-                        if not os.path.exists(csv_filename):
-                            logging.error(f"[{BACKTEST_TICKER}] CSV file {csv_filename} does not exist, skipping.")
-                            continue
-                        df = read_csv_limited(csv_filename)
-                        if df.empty:
-                            logging.error(f"[{BACKTEST_TICKER}] CSV is empty, skipping.")
-                            continue
-                    else:
-                        df = fetch_candles_plus_features_and_predclose(
-                            BACKTEST_TICKER,
-                            bars=N_BARS,
-                            timeframe=BAR_TIMEFRAME,
-                            rewrite_mode=REWRITE
-                        )
-                        df.to_csv(csv_filename, index=False)
-                        logging.info(f"[{BACKTEST_TICKER}] Saved updated CSV with sentiment & features (minus disabled) to {csv_filename} before backtest.")
-
-                    allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
-                    df = df.loc[:, [col for col in df.columns if col in allowed]]
-
-                    if 'close' not in df.columns:
-                        logging.error(f"[{BACKTEST_TICKER}] No 'close' column after feature processing. Cannot backtest.")
-                        continue
-                    df['target'] = df['close'].shift(-1)
-                    df.dropna(subset=['target'], inplace=True)
-                    if len(df) <= test_size + 1:
-                        logging.error(f"[{BACKTEST_TICKER}] Not enough rows for backtest split. Need more data than test_size.")
-                        continue
-
-                    total_len = len(df)
-                    train_end = total_len - test_size
-                    if train_end < 1:
-                        logging.error(f"[{BACKTEST_TICKER}] train_end < 1. Not enough data for that test_size.")
-                        continue
-
-                    predictions = []
-                    actuals = []
-                    timestamps = []
-                    trade_records = []
-                    portfolio_records = []
-                    start_balance = 10000.0
-                    cash = start_balance
-                    position_qty = 0
-                    avg_entry_price = 0.0
-                    last_action = None
-                    start_iter = 0
-
-                    def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
-                        trade_records.append({
-                            "timestamp": tstamp,
-                            "action": action,
-                            "shares": shares,
-                            "current_price": curr_price,
-                            "predicted_price": pred_price,
-                            "profit_loss": pl
-                        })
-
-                    def get_portfolio_value(pos_qty, csh, c_price, avg_price):
-                        if pos_qty > 0:
-                            return csh + (c_price - avg_price) * pos_qty
-                        elif pos_qty < 0:
-                            return csh + (avg_price - c_price) * abs(pos_qty)
-                        else:
-                            return csh
-
-                    if approach in ["simple", "complex"]:
-                        ml_models = get_ml_models_for_ticker(BACKTEST_TICKER)
-                        if approach == "simple":
-                            train_df = df.iloc[:train_end]
-                            test_df  = df.iloc[train_end:]
-                            idx_list = list(test_df.index)
-
-                            feature_cols = [c for c in POSSIBLE_FEATURE_COLS if c in train_df.columns]
-                            X_train = train_df[feature_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-                            y_train = train_df['target']
-
-                            model_stack = []
-                            for m in ml_models:
-                                if m in ["forest", "rf", "randomforest"]:
-                                    mdl = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                                elif m == "xgboost":
-                                    mdl = xgb.XGBRegressor(
-                                        n_estimators=114, 
-                                        max_depth=9, 
-                                        learning_rate=0.14264252588219034,
-                                        subsample=0.5524803023252148,
-                                        colsample_bytree=0.7687841723045249,
-                                        gamma=0.5856035407199236,
-                                        reg_alpha=0.5063880221467401,
-                                        reg_lambda=0.0728996118523866,
-                                    )
-                                elif m == "catboost":
-                                    mdl = CatBoostRegressor(iterations=600, depth=6, learning_rate=0.05,
-                                                            l2_leaf_reg=3, bagging_temperature=0.5,
-                                                            loss_function="RMSE", eval_metric="RMSE",
-                                                            random_seed=42, verbose=False)
-                                elif m in ["lightgbm", "lgbm"]:
-                                    mdl = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                                else:
-                                    continue
-                                mdl.fit(X_train, y_train)
-                                model_stack.append(mdl)
-
-                            if not model_stack:
-                                logging.error(f"[{BACKTEST_TICKER}] No supported model for simple backtest.")
+                        model_stack = []
+                        for m in ml_models:
+                            if m in ["forest", "rf", "randomforest"]:
+                                mdl = RandomForestRegressor(
+                                    n_estimators=N_ESTIMATORS,
+                                    random_state=RANDOM_SEED
+                                )
+                            elif m == "xgboost":
+                                mdl = xgb.XGBRegressor(
+                                    n_estimators=114,
+                                    max_depth=9,
+                                    learning_rate=0.14264252588219034,
+                                    subsample=0.5524803023252148,
+                                    colsample_bytree=0.7687841723045249,
+                                    gamma=0.5856035407199236,
+                                    reg_alpha=0.5063880221467401,
+                                    reg_lambda=0.0728996118523866,
+                                )
+                            elif m == "catboost":
+                                mdl = CatBoostRegressor(
+                                    iterations=600, depth=6, learning_rate=0.05,
+                                    l2_leaf_reg=3, bagging_temperature=0.5,
+                                    loss_function="RMSE", eval_metric="RMSE",
+                                    random_seed=42, verbose=False
+                                )
+                            elif m in ["lightgbm", "lgbm"]:
+                                mdl = lgb.LGBMRegressor(
+                                    n_estimators=N_ESTIMATORS,
+                                    random_state=RANDOM_SEED
+                                )
+                            else:
                                 continue
-                        else: # complex
-                            idx_list = list(range(train_end, total_len))               
-                        if len(df.iloc[:train_end]) < 70:
-                            logging.error(f"[{BACKTEST_TICKER}] Not enough training rows for {approach} approach.")
+                            mdl.fit(X_train, y_train)
+                            model_stack.append(mdl)
+
+                        if not model_stack:
+                            logging.error(
+                                f"[{BACKTEST_TICKER}] No supported model for simple backtest."
+                            )
                             continue
-                        total_iterations = len(idx_list)
+                    else:  # complex
+                        idx_list = list(range(train_end, total_len))
+
+                    if len(df.iloc[:train_end]) < 70:
+                        logging.error(
+                            f"[{BACKTEST_TICKER}] Not enough training rows for {approach} approach."
+                        )
+                        continue
+
+                    total_iterations = len(idx_list)
+                    resume_data = restore_backtest_state(
+                        cache_state,
+                        mode="ml",
+                        total_iterations=total_iterations,
+                        start_balance=start_balance,
+                    )
+                    if resume_data:
+                        (
+                            predictions,
+                            actuals,
+                            timestamps,
+                            trade_records,
+                            portfolio_records,
+                            cash,
+                            position_qty,
+                            avg_entry_price,
+                            start_iter,
+                            last_action,
+                        ) = resume_data
+                        logging.info(
+                            f"[{BACKTEST_TICKER}] Resuming backtest for {logic_module_name} "
+                            f"at candle {start_iter} of {total_iterations}."
+                        )
+
+                    if "sub-vote" in ml_models or "sub-meta" in ml_models:
+                        mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
+                        signal_df  = call_sub_main(df, 500)
+
+                        # --- keep only actionable rows and order chronologically ---------------
+                        trade_actions = (
+                            signal_df[signal_df["action"].isin(["BUY", "SELL"])]
+                            .copy()
+                            .sort_values("timestamp")
+                            .reset_index(drop=True)
+                        )
+
+                        # -----------------------------------------------------------------------
+                        #  Portfolio state variables
+                        # -----------------------------------------------------------------------
+                        trade_records      = []
+                        portfolio_records  = []
+                        predictions        = []
+                        actuals            = []
+                        timestamps         = []
+
+                        START_BALANCE      = 10_000.0
+                        cash               = START_BALANCE
+                        position_qty       = 0
+                        avg_entry_price    = 0.0
+
+                        # convenience -----------------------------------------------------------
+                        def record_trade(act, ts, qty, px, pl=None):
+                            trade_records.append({
+                                "timestamp"     : ts,
+                                "action"        : act,
+                                "shares"        : qty,
+                                "current_price" : px,
+                                "profit_loss"   : pl
+                            })
+
+                        # timestamp alignment ---------------------------------------------------
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        trade_actions['timestamp'] = pd.to_datetime(trade_actions['timestamp'])
+
+                        df_sorted = df.sort_values('timestamp').reset_index(drop=True)
+                        actions_sorted = trade_actions.sort_values('timestamp').reset_index(drop=True)
+
+                        merged_actions = pd.merge_asof(
+                            actions_sorted,
+                            df_sorted,
+                            on='timestamp',
+                            direction='backward'
+                        )
+
+                        total_iterations = len(merged_actions)
                         resume_data = restore_backtest_state(
                             cache_state,
-                            mode="ml",
+                            mode="signal",
                             total_iterations=total_iterations,
-                            start_balance=start_balance,
+                            start_balance=START_BALANCE,
                         )
                         if resume_data:
                             (
@@ -3687,432 +3898,411 @@ def console_listener():
                                 last_action,
                             ) = resume_data
                             logging.info(
-                                f"[{BACKTEST_TICKER}] Resuming backtest at candle {start_iter} "
-                                f"of {total_iterations}."
+                                f"[{BACKTEST_TICKER}] Resuming signal backtest for {logic_module_name} "
+                                f"at step {start_iter} of {total_iterations}."
                             )
-                        if "sub-vote" in ml_models or "sub-meta" in ml_models:
-                            mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-                            signal_df  = call_sub_main(df, 500)
+                        else:
+                            start_iter = 0
+                            last_action = None
 
-                            # --- keep only actionable rows and order chronologically ---------------
-                            trade_actions = (
-                                signal_df[signal_df["action"].isin(["BUY", "SELL"])]
-                                .copy()
-                                .sort_values("timestamp")
-                                .reset_index(drop=True)
-                            )
+                        # -----------------------------------------------------------------------
+                        #  Iterate over each (action, candle) row – enforce position sanity
+                        # -----------------------------------------------------------------------
+                        for iter_idx, (_, row) in enumerate(merged_actions.iterrows()):
+                            if iter_idx < start_iter:
+                                continue
+                            raw_act = row["action"]
+                            ts      = row["timestamp"]
+                            price   = row["close"]
 
-                            # -----------------------------------------------------------------------
-                            #  Portfolio state variables
-                            # -----------------------------------------------------------------------
-                            trade_records      = []
-                            portfolio_records  = []
-                            predictions        = []
-                            actuals            = []
-                            timestamps         = []
+                            if raw_act == "BUY":
+                                # If already long, ignore duplicate BUY
+                                if position_qty > 0:
+                                    raw_act = "NONE"
+                                # If short, COVER first
+                                elif position_qty < 0:
+                                    pl = (avg_entry_price - price) * abs(position_qty)
+                                    cash += pl
+                                    record_trade("COVER", ts, abs(position_qty), price, pl)
+                                    position_qty    = 0
+                                    avg_entry_price = 0.0
 
-                            START_BALANCE      = 10_000.0
-                            cash               = START_BALANCE
-                            position_qty       = 0
-                            avg_entry_price    = 0.0
+                            elif raw_act == "SELL":
+                                if position_qty <= 0:
+                                    raw_act = "NONE"
 
-                            # convenience -----------------------------------------------------------
-                            def record_trade(act, ts, qty, px, pl=None):
-                                trade_records.append({
-                                    "timestamp"     : ts,
-                                    "action"        : act,
-                                    "shares"        : qty,
-                                    "current_price" : px,
-                                    "profit_loss"   : pl
-                                })
+                            # ------------------------------------------------ execute action ---
+                            if raw_act == "BUY":
+                                shares_to_buy = int(cash // price)
+                                if shares_to_buy > 0:
+                                    position_qty    = shares_to_buy
+                                    avg_entry_price = price
+                                    record_trade("BUY", ts, shares_to_buy, price)
 
-                            # timestamp alignment ---------------------------------------------------
-                            df['timestamp'] = pd.to_datetime(df['timestamp'])
-                            trade_actions['timestamp'] = pd.to_datetime(trade_actions['timestamp'])
-
-                            df_sorted = df.sort_values('timestamp').reset_index(drop=True)
-                            actions_sorted = trade_actions.sort_values('timestamp').reset_index(drop=True)
-
-                            merged_actions = pd.merge_asof(
-                                actions_sorted,
-                                df_sorted,
-                                on='timestamp',
-                                direction='backward'
-                            )
-
-                            total_iterations = len(merged_actions)
-                            resume_data = restore_backtest_state(
-                                cache_state,
-                                mode="signal",
-                                total_iterations=total_iterations,
-                                start_balance=START_BALANCE,
-                            )
-                            if resume_data:
-                                (
-                                    predictions,
-                                    actuals,
-                                    timestamps,
-                                    trade_records,
-                                    portfolio_records,
-                                    cash,
-                                    position_qty,
-                                    avg_entry_price,
-                                    start_iter,
-                                    last_action,
-                                ) = resume_data
-                                logging.info(
-                                    f"[{BACKTEST_TICKER}] Resuming signal backtest at step {start_iter} "
-                                    f"of {total_iterations}."
-                                )
-                            else:
-                                start_iter = 0
-                                last_action = None
-
-                            # -----------------------------------------------------------------------
-                            #  Iterate over each (action, candle) row – enforce position sanity
-                            # -----------------------------------------------------------------------
-                            for iter_idx, (_, row) in enumerate(merged_actions.iterrows()):
-                                if iter_idx < start_iter:
-                                    continue
-                                raw_act = row["action"]
-                                ts      = row["timestamp"]
-                                price   = row["close"]
-
-                                if raw_act == "BUY":
-                                    # If already long, ignore duplicate BUY
-                                    if position_qty > 0:
-                                        raw_act = "NONE"
-                                    # If short, COVER first
-                                    elif position_qty < 0:
-                                        pl = (avg_entry_price - price) * abs(position_qty)
-                                        cash += pl
-                                        record_trade("COVER", ts, abs(position_qty), price, pl)
-                                        position_qty    = 0
-                                        avg_entry_price = 0.0
-
-                                elif raw_act == "SELL":
-                                    if position_qty <= 0:
-                                        raw_act = "NONE"
-
-                                # ------------------------------------------------ execute action ---
-                                if raw_act == "BUY":
-                                    shares_to_buy = int(cash // price)
-                                    if shares_to_buy > 0:
-                                        position_qty    = shares_to_buy
-                                        avg_entry_price = price
-                                        record_trade("BUY", ts, shares_to_buy, price)
-
-                                elif raw_act == "SELL":
+                            elif raw_act == "SELL":
+                                if position_qty > 0:
                                     pl   = (price - avg_entry_price) * position_qty
                                     cash += pl
                                     record_trade("SELL", ts, position_qty, price, pl)
                                     position_qty    = 0
                                     avg_entry_price = 0.0
 
-                                # ------------------------------------------------ portfolio value --
-                                port_val = (
-                                    cash
-                                    + (price - avg_entry_price) * position_qty
-                                    if position_qty != 0 else cash
-                                )
-                                portfolio_records.append({"timestamp": ts, "portfolio_value": port_val})
+                            # ------------------------------------------------ portfolio value --
+                            port_val = (
+                                cash
+                                + (price - avg_entry_price) * position_qty
+                                if position_qty != 0 else cash
+                            )
+                            portfolio_records.append({"timestamp": ts, "portfolio_value": port_val})
 
-                                last_action = raw_act
-                                update_backtest_cache(
-                                    cache_path,
-                                    cache_meta,
-                                    mode="signal",
-                                    total_iterations=total_iterations,
-                                    next_index=iter_idx + 1,
-                                    predictions=predictions,
-                                    actuals=actuals,
-                                    timestamps=timestamps,
-                                    trade_records=trade_records,
-                                    portfolio_records=portfolio_records,
-                                    cash=cash,
-                                    position_qty=position_qty,
-                                    avg_entry_price=avg_entry_price,
-                                    last_action=last_action,
-                                )
+                            last_action = raw_act
+                            update_backtest_cache(
+                                cache_path,
+                                cache_meta,
+                                mode="signal",
+                                total_iterations=total_iterations,
+                                next_index=iter_idx + 1,
+                                predictions=predictions,
+                                actuals=actuals,
+                                timestamps=timestamps,
+                                trade_records=trade_records,
+                                portfolio_records=portfolio_records,
+                                cash=cash,
+                                position_qty=position_qty,
+                                avg_entry_price=avg_entry_price,
+                                last_action=last_action,
+                            )
 
-                            # -----------------------------------------------------------------------
-                            #  Ensure results directory exists (unchanged)
-                            # -----------------------------------------------------------------------
-                            results_dir = os.path.join("sub", "sub-results")
-                            os.makedirs(results_dir, exist_ok=True)
+                        # -----------------------------------------------------------------------
+                        #  Ensure results directory exists (unchanged)
+                        # -----------------------------------------------------------------------
+                        results_dir = os.path.join("sub", "sub-results")
+                        os.makedirs(results_dir, exist_ok=True)
 
+                    # ----------- ALL OTHER ML MODES -----------------------------------
+                    else:
+                        ROLL_WIN = test_size
 
-                        # ----------- ALL OTHER ML MODES -----------------------------------
-                        else:
-                            ROLL_WIN = test_size
+                        for i_, row_idx in enumerate(idx_list):
 
-                            for i_, row_idx in enumerate(idx_list):
+                            if i_ < start_iter:
+                                continue
 
-                                if i_ < start_iter:
+                            if approach == "simple":
+                                if row_idx == 0:
                                     continue
-
-                                if approach == "simple":
-                                    if row_idx == 0:
-                                        continue
-                                    feat_row = df.loc[row_idx - 1, feature_cols]
-                                    X_pred = pd.DataFrame([feat_row], columns=feature_cols)
-                                    X_pred = X_pred.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-                                    preds = [mdl.predict(X_pred)[0] for mdl in model_stack]
-                                    pred_close = float(np.mean(preds))
-                                else:
-                                    sub_df = df.iloc[:row_idx]
-                                    pred_close = train_and_predict(sub_df, ticker=BACKTEST_TICKER)
-                                row_data   = df.loc[row_idx]
-                                real_close = row_data["close"]
-
-                                # ───────────────────────────────────────────────────────────
-                                # 2. Build the ROLLING candles slice handed to run_backtest
-                                # ───────────────────────────────────────────────────────────
-                                start_idx  = max(0, row_idx - ROLL_WIN + 1)      # never < 0
-                                candles_bt = df.iloc[start_idx : row_idx + 1].copy()
-
-                                # make sure the prediction column exists & is float-typed
-                                if "predicted_close" not in candles_bt.columns:
-                                    candles_bt["predicted_close"] = np.nan
-                                candles_bt["predicted_close"] = candles_bt["predicted_close"].astype(float)
-
-                                # ensure pred_close is a scalar, then set it
-                                if isinstance(pred_close, dict):
-                                    pred_close = list(pred_close.values())[-1]  # grab last value
-                                pred_close = float(np.asarray(pred_close).flatten()[-1])
-                                candles_bt.at[candles_bt.index[-1], "predicted_close"] = pred_close
-
-
-                                # ───────────────────────────────────────────────────────────
-                                # 3. Call the user’s trading-logic module
-                                # ───────────────────────────────────────────────────────────
-                                print(logic_module)
-                                action = logic_module.run_backtest(
-                                    current_price     = real_close,
-                                    predicted_price   = pred_close,
-                                    position_qty      = position_qty,
-                                    current_timestamp = row_data["timestamp"],
-                                    candles           = candles_bt,
-                                    ticker            = BACKTEST_TICKER
+                                feat_row = df.loc[row_idx - 1, feature_cols]
+                                X_pred = pd.DataFrame([feat_row], columns=feature_cols)
+                                X_pred = X_pred.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                                preds = [mdl.predict(X_pred)[0] for mdl in model_stack]
+                                pred_close = float(np.mean(preds))
+                            else:
+                                sub_df = df.iloc[:row_idx]
+                                pred_close = train_and_predict(
+                                    sub_df,
+                                    ticker=BACKTEST_TICKER
                                 )
+                            row_data   = df.loc[row_idx]
+                            real_close = row_data["close"]
 
-                                # ───────────────────────────────────────────────────────────
-                                # 4. Log the prediction so RMSE/plots still work
-                                # ───────────────────────────────────────────────────────────
-                                predictions.append(pred_close)
-                                actuals.append(real_close)
-                                timestamps.append(row_data["timestamp"])
+                            # ───────────────────────────────────────────────────────────
+                            # 2. Build the ROLLING candles slice handed to run_backtest
+                            # ───────────────────────────────────────────────────────────
+                            start_idx  = max(0, row_idx - ROLL_WIN + 1)      # never < 0
+                            candles_bt = df.iloc[start_idx : row_idx + 1].copy()
 
-                                # ───────────────────────────────────────────────────────────
-                                # 5. Trade-simulation block (unchanged)
-                                # ───────────────────────────────────────────────────────────
-                                if action == "BUY"   and position_qty > 0:  action = "NONE"
-                                if action == "SHORT" and position_qty < 0:  action = "NONE"
-                                if action == "SELL"  and position_qty <= 0: action = "NONE"
-                                if action == "COVER" and position_qty >= 0: action = "NONE"
+                            # make sure the prediction column exists & is float-typed
+                            if "predicted_close" not in candles_bt.columns:
+                                candles_bt["predicted_close"] = np.nan
+                            candles_bt["predicted_close"] = candles_bt[
+                                "predicted_close"
+                            ].astype(float)
 
-                                if action == "BUY":
-                                    if position_qty < 0:
-                                        pl = (avg_entry_price - real_close) * abs(position_qty)
-                                        cash += pl
-                                        record_trade("COVER", row_data["timestamp"],
-                                                    abs(position_qty), real_close,
-                                                    pred_close, pl)
-                                        position_qty   = 0
-                                        avg_entry_price = 0.0
+                            # ensure pred_close is a scalar, then set it
+                            if isinstance(pred_close, dict):
+                                pred_close = list(pred_close.values())[-1]  # grab last value
+                            pred_close = float(np.asarray(pred_close).flatten()[-1])
+                            candles_bt.at[
+                                candles_bt.index[-1], "predicted_close"
+                            ] = pred_close
 
-                                    shares_to_buy = int(cash // real_close)
-                                    if shares_to_buy > 0:
-                                        position_qty    = shares_to_buy
-                                        avg_entry_price = real_close
-                                        record_trade("BUY", row_data["timestamp"],
-                                                    shares_to_buy, real_close,
-                                                    pred_close, None)
+                            # ───────────────────────────────────────────────────────────
+                            # 3. Call the user’s trading-logic module
+                            # ───────────────────────────────────────────────────────────
+                            print(logic_module)
+                            action = logic_module.run_backtest(
+                                current_price     = real_close,
+                                predicted_price   = pred_close,
+                                position_qty      = position_qty,
+                                current_timestamp = row_data["timestamp"],
+                                candles           = candles_bt,
+                                ticker            = BACKTEST_TICKER
+                            )
 
-                                elif action == "SELL":
-                                    if position_qty > 0:
-                                        pl = (real_close - avg_entry_price) * position_qty
-                                        cash += pl
-                                        record_trade("SELL", row_data["timestamp"],
-                                                    position_qty, real_close,
-                                                    pred_close, pl)
-                                        position_qty    = 0
-                                        avg_entry_price = 0.0
+                            # ───────────────────────────────────────────────────────────
+                            # 4. Log the prediction so RMSE/plots still work
+                            # ───────────────────────────────────────────────────────────
+                            predictions.append(pred_close)
+                            actuals.append(real_close)
+                            timestamps.append(row_data["timestamp"])
 
-                                elif action == "SHORT":
-                                    if position_qty > 0:
-                                        pl = (real_close - avg_entry_price) * position_qty
-                                        cash += pl
-                                        record_trade("SELL", row_data["timestamp"],
-                                                    position_qty, real_close,
-                                                    pred_close, pl)
-                                        position_qty    = 0
-                                        avg_entry_price = 0.0
+                            # ───────────────────────────────────────────────────────────
+                            # 5. Trade-simulation block (unchanged)
+                            # ───────────────────────────────────────────────────────────
+                            if action == "BUY"   and position_qty > 0:  action = "NONE"
+                            if action == "SHORT" and position_qty < 0:  action = "NONE"
+                            if action == "SELL"  and position_qty <= 0: action = "NONE"
+                            if action == "COVER" and position_qty >= 0: action = "NONE"
 
-                                    shares_to_short = int(cash // real_close)
-                                    if shares_to_short > 0:
-                                        position_qty    = -shares_to_short
-                                        avg_entry_price = real_close
-                                        record_trade("SHORT", row_data["timestamp"],
-                                                    shares_to_short, real_close,
-                                                    pred_close, None)
+                            if action == "BUY":
+                                if position_qty < 0:
+                                    pl = (avg_entry_price - real_close) * abs(position_qty)
+                                    cash += pl
+                                    record_trade(
+                                        "COVER",
+                                        row_data["timestamp"],
+                                        abs(position_qty),
+                                        real_close,
+                                        pred_close,
+                                        pl,
+                                    )
+                                    position_qty    = 0
+                                    avg_entry_price = 0.0
 
-                                elif action == "COVER":
-                                    if position_qty < 0:
-                                        pl = (avg_entry_price - real_close) * abs(position_qty)
-                                        cash += pl
-                                        record_trade("COVER", row_data["timestamp"],
-                                                    abs(position_qty), real_close,
-                                                    pred_close, pl)
-                                        position_qty    = 0
-                                        avg_entry_price = 0.0
+                                shares_to_buy = int(cash // real_close)
+                                if shares_to_buy > 0:
+                                    position_qty    = shares_to_buy
+                                    avg_entry_price = real_close
+                                    record_trade(
+                                        "BUY",
+                                        row_data["timestamp"],
+                                        shares_to_buy,
+                                        real_close,
+                                        pred_close,
+                                        None,
+                                    )
 
-                                val = get_portfolio_value(position_qty, cash, real_close, avg_entry_price)
-                                portfolio_records.append(
-                                    {"timestamp": row_data["timestamp"], "portfolio_value": val}
-                                )
+                            elif action == "SELL":
+                                if position_qty > 0:
+                                    pl = (real_close - avg_entry_price) * position_qty
+                                    cash += pl
+                                    record_trade(
+                                        "SELL",
+                                        row_data["timestamp"],
+                                        position_qty,
+                                        real_close,
+                                        pred_close,
+                                        pl,
+                                    )
+                                    position_qty    = 0
+                                    avg_entry_price = 0.0
 
-                                last_action = action
-                                update_backtest_cache(
-                                    cache_path,
-                                    cache_meta,
-                                    mode="ml",
-                                    total_iterations=total_iterations,
-                                    next_index=i_ + 1,
-                                    predictions=predictions,
-                                    actuals=actuals,
-                                    timestamps=timestamps,
-                                    trade_records=trade_records,
-                                    portfolio_records=portfolio_records,
-                                    cash=cash,
-                                    position_qty=position_qty,
-                                    avg_entry_price=avg_entry_price,
-                                    last_action=last_action,
-                                )
-                        # ----------------- END inner loop ---------------------------------
+                            elif action == "SHORT":
+                                if position_qty > 0:
+                                    pl = (real_close - avg_entry_price) * position_qty
+                                    cash += pl
+                                    record_trade(
+                                        "SELL",
+                                        row_data["timestamp"],
+                                        position_qty,
+                                        real_close,
+                                        pred_close,
+                                        pl,
+                                    )
+                                    position_qty    = 0
+                                    avg_entry_price = 0.0
 
-                    else:
-                        logging.warning(
-                            f"[{BACKTEST_TICKER}] Unknown approach={approach}. Skipping backtest."
-                        )
-                        continue
+                                shares_to_short = int(cash // real_close)
+                                if shares_to_short > 0:
+                                    position_qty    = -shares_to_short
+                                    avg_entry_price = real_close
+                                    record_trade(
+                                        "SHORT",
+                                        row_data["timestamp"],
+                                        shares_to_short,
+                                        real_close,
+                                        pred_close,
+                                        None,
+                                    )
 
-                    # ------------------------------------------------------------------
-                    #  ▸  RESULTS & METRICS  (skip RMSE/MAE when no regression preds)
-                    # ------------------------------------------------------------------
-                    collecting_regression = len(predictions) > 0
+                            elif action == "COVER":
+                                if position_qty < 0:
+                                    pl = (avg_entry_price - real_close) * abs(position_qty)
+                                    cash += pl
+                                    record_trade(
+                                        "COVER",
+                                        row_data["timestamp"],
+                                        abs(position_qty),
+                                        real_close,
+                                        pred_close,
+                                        pl,
+                                    )
+                                    position_qty    = 0
+                                    avg_entry_price = 0.0
 
-                    if collecting_regression:
-                        y_pred = np.array(predictions, dtype=float)
-                        y_test = np.array(actuals,      dtype=float)
+                            val = get_portfolio_value(
+                                position_qty, cash, real_close, avg_entry_price
+                            )
+                            portfolio_records.append(
+                                {
+                                    "timestamp": row_data["timestamp"],
+                                    "portfolio_value": val,
+                                }
+                            )
 
-                        rmse = math.sqrt(mean_squared_error(y_test, y_pred))
-                        mae  = mean_absolute_error(y_test, y_pred)
+                            last_action = action
+                            update_backtest_cache(
+                                cache_path,
+                                cache_meta,
+                                mode="ml",
+                                total_iterations=total_iterations,
+                                next_index=i_ + 1,
+                                predictions=predictions,
+                                actuals=actuals,
+                                timestamps=timestamps,
+                                trade_records=trade_records,
+                                portfolio_records=portfolio_records,
+                                cash=cash,
+                                position_qty=position_qty,
+                                avg_entry_price=avg_entry_price,
+                                last_action=last_action,
+                            )
+                    # ----------------- END inner loop ---------------------------------
 
-                        avg_close = y_test.mean() if len(y_test) else 1e-6
-                        accuracy  = 100.0 - (mae / avg_close * 100.0)
-
-                        logging.info(
-                            f"[{BACKTEST_TICKER}] Backtest ({approach}) — "
-                            f"test_size={test_size}, "
-                            f"RMSE={rmse:.4f}, MAE={mae:.4f}, "
-                            f"Accuracy≈{accuracy:.2f}%"
-                        )
-                    else:
-                        logging.info(
-                            f"[{BACKTEST_TICKER}] Backtest ({approach}) — "
-                            "classification / signal mode "
-                            "(sub-vote / sub-meta) — RMSE/MAE not computed."
-                        )
-
-                    # ---------------- save artefacts ----------------
-                    tf_code       = timeframe_to_code(timeframe_for_backtest)
-                    results_dir   = os.path.join("results", logic_num_str)
-                    os.makedirs(results_dir, exist_ok=True)
-
-                    # ▸ prediction CSV & plot — only when we *have* predictions
-                    if collecting_regression:
-                        out_pred_csv = os.path.join(
-                            results_dir,
-                            f"backtest_predictions_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
-                        )
-                        out_pred_png = os.path.join(
-                            results_dir,
-                            f"backtest_predictions_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.png",
-                        )
-
-                        pd.DataFrame(
-                            {
-                                "timestamp": timestamps,
-                                "actual_close": actuals,
-                                "predicted_close": predictions,
-                            }
-                        ).to_csv(out_pred_csv, index=False)
-
-                        plt.figure(figsize=(10, 6))
-                        plt.plot(timestamps, actuals,     label="Actual")
-                        plt.plot(timestamps, predictions, label="Predicted")
-                        plt.title(
-                            f"{BACKTEST_TICKER} Backtest ({approach} — last {test_size}) "
-                            f"[{timeframe_for_backtest}]"
-                        )
-                        plt.xlabel("Timestamp")
-                        plt.ylabel("Close Price")
-                        plt.legend()
-                        plt.grid(True)
-                        if test_size > 30:
-                            plt.xticks(rotation=45)
-                        plt.tight_layout()
-                        plt.savefig(out_pred_png)
-                        plt.close()
-
-                        logging.info(f"[{BACKTEST_TICKER}] Saved predictions → {out_pred_csv}")
-                        logging.info(f"[{BACKTEST_TICKER}] Saved prediction plot → {out_pred_png}")
-
-                    # ▸ trade log & portfolio series (always saved)
-                    trade_log_csv = os.path.join(
-                        results_dir,
-                        f"backtest_trades_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
+                else:
+                    logging.warning(
+                        f"[{BACKTEST_TICKER}] Unknown approach={approach}. "
+                        f"Skipping backtest for {logic_module_name}."
                     )
-                    port_csv = os.path.join(
-                        results_dir,
-                        f"backtest_portfolio_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
+                    continue
+
+                # ------------------------------------------------------------------
+                #  ▸  RESULTS & METRICS (per logic module)
+                # ------------------------------------------------------------------
+                collecting_regression = len(predictions) > 0
+
+                if collecting_regression:
+                    y_pred = np.array(predictions, dtype=float)
+                    y_test = np.array(actuals,      dtype=float)
+
+                    rmse = math.sqrt(mean_squared_error(y_test, y_pred))
+                    mae  = mean_absolute_error(y_test, y_pred)
+
+                    avg_close = y_test.mean() if len(y_test) else 1e-6
+                    accuracy  = 100.0 - (mae / avg_close * 100.0)
+
+                    logging.info(
+                        f"[{BACKTEST_TICKER}] Backtest ({approach}) — logic={logic_module_name}, "
+                        f"test_size={test_size}, "
+                        f"RMSE={rmse:.4f}, MAE={mae:.4f}, "
+                        f"Accuracy≈{accuracy:.2f}%"
                     )
-                    port_png = os.path.join(
-                        results_dir,
-                        f"backtest_portfolio_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.png",
+                else:
+                    logging.info(
+                        f"[{BACKTEST_TICKER}] Backtest ({approach}) — logic={logic_module_name}, "
+                        "classification / signal mode "
+                        "(sub-vote / sub-meta) — RMSE/MAE not computed."
                     )
 
-                    pd.DataFrame(trade_records).to_csv(trade_log_csv, index=False)
-                    pd.DataFrame(portfolio_records).to_csv(port_csv, index=False)
-                    logging.info(f"[{BACKTEST_TICKER}] Saved trades → {trade_log_csv}")
-                    logging.info(f"[{BACKTEST_TICKER}] Saved portfolio series → {port_csv}")
+                # ---------------- save artefacts ----------------
+                tf_code       = timeframe_to_code(timeframe_for_backtest)
+                results_dir   = os.path.join("results", logic_num_str)
+                os.makedirs(results_dir, exist_ok=True)
 
-                    # portfolio value plot (only if records exist)
-                    port_df = pd.DataFrame(portfolio_records)
-                    if not port_df.empty:
-                        plt.figure(figsize=(10, 6))
-                        plt.plot(
-                            port_df["timestamp"],
-                            port_df["portfolio_value"],
-                            label="Portfolio Value",
-                        )
-                        plt.title(
-                            f"{BACKTEST_TICKER} Portfolio Value Backtest ({approach})"
-                        )
-                        plt.xlabel("Timestamp")
-                        plt.ylabel("Portfolio Value (USD)")
-                        plt.legend()
-                        plt.grid(True)
-                        if test_size > 30:
-                            plt.xticks(rotation=45)
-                        plt.tight_layout()
-                        plt.savefig(port_png)
-                        plt.close()
+                # ▸ prediction CSV & plot — only when we *have* predictions
+                if collecting_regression:
+                    out_pred_csv = os.path.join(
+                        results_dir,
+                        f"backtest_predictions_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
+                    )
+                    out_pred_png = os.path.join(
+                        results_dir,
+                        f"backtest_predictions_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.png",
+                    )
 
-                        logging.info(f"[{BACKTEST_TICKER}] Saved portfolio plot → {port_png}")
+                    pd.DataFrame(
+                        {
+                            "timestamp": timestamps,
+                            "actual_close": actuals,
+                            "predicted_close": predictions,
+                        }
+                    ).to_csv(out_pred_csv, index=False)
 
-                    clear_backtest_cache(cache_path)
+                    plt.figure(figsize=(10, 6))
+                    plt.plot(timestamps, actuals,     label="Actual")
+                    plt.plot(timestamps, predictions, label="Predicted")
+                    plt.title(
+                        f"{BACKTEST_TICKER} Backtest ({approach} — last {test_size}) "
+                        f"[{timeframe_for_backtest}] — {logic_module_name}"
+                    )
+                    plt.xlabel("Timestamp")
+                    plt.ylabel("Close Price")
+                    plt.legend()
+                    plt.grid(True)
+                    if test_size > 30:
+                        plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    plt.savefig(out_pred_png)
+                    plt.close()
+
+                    logging.info(
+                        f"[{BACKTEST_TICKER}] Saved predictions for {logic_module_name} → {out_pred_csv}"
+                    )
+                    logging.info(
+                        f"[{BACKTEST_TICKER}] Saved prediction plot for {logic_module_name} → {out_pred_png}"
+                    )
+
+                # ▸ trade log & portfolio series (always saved)
+                trade_log_csv = os.path.join(
+                    results_dir,
+                    f"backtest_trades_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
+                )
+                port_csv = os.path.join(
+                    results_dir,
+                    f"backtest_portfolio_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.csv",
+                )
+                port_png = os.path.join(
+                    results_dir,
+                    f"backtest_portfolio_{BACKTEST_TICKER}_{test_size}_{tf_code}_{approach}.png",
+                )
+
+                pd.DataFrame(trade_records).to_csv(trade_log_csv, index=False)
+                pd.DataFrame(portfolio_records).to_csv(port_csv, index=False)
+                logging.info(
+                    f"[{BACKTEST_TICKER}] Saved trades for {logic_module_name} → {trade_log_csv}"
+                )
+                logging.info(
+                    f"[{BACKTEST_TICKER}] Saved portfolio series for {logic_module_name} → {port_csv}"
+                )
+
+                # portfolio value plot (only if records exist)
+                port_df = pd.DataFrame(portfolio_records)
+                if not port_df.empty:
+                    plt.figure(figsize=(10, 6))
+                    plt.plot(
+                        port_df["timestamp"],
+                        port_df["portfolio_value"],
+                        label="Portfolio Value",
+                    )
+                    plt.title(
+                        f"{BACKTEST_TICKER} Portfolio Value Backtest ({approach}) "
+                        f"— {logic_module_name}"
+                    )
+                    plt.xlabel("Timestamp")
+                    plt.ylabel("Portfolio Value (USD)")
+                    plt.legend()
+                    plt.grid(True)
+                    if test_size > 30:
+                        plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    plt.savefig(port_png)
+                    plt.close()
+
+                    logging.info(
+                        f"[{BACKTEST_TICKER}] Saved portfolio plot for {logic_module_name} → {port_png}"
+                    )
+
+                clear_backtest_cache(cache_path)
 
         elif cmd == "get-best-tickers":
             n = 1

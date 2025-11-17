@@ -991,7 +991,6 @@ def _get_logic_script_name(logic_id: str) -> str:
     ``logic_1_forecast_driven``.
     """
     logic_dir, json_path = get_logic_dir_and_json()
-
     # If the user provided a direct filename, strip the extension and use it.
     if logic_id.lower().endswith('.py'):
         return logic_id[:-3]
@@ -3148,7 +3147,7 @@ def trade_logic(current_price: float, predicted_price: float, ticker: str):
         if classifier_stack & set(ml_models):
             logic_module_name = "classifier"          # logic/classifier.py
         else:
-            logic_module_name = _get_logic_script_name(TRADE_LOGIC)
+            logic_module_name = _get_logic_script_name(str(TRADE_LOGIC))
 
         module_path   = f"{logic_dir}.{logic_module_name}"
         logic_module  = importlib.import_module(module_path)
@@ -3515,7 +3514,7 @@ def console_listener():
                     "sub-meta", "sub_vote", "catboost_cls"} & set(ml_models):
                         logic_module_name = "classifier"
                     else:
-                        logic_module_name = _get_logic_script_name(TRADE_LOGIC)
+                        logic_module_name = _get_logic_script_name(str(TRADE_LOGIC))
 
                     logging.info("Trading logic: " + logic_module_name)
                     try:

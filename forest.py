@@ -2761,15 +2761,11 @@ def compute_and_cache_best_tickers() -> list[str]:
 
 
 def maybe_update_best_tickers(scheduled_time_ny: str | None = None):
-    """Re-compute best tickers when the cache predates the reference time.
-
-    • `scheduled_time_ny` – "%H:%M" string from TIMEFRAME_SCHEDULE, or
-      None when called at script start-up.
-    """
-
+    today_str = datetime.now().date().isoformat()
     try:
-        clock = api.get_clock()
-        if not clock.is_open:
+        calendar = api.get_calendar(start=today_str, end=today_str)
+        if not calendar:
+            logging.info("Market is not scheduled to open today. Skipping job.")
             return
     except Exception as e:
         logging.error(f"Clock check failed")
@@ -2808,7 +2804,7 @@ def send_discord_order_message(action, ticker, price, predicted_price, extra_inf
 
 def buy_shares(ticker, qty, buy_price, predicted_price):
     logging.info("BUY: %s", ticker)
-    
+    maybe_update_best_tickers()
     if ticker.upper() in STATIC_TICKERS:
         logging.info("Ticker %s is in STATIC_TICKERS. Skipping...", ticker)
         return
@@ -2860,13 +2856,19 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
                         type='market',
                         time_in_force='day'
                     )
-                logging.info(f"[{ticker}] Auto-COVER {int(abs_short_qty)} at {buy_price:.2f} before BUY")
+                logging.info(
+                    "[%s] Auto-COVER %d at %.2f before BUY",
+                    ticker, int(abs_short_qty), buy_price
+                )
                 log_trade("COVER", ticker, abs_short_qty, buy_price, None, None)
             pos_qty = 0.0
 
         # Step 2: If already long, avoid duplicate buy
         if already_long:
-            logging.info(f"[{ticker}] Already long {int(pos_qty)} shares. Skipping new BUY to prevent duplicate long position.")
+            logging.info(
+                "[%s] Already long %d shares. Skipping new BUY to prevent duplicate long position.",
+                ticker, int(pos_qty)
+            )
             return
 
         # Step 3: Proceed to new BUY for desired qty
@@ -2879,13 +2881,20 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
             # Risk allocation as before
             account = api.get_account()
             available_cash = float(account.cash)
+            logging.info("Available cash: %s", available_cash)
+            logging.info("Length of tickers: %s", len(TICKERS))
             total_ticker_slots = (len(TICKERS) if TICKERS else 0) + AI_TICKER_COUNT
+            logging.info("Total Ticker slots 1: %s", total_ticker_slots)
             total_ticker_slots = max(total_ticker_slots, 1)
+            logging.info("Total Ticker slots 2: %s", total_ticker_slots)
             split_cash = available_cash / total_ticker_slots
+            logging.info("Split cash: %s", split_cash)
             max_shares = (split_cash // buy_price) if USE_FULL_SHARES else (split_cash / buy_price)
+            logging.info("Max shares: %s", max_shares)
             final_qty = min(qty, max_shares)
+            logging.info("Final quantity: %s", final_qty)
             if final_qty <= 0:
-                logging.info(f"[{ticker}] Not enough split cash to buy any shares. Skipping.")
+                logging.info("[%s] Not enough split cash to buy any shares. Skipping.", ticker)
                 return
             if USE_FULL_SHARES:
                 api.submit_order(
@@ -2902,14 +2911,17 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
                     side='buy',
                     type='market',
                     time_in_force='day'
-                )     
+                )
             log_qty = int(final_qty) if USE_FULL_SHARES else round(final_qty, 4)
-            logging.info(f"[{ticker}] BUY {log_qty} at {buy_price:.2f} (Predicted: {predicted_price:.2f})")
+            logging.info(
+                "[%s] BUY %s at %.2f (Predicted: %.2f)",
+                ticker, log_qty, buy_price, predicted_price
+            )
             log_trade("BUY", ticker, final_qty, buy_price, predicted_price, None)
             if ticker not in TICKERS and ticker not in AI_TICKERS:
                 AI_TICKERS.append(ticker)
     except Exception as e:
-        logging.error(f"[{ticker}] Buy order failed: {e}")
+        logging.error("[%s] Buy order failed: %s", ticker, e)
 
 def sell_shares(ticker, qty, sell_price, predicted_price):
     logging.info("SELL: %s", ticker)

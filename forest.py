@@ -2561,23 +2561,15 @@ def cash_below_minimum() -> bool:
 
 
 def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> list[str]:
-    """
-    Rank and return a list of the best tickers.
-
-    • Default ─ ranks by ML-model prediction quality.
-    • If `SELECTION_MODEL` starts with “trade_logic”, the user’s trade-logic
-      script is imported and its `run_backtest` function is executed ONCE on
-      the **entire** candle history for each symbol.  
-      The numeric value returned by `run_backtest` (or one of the common keys
-      in a returned dict) is used as the ranking metric.
-    """
     if top_n is None:
         top_n = TICKERLIST_TOP_N
 
     tickers = load_tickerlist()
     if not tickers:
         return []
+
     print(SELECTION_MODEL)
+
     # ────────────────────────────────────────────────────────────────────
     # 1. Trade-logic branch ─ use run_backtest for scoring
     # ────────────────────────────────────────────────────────────────────
@@ -2593,7 +2585,9 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
             logic_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(logic_module)
 
-        results: list[str] = []
+        # For others we just keep ticker symbols in discovery order.
+        results_with_conf: list[tuple[float, str]] = []
+        results_plain: list[str] = []
 
         for tck in tickers:
             tf_code  = timeframe_to_code(BAR_TIMEFRAME)
@@ -2631,32 +2625,83 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
 
             # ── Run back-test once on full data ───────────────────────────
             try:
-                action = logic_module.run_backtest(
-                    current_price     = get_current_price(tck),
-                    predicted_price   = pred_close,
-                    position_qty      = 0,
-                    current_timestamp = df.iloc[-1]["timestamp"],
-                    candles           = df.copy(),
-                    ticker            = tck
-                )
+                if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+                    # New signature: return (action, confidence) when confidence=True
+                    rb_result = logic_module.run_backtest(
+                        current_price     = get_current_price(tck),
+                        predicted_price   = pred_close,
+                        position_qty      = 0,
+                        current_timestamp = df.iloc[-1]["timestamp"],
+                        candles           = df.copy(),
+                        ticker            = tck,
+                        confidence        = True,
+                    )
+                else:
+                    # Legacy behaviour: no confidence flag
+                    rb_result = logic_module.run_backtest(
+                        current_price     = get_current_price(tck),
+                        predicted_price   = pred_close,
+                        position_qty      = 0,
+                        current_timestamp = df.iloc[-1]["timestamp"],
+                        candles           = df.copy(),
+                        ticker            = tck,
+                    )
             except Exception as exc:
                 logging.exception("Back-test failed for %s: %s", tck, exc)
                 continue
-            
+
+            # ── Unpack action / confidence depending on TRADE_LOGIC ───────
+            action = rb_result
+            confidence_score: float | None = None
+
+            if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+                # Expected shape: (action, confidence)
+                if isinstance(rb_result, tuple) and len(rb_result) >= 2:
+                    action, confidence_score = rb_result[0], rb_result[1]
+                elif isinstance(rb_result, dict):
+                    # Fallback: dict-style result
+                    action = rb_result.get("action", rb_result.get("signal", "NONE"))
+                    confidence_score = rb_result.get("confidence")
+                else:
+                    # Fallback: only action returned
+                    action = rb_result
+                    confidence_score = None
+
+                # Normalise confidence_score to float if possible
+                if confidence_score is not None:
+                    try:
+                        confidence_score = float(confidence_score)
+                    except (TypeError, ValueError):
+                        confidence_score = None
+
             # Normalise action to upper-case string
             action_str = str(action).strip().upper()
             logging.info("%s: %s", tck, action_str)
 
             # Keep tickers with a BUY signal
             if action_str == "BUY":
-                results.append(tck)
+                if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+                    # If confidence is missing, treat as 0.0 so it sorts to the bottom.
+                    if confidence_score is None or not np.isfinite(confidence_score):
+                        confidence_score = 0.0
+                    results_with_conf.append((confidence_score, tck))
+                else:
+                    results_plain.append(tck)
 
-        if not results:
-            logging.info("No tickers produced a BUY signal.")
-            return []
-
-        # Preserve discovery order but cap at top_n
-        return results[:max(1, top_n)]
+        # ── Finalise trade-logic selection ───────────────────────────────
+        if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+            if not results_with_conf:
+                logging.info("No tickers produced a BUY signal.")
+                return []
+            # Sort BUY tickers by confidence (descending) and apply top_n
+            results_with_conf.sort(key=lambda x: x[0], reverse=True)
+            return [t for _, t in results_with_conf[:max(1, top_n)]]
+        else:
+            if not results_plain:
+                logging.info("No tickers produced a BUY signal.")
+                return []
+            # Preserve discovery order but cap at top_n
+            return results_plain[:max(1, top_n)]
 
     # ────────────────────────────────────────────────────────────────────
     # 2. ML-ranking branch (unchanged from original)
@@ -2712,6 +2757,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
 
     results.sort(key=lambda x: x[0], reverse=True)
     return [t for _, t in results[:max(1, top_n)]]
+
 
 
 def load_best_ticker_cache() -> tuple[list[str], datetime | None]:
@@ -4042,14 +4088,25 @@ def console_listener():
                             # 3. Call the user’s trading-logic module
                             # ───────────────────────────────────────────────────────────
                             print(logic_module)
-                            action = logic_module.run_backtest(
-                                current_price     = real_close,
-                                predicted_price   = pred_close,
-                                position_qty      = position_qty,
-                                current_timestamp = row_data["timestamp"],
-                                candles           = candles_bt,
-                                ticker            = BACKTEST_TICKER
-                            )
+                            if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+                                action = logic_module.run_backtest(
+                                    current_price = real_close,
+                                    predicted_price = pred_close,
+                                    position_qty = position_qty,
+                                    current_timestamp = row_data["timestamp"],
+                                    candles = candles_bt,
+                                    ticker = BACKTEST_TICKER,
+                                    confidence = False
+                                )
+                            else:
+                                action = logic_module.run_backtest(
+                                    current_price     = real_close,
+                                    predicted_price   = pred_close,
+                                    position_qty      = position_qty,
+                                    current_timestamp = row_data["timestamp"],
+                                    candles           = candles_bt,
+                                    ticker            = BACKTEST_TICKER
+                                )
 
                             # ───────────────────────────────────────────────────────────
                             # 4. Log the prediction so RMSE/plots still work
@@ -4770,7 +4827,6 @@ def console_listener():
 def main():
     _update_logic_json()
     setup_schedule_for_timeframe(BAR_TIMEFRAME)
-    maybe_update_best_tickers()
     listener_thread = threading.Thread(target=console_listener, daemon=True)
     listener_thread.start()
     logging.info("Bot started. Running schedule in local NY time.")

@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional, List, Tuple, Callable
 import numpy as np
 import pandas as pd
 
-# Optional env loader
+# Optional env loader.
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
@@ -2844,3 +2844,4 @@ def train_models(ticker: str) -> pd.DataFrame:
     if not out.empty:
         out.sort_values(["model","feature"], inplace=True)
     return out
+

@@ -77,10 +77,11 @@ RUN_SCHEDULE = config.RUN_SCHEDULE
 SENTIMENT_OFFSET_MINUTES = config.SENTIMENT_OFFSET_MINUTES
 BACKTEST_TICKER = config.BACKTEST_TICKER
 DISABLE_PRED_CLOSE = config.DISABLE_PRED_CLOSE
+HORIZON = max(1, int(getattr(config, "HORIZON", 1)))
 
 _raw = config.STATIC_TICKERS
 STATIC_TICKERS = {t.strip().upper()
-                  for t in _raw.split(",") 
+                  for t in _raw.split(",")
                   if t.strip()}      
 BAR_TIMEFRAME = config.BAR_TIMEFRAME
 N_BARS = config.N_BARS
@@ -2042,9 +2043,10 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         return None
 
     df_full = df_feat.copy()
+    horizon_gap = HORIZON
     df_full['ret1']    = df_full['close'].pct_change()
-    df_full['direction'] = (df_full['ret1'].shift(-1) > 0).astype(int)
-    df_full['target']  = df_full['close'].shift(-1)
+    df_full['direction'] = (df_full['close'].shift(-horizon_gap) > df_full['close']).astype(int)
+    df_full['target']  = df_full['close'].shift(-horizon_gap)
 
     df_train = df_full.dropna(subset=['target']).copy()
     if len(df_train) < 70:
@@ -3699,10 +3701,11 @@ def console_listener():
                 )
                 continue
 
-            df['target'] = df['close'].shift(-1)
+            horizon_gap = HORIZON
+            df['target'] = df['close'].shift(-horizon_gap)
             df.dropna(subset=['target'], inplace=True)
 
-            if len(df) <= test_size + 1:
+            if len(df) <= test_size + horizon_gap:
                 logging.error(
                     f"[{BACKTEST_TICKER}] Not enough rows for backtest split. Need more data than test_size."
                 )
@@ -3803,7 +3806,15 @@ def console_listener():
                     # (Re)fetch ml models inside approach block, as original code did
                     ml_models = get_ml_models_for_ticker(BACKTEST_TICKER)
                     if approach == "simple":
+                        horizon_buffer = max(0, horizon_gap - 1)
                         train_df = df.iloc[:train_end]
+                        if horizon_buffer > 0:
+                            if len(train_df) <= horizon_buffer:
+                                logging.error(
+                                    f"[{BACKTEST_TICKER}] Not enough training rows after horizon cut."
+                                )
+                                continue
+                            train_df = train_df.iloc[:-horizon_buffer]
                         test_df  = df.iloc[train_end:]
                         idx_list = list(test_df.index)
 
@@ -3854,7 +3865,8 @@ def console_listener():
                     else:  # complex
                         idx_list = list(range(train_end, total_len))
 
-                    if len(df.iloc[:train_end]) < 70:
+                    min_train_rows = len(train_df) if approach == "simple" else len(df.iloc[:train_end]) - max(0, horizon_gap - 1)
+                    if min_train_rows < 70:
                         logging.error(
                             f"[{BACKTEST_TICKER}] Not enough training rows for {approach} approach."
                         )
@@ -4056,8 +4068,17 @@ def console_listener():
                                 pred_close = float(np.mean(preds))
                             else:
                                 sub_df = df.iloc[:row_idx]
+                                if horizon_gap > 1:
+                                    if len(sub_df) <= horizon_gap - 1:
+                                        logging.error(
+                                            f"[{BACKTEST_TICKER}] Not enough rows for training after horizon cut."
+                                        )
+                                        break
+                                    sub_df_for_training = sub_df.iloc[: -(horizon_gap - 1)]
+                                else:
+                                    sub_df_for_training = sub_df
                                 pred_close = train_and_predict(
-                                    sub_df,
+                                    sub_df_for_training,
                                     ticker=BACKTEST_TICKER
                                 )
                             row_data   = df.loc[row_idx]

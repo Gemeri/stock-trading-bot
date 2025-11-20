@@ -627,11 +627,60 @@ POSSIBLE_FEATURE_COLS = [
     'days_since_high', 'days_since_low', "d_sentiment"
 ]
 
-def make_pipeline(base_est): 
-    return Pipeline([ 
-        ("sc",  StandardScaler()), 
-        ("cal", CalibratedClassifierCV(base_est, method="isotonic", cv=3)), 
+def make_pipeline(base_est):
+    return Pipeline([
+        ("sc",  StandardScaler()),
+        ("cal", CalibratedClassifierCV(base_est, method="isotonic", cv=3)),
     ])
+
+
+def _ensure_multi_horizon_targets(df: pd.DataFrame) -> pd.DataFrame:
+    """Create a ternary target column for the configured horizon if missing."""
+    if "close" not in df.columns:
+        raise ValueError("DataFrame must contain 'close' column to build targets.")
+
+    close = df["close"].astype(float)
+
+    col = f"target_{HORIZON}"
+    if col in df.columns:
+        return df  # already present, don't overwrite
+
+    fwd_ret = close.shift(-HORIZON) / close - 1.0
+
+    # Rolling quantiles over the past 32 values of fwd_ret
+    rolling_low = (
+        fwd_ret.rolling(32, min_periods=32)
+                .quantile(0.33)
+    )
+    rolling_high = (
+        fwd_ret.rolling(32, min_periods=32)
+                .quantile(0.67)
+    )
+
+    target = np.zeros(len(df), dtype=int)
+
+    valid = (~fwd_ret.isna()) & (~rolling_low.isna()) & (~rolling_high.isna())
+    target[(fwd_ret > rolling_high) & valid] = 1
+    target[(fwd_ret < rolling_low) & valid] = -1
+
+    df[col] = target
+
+    return df
+
+
+def _get_feature_and_target_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """Return available feature columns and ensured target column names."""
+    # make sure target_* columns are present (created in-memory if needed)
+    df = _ensure_multi_horizon_targets(df)
+
+    feature_cols = [c for c in POSSIBLE_FEATURE_COLS if c in df.columns]
+
+    target_cols: list[str] = []
+    col = f"target_{HORIZON}"
+    if col in df.columns:
+        target_cols.append(col)
+
+    return feature_cols, target_cols
 
 def call_sub_main(df, backtest_amount, position_open=False):
     if SUB_VERSION == "beta":
@@ -711,20 +760,36 @@ def parse_ml_models(override: str | None = None) -> list[str]:
     raw = [m.strip().lower() for m in ml_raw.split(",") if m.strip()]
 
     if "all" in raw:
-        raw += ["forest", "xgboost", "lightgbm", "catboost", "lstm", "transformer"]
+        raw += [
+            "forest",
+            "xgboost",
+            "lightgbm",
+            "catboost",
+            "lstm",
+            "transformer",
+        ]
     if "all_cls" in raw:
-        raw += ["forest_cls", "xgboost_cls", "catboost_cls" "lightgbm_cls", "transformer_cls"]
+        raw += [
+            "forest_cls",
+            "xgboost_cls",
+            "catboost_cls",
+            "lightgbm_cls",
+            "transformer_cls",
+        ]
 
     canonical: list[str] = []
     for m in raw:
         match m:
             case "lgbm" | "lightgbm":                 canonical.append("lightgbm")
             case "lgbm_cls" | "lightgbm_cls":         canonical.append("lightgbm_cls")
+            case "lgbm_multi" | "lightgbm_multi":     canonical.append("lightgbm_multi")
             case "rf" | "randomforest":               canonical.append("forest")
             case "rf_cls" | "forest_cls":             canonical.append("forest_cls")
             case "xgb_cls" | "xgboost_cls":           canonical.append("xgboost_cls")
+            case "xgb_multi" | "xgboost_multi":       canonical.append("xgboost_multi")
             case "cb" | "catboost":                   canonical.append("catboost")
             case "cb_cls" | "catboost_cls":           canonical.append("catboost_cls")
+            case "cb_multi" | "catboost_multi":       canonical.append("catboost_multi")
             case "classifier" | "transformer_cls":    canonical.append("transformer_cls")
             case "sub_vote" | "sub-vote":             canonical.append("sub-vote")
             case "sub_meta" | "sub-meta":             canonical.append("sub-meta")
@@ -2042,7 +2107,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
         logging.error("No 'close' in DataFrame, cannot create target.")
         return None
 
-    df_full = df_feat.copy()
+    df_full = _ensure_multi_horizon_targets(df_feat.copy())
     horizon_gap = HORIZON
     df_full['ret1']    = df_full['close'].pct_change()
     df_full['direction'] = (df_full['close'].shift(-horizon_gap) > df_full['close']).astype(int)
@@ -2107,8 +2172,90 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
 
     use_meta_model = sorted(ml_models) == sorted(["forest", "xgboost", "lightgbm", "lstm", "transformer", "catboost"])
 
+    multi_classifier_set = {"xgboost_multi", "catboost_multi", "lightgbm_multi"}
     classifier_set = {"forest_cls", "xgboost_cls",
                     "lightgbm_cls", "transformer_cls", "catboost_cls"}
+
+    if any(m in multi_classifier_set for m in ml_models):
+        feature_cols, target_cols = _get_feature_and_target_columns(df_full)
+
+        if not feature_cols:
+            logging.error("No feature columns available for multi-class classification.")
+            return None
+        if not target_cols:
+            logging.error("No target columns available for multi-class classification.")
+            return None
+
+        target_col = target_cols[0]
+        X_multi = df_full[feature_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        y_multi = df_full[target_col].astype(int)
+
+        valid_mask = df_full["close"].shift(-HORIZON).notna()
+        if valid_mask.sum() < 2:
+            logging.error("Not enough data to train multi-class models.")
+            return None
+
+        scaler_multi = StandardScaler().fit(X_multi[valid_mask])
+        X_multi_scaled = scaler_multi.transform(X_multi[valid_mask])
+        X_last_multi = scaler_multi.transform(X_multi.iloc[[-1]])
+
+        label_to_index = {-1: 0, 0: 1, 1: 2}
+        y_encoded = y_multi[valid_mask].map(label_to_index).to_numpy()
+
+        proba_preds: list[np.ndarray] = []
+
+        if "xgboost_multi" in ml_models:
+            xgb_multi = XGBClassifier(
+                n_estimators=400,
+                learning_rate=0.05,
+                max_depth=5,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                objective="multi:softprob",
+                num_class=3,
+                random_state=RANDOM_SEED,
+                tree_method="hist",
+            )
+            xgb_multi.fit(X_multi_scaled, y_encoded)
+            proba_preds.append(xgb_multi.predict_proba(X_last_multi)[0])
+
+        if "catboost_multi" in ml_models:
+            cb_multi = CatBoostClassifier(
+                iterations=600,
+                depth=6,
+                learning_rate=0.05,
+                l2_leaf_reg=3,
+                bagging_temperature=0.5,
+                loss_function="MultiClass",
+                eval_metric="MultiClass",
+                random_seed=RANDOM_SEED,
+                verbose=False,
+            )
+            cb_multi.fit(X_multi_scaled, y_encoded)
+            proba_preds.append(cb_multi.predict_proba(X_last_multi)[0])
+
+        if "lightgbm_multi" in ml_models:
+            lgb_multi = LGBMClassifier(
+                n_estimators=400,
+                learning_rate=0.05,
+                num_leaves=64,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                objective="multiclass",
+                num_class=3,
+                random_state=RANDOM_SEED,
+            )
+            lgb_multi.fit(X_multi_scaled, y_encoded)
+            proba_preds.append(lgb_multi.predict_proba(X_last_multi)[0])
+
+        if not proba_preds:
+            logging.error(f"Unknown multi-classifier in request: {ml_models}")
+            return None
+
+        avg_proba = np.mean(np.vstack(proba_preds), axis=0)
+        idx_to_label = {0: -1, 1: 0, 2: 1}
+        pred_idx = int(np.argmax(avg_proba))
+        return idx_to_label.get(pred_idx, 0)
 
     if any(m in classifier_set for m in ml_models):
 

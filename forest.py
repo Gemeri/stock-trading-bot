@@ -116,6 +116,26 @@ TICKERS: list[str] = []
 TICKER_ML_OVERRIDES: dict[str, str] = {}
 SELECTION_MODEL: str | None = None
 
+
+def timeframe_subdir(tf_code: str) -> str:
+    """Return the directory path for a given timeframe code, creating it if needed."""
+
+    path = os.path.join(DATA_DIR, tf_code)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def candle_csv_path(ticker: str, tf_code: str) -> str:
+    """Build the candle CSV path for ticker/timeframe inside its subdirectory."""
+
+    return os.path.join(timeframe_subdir(tf_code), f"{ticker}_{tf_code}.csv")
+
+
+def sentiment_csv_path(ticker: str, tf_code: str) -> str:
+    """Build the sentiment CSV path for ticker/timeframe inside its subdirectory."""
+
+    return os.path.join(timeframe_subdir(tf_code), f"{ticker}_sentiment_{tf_code}.csv")
+
 def load_tickerlist() -> list[str]:
     """Load tickers and per-ticker ML overrides from tickerlist.txt."""
     global TICKERS, TICKER_ML_OVERRIDES, SELECTION_MODEL, TRADE_LOGIC
@@ -1206,8 +1226,8 @@ def fetch_candles_plus_features_and_predclose(
     rewrite_mode: str
 ) -> pd.DataFrame:
     tf_code       = timeframe_to_code(timeframe)
-    csv_filename  = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
-    sentiment_csv = os.path.join(DATA_DIR, f"{ticker}_sentiment_{tf_code}.csv")
+    csv_filename  = candle_csv_path(ticker, tf_code)
+    sentiment_csv = sentiment_csv_path(ticker, tf_code)
 
     def get_features(df: pd.DataFrame):
         exclude = {'predicted_close'}
@@ -1685,7 +1705,7 @@ def save_news_to_csv(ticker: str, news_list: list):
 
 def merge_sentiment_from_csv(df, ticker):
     tf_code = timeframe_to_code(BAR_TIMEFRAME)
-    sentiment_csv_filename = os.path.join(DATA_DIR, f"{ticker}_sentiment_{tf_code}.csv")
+    sentiment_csv_filename = sentiment_csv_path(ticker, tf_code)
     if not os.path.exists(sentiment_csv_filename):
         logging.error(f"Sentiment CSV {sentiment_csv_filename} not found for ticker {ticker}.")
         return df
@@ -2741,7 +2761,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
 
         for tck in tickers:
             tf_code  = timeframe_to_code(BAR_TIMEFRAME)
-            csv_file = os.path.join(DATA_DIR, f"{tck}_{tf_code}.csv")
+            csv_file = candle_csv_path(tck, tf_code)
 
             # ── Load or refresh candles + features ────────────────────────
             if skip_data:
@@ -2862,7 +2882,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
 
     for tck in tickers:
         tf_code  = timeframe_to_code(BAR_TIMEFRAME)
-        csv_file = os.path.join(DATA_DIR, f"{tck}_{tf_code}.csv")
+        csv_file = candle_csv_path(tck, tf_code)
 
         if skip_data:
             if not os.path.exists(csv_file):
@@ -3464,7 +3484,7 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
     TICKERS = tickers_run    
     for ticker in tickers_run:
         tf_code = timeframe_to_code(BAR_TIMEFRAME)
-        csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
+        csv_filename = candle_csv_path(ticker, tf_code)
 
         if not skip_data:
             df = fetch_candles_plus_features_and_predclose(
@@ -3674,13 +3694,13 @@ def console_listener():
                 )
 
                 tf_code = timeframe_to_code(timeframe)
-                csv_filename = os.path.join(DATA_DIR, f"{ticker}_{tf_code}.csv")
+                csv_filename = candle_csv_path(ticker, tf_code)
                 df.to_csv(csv_filename, index=False)
                 logging.info(f"[{ticker}] Saved candle data + advanced features (minus disabled) to {csv_filename}.")
 
         elif cmd == "predict-next":
             tf_code = timeframe_to_code(BAR_TIMEFRAME)
-            csv_filename = os.path.join(DATA_DIR, f"{BACKTEST_TICKER}_{tf_code}.csv")
+            csv_filename = candle_csv_path(BACKTEST_TICKER, tf_code)
             if skip_data:
                 logging.info(f"[{BACKTEST_TICKER}] predict-next -r: Using existing CSV {csv_filename}")
                 if not os.path.exists(csv_filename):
@@ -3830,7 +3850,7 @@ def console_listener():
             #  Prepare / load data ONCE, reused for all logic scripts
             # --------------------------------------------------------------
             tf_code = timeframe_to_code(timeframe_for_backtest)
-            csv_filename = os.path.join(DATA_DIR, f"{BACKTEST_TICKER}_{tf_code}.csv")
+            csv_filename = candle_csv_path(BACKTEST_TICKER, tf_code)
 
             if skip_data:
                 logging.info(
@@ -4751,7 +4771,7 @@ def console_listener():
             # Main per-ticker loop (expects 'ticker' variable to be defined in your outer loop)
             # ──────────────────────────────────────────────────────────────────────────
             tf_code = timeframe_to_code(BAR_TIMEFRAME)
-            csv_file = os.path.join(DATA_DIR, f"{BACKTEST_TICKER}_{tf_code}.csv")
+            csv_file = candle_csv_path(BACKTEST_TICKER, tf_code)
             out_dir  = os.path.join(SAVE_DIR_ROOT, BACKTEST_TICKER)
             os.makedirs(out_dir, exist_ok=True)
 
@@ -4996,14 +5016,14 @@ def console_listener():
                     if ticker_or_all == "all":
                         for ticker in load_tickerlist:
                             logging.info(f"Now training {ticker}...")
-                            csv_path = os.path.join("data", f"{ticker}_{timeframe_to_code(BAR_TIMEFRAME)}.csv")
+                            csv_path = candle_csv_path(ticker, timeframe_to_code(BAR_TIMEFRAME))
                             if not os.path.exists(csv_path):
                                 logging.info(f"CSV '{csv_path}' does not exist. Skipping {ticker}.")
                                 continue
                             df = pd.read_csv(csv_path)
                             call_sub_main(df, -1)
                     else:
-                        csv_path = os.path.join("data", f"{ticker_or_all}_{timeframe_to_code(BAR_TIMEFRAME)}.csv")
+                        csv_path = candle_csv_path(ticker_or_all, timeframe_to_code(BAR_TIMEFRAME))
                         if not os.path.exists(csv_path):
                             logging.info(f"CSV '{csv_path}' does not exist")
                         else:

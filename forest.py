@@ -4302,29 +4302,44 @@ def console_listener():
                             actuals.append(real_close)
                             timestamps.append(row_data["timestamp"])
 
-                            # ───────────────────────────────────────────────────────────
-                            # 5. Trade-simulation block (unchanged)
-                            # ───────────────────────────────────────────────────────────
-                            if action == "BUY"   and position_qty > 0:  action = "NONE"
-                            if action == "SHORT" and position_qty < 0:  action = "NONE"
-                            if action == "SELL"  and position_qty <= 0: action = "NONE"
-                            if action == "COVER" and position_qty >= 0: action = "NONE"
-
+                            # Normalize action based on current position and rules
                             if action == "BUY":
-                                if position_qty < 0:
-                                    pl = (avg_entry_price - real_close) * abs(position_qty)
-                                    cash += pl
-                                    record_trade(
-                                        "COVER",
-                                        row_data["timestamp"],
-                                        abs(position_qty),
-                                        real_close,
-                                        pred_close,
-                                        pl,
-                                    )
-                                    position_qty    = 0
-                                    avg_entry_price = 0.0
+                                if position_qty > 0:
+                                    # 1. Already long: do nothing
+                                    action = "NONE"
+                                elif position_qty < 0:
+                                    # 3. Short exists: treat BUY as COVER (close short only)
+                                    action = "COVER"
 
+                            elif action == "SELL":
+                                if position_qty > 0:
+                                    # 1. Long position: keep SELL to close it
+                                    pass
+                                elif position_qty == 0:
+                                    # 2. Flat and allowed to short: convert SELL to SHORT
+                                    if USE_SHORT:
+                                        action = "SHORT"
+                                    else:
+                                        action = "NONE"
+                                else:  # position_qty < 0
+                                    # 3. Already short: do nothing
+                                    action = "NONE"
+
+                            elif action == "SHORT":
+                                if position_qty != 0:
+                                    # Remove flip logic (no close+short in same step)
+                                    action = "NONE"
+
+                            elif action == "COVER":
+                                if position_qty >= 0:
+                                    # Only valid when actually short
+                                    action = "NONE"
+
+                            # ───────────────────────────────────────────────────────────
+                            # Execute normalized action
+                            # ───────────────────────────────────────────────────────────
+                            if action == "BUY":
+                                # 2. Flat: open a long, buy all possible shares
                                 shares_to_buy = int(cash // real_close)
                                 if shares_to_buy > 0:
                                     position_qty    = shares_to_buy
@@ -4339,6 +4354,7 @@ def console_listener():
                                     )
 
                             elif action == "SELL":
+                                # 1. Long exists: close entire long
                                 if position_qty > 0:
                                     pl = (real_close - avg_entry_price) * position_qty
                                     cash += pl
@@ -4354,34 +4370,23 @@ def console_listener():
                                     avg_entry_price = 0.0
 
                             elif action == "SHORT":
-                                if position_qty > 0:
-                                    pl = (real_close - avg_entry_price) * position_qty
-                                    cash += pl
-                                    record_trade(
-                                        "SELL",
-                                        row_data["timestamp"],
-                                        position_qty,
-                                        real_close,
-                                        pred_close,
-                                        pl,
-                                    )
-                                    position_qty    = 0
-                                    avg_entry_price = 0.0
-
-                                shares_to_short = int(cash // real_close)
-                                if shares_to_short > 0:
-                                    position_qty    = -shares_to_short
-                                    avg_entry_price = real_close
-                                    record_trade(
-                                        "SHORT",
-                                        row_data["timestamp"],
-                                        shares_to_short,
-                                        real_close,
-                                        pred_close,
-                                        None,
-                                    )
+                                # 2. Flat (from SELL when USE_SHORT=True): open full short
+                                if position_qty == 0:
+                                    shares_to_short = int(cash // real_close)
+                                    if shares_to_short > 0:
+                                        position_qty    = -shares_to_short
+                                        avg_entry_price = real_close
+                                        record_trade(
+                                            "SHORT",
+                                            row_data["timestamp"],
+                                            shares_to_short,
+                                            real_close,
+                                            pred_close,
+                                            None,
+                                        )
 
                             elif action == "COVER":
+                                # 3. From BUY when short, or explicit COVER: close entire short
                                 if position_qty < 0:
                                     pl = (avg_entry_price - real_close) * abs(position_qty)
                                     cash += pl

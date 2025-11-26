@@ -192,12 +192,20 @@ REWRITE = config.REWRITE
 
 def limit_df_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Trim DataFrame to keep the most recent ROLLING_CANDLES rows.
-    Assumes df is sorted with oldest first and newest last.
+
+    When a ``timestamp`` column is available, rows are sorted chronologically
+    before trimming so that the newest candles are preserved even if the input
+    ordering changes. Falls back to the original index ordering otherwise.
     """
     if ROLLING_CANDLES > 0 and len(df) > ROLLING_CANDLES:
-        df = df.iloc[-ROLLING_CANDLES:].reset_index(drop=True)
+        if 'timestamp' in df.columns:
+            df = df.copy()
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            df = df.sort_values('timestamp').tail(ROLLING_CANDLES)
+        else:
+            df = df.iloc[-ROLLING_CANDLES:]
+        df = df.reset_index(drop=True)
     return df
-
 
 
 

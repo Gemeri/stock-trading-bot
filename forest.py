@@ -191,10 +191,14 @@ REWRITE = config.REWRITE
 
 
 def limit_df_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Trim DataFrame to last ROLLING_CANDLES rows if limit is set."""
+    """Trim DataFrame to keep the most recent ROLLING_CANDLES rows.
+    Assumes df is sorted with oldest first and newest last.
+    """
     if ROLLING_CANDLES > 0 and len(df) > ROLLING_CANDLES:
         df = df.iloc[-ROLLING_CANDLES:].reset_index(drop=True)
     return df
+
+
 
 
 def read_csv_limited(path: str) -> pd.DataFrame:
@@ -3135,7 +3139,7 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
     # Support either USE_SHORTS or USE_SHORT as the global flag
     use_shorts_enabled = False
     try:
-        use_shorts_enabled = USE_SHORTS
+        use_shorts_enabled = USE_SHORT
     except NameError:
         try:
             use_shorts_enabled = USE_SHORT

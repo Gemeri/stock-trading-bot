@@ -3959,11 +3959,11 @@ def console_listener():
                     and classifier_names & set(ml_models)
                 ):
                     logic_num_str = ",".join(ml_models)
-                    results_dir   = os.path.join("results", logic_num_str)
                 else:
                     match_script  = re.match(r"^logic_(\d+)_", logic_module_name)
                     logic_num_str = match_script.group(1) if match_script else "unknown"
-                    results_dir   = os.path.join("results", logic_num_str)
+
+                results_dir = os.path.join("results", tf_code, logic_num_str)
 
                 os.makedirs(results_dir, exist_ok=True)
 
@@ -4499,7 +4499,7 @@ def console_listener():
 
                 # ---------------- save artefacts ----------------
                 tf_code       = timeframe_to_code(timeframe_for_backtest)
-                results_dir   = os.path.join("results", logic_num_str)
+                results_dir   = os.path.join("results", tf_code, logic_num_str)
                 os.makedirs(results_dir, exist_ok=True)
 
                 # ▸ prediction CSV & plot — only when we *have* predictions

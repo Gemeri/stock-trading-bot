@@ -19,6 +19,10 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils import weight_norm
+try:
+    import config
+except ImportError:
+    print("Not running from script")
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -39,19 +43,39 @@ except Exception:
 
 LOGGER_NAME = __name__
 logger = logging.getLogger(LOGGER_NAME)
-
-BAR_TIMEFRAME = "4Hour"
-CONVERTED_TIMEFRAME = "H4"
+try:
+    BAR_TIMEFRAME = config.BAR_TIMEFRAME
+except Exception:
+    BAR_TIMEFRAME = "4Hour"
+TIMEFRAME_MAP = {
+    "4Hour": "H4", "2Hour": "H2", "1Hour": "H1",
+    "30Min": "M30", "15Min": "M15"
+}
+CONVERTED_TIMEFRAME = TIMEFRAME_MAP.get(BAR_TIMEFRAME, BAR_TIMEFRAME)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, os.pardir))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+DOTA_DIR = os.path.join(os.path.dirname(__file__), "data")
+def timeframe_subdor(tf_code: str) -> str:
+    """Return the directory path for a given timeframe code, creating it if needed."""
+
+    path = os.path.join(DOTA_DIR, tf_code)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def timeframe_subdir(tf_code: str) -> str:
+    """Return the directory path for a given timeframe code, creating it if needed."""
+
+    path = os.path.join(DOTA_DIR, tf_code)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 def get_csv_filename(ticker: str) -> str:
-    rel_path = os.path.join("data", f"{ticker}_H4.csv")
+    rel_path = os.path.join(timeframe_subdor(CONVERTED_TIMEFRAME), f"{ticker}_{CONVERTED_TIMEFRAME}.csv")
     if os.path.exists(rel_path):
         return rel_path
     # Fallback to absolute
-    return os.path.join(DATA_DIR, f"{ticker}_H4.csv")
+    return os.path.join(timeframe_subdir(CONVERTED_TIMEFRAME), f"{ticker}_{CONVERTED_TIMEFRAME}.csv")
 
 
 
@@ -71,31 +95,31 @@ BASE_FEATURES = [
 
 # -------------------- Model / Training defaults (env overridable) ---------------------
 LOOKBACK = int(256)
-ENSEMBLE_SIZE = int(os.getenv("TCN_ENSEMBLE_SIZE", "3"))
-KERNEL_SIZE = int(os.getenv("TCN_KERNEL_SIZE", "5"))
+ENSEMBLE_SIZE = 3
+KERNEL_SIZE = 5
 CHANNELS = [int(x) for x in os.getenv("TCN_CHANNELS", "64,64,64,64,64,64").split(",")]
-DROPOUT = float(os.getenv("TCN_DROPOUT", "0.05"))
+DROPOUT = 0.05
 
 LR = float(os.getenv("TCN_LR", "3e-4"))
 WEIGHT_DECAY = float(os.getenv("TCN_WEIGHT_DECAY", "1e-4"))
-BATCH_SIZE = int(os.getenv("TCN_BATCH_SIZE", "256"))
-EPOCHS = int(os.getenv("TCN_EPOCHS", "80"))
-PATIENCE = int(os.getenv("TCN_PATIENCE", "10"))
-VAL_FRACTION = float(os.getenv("TCN_VAL_FRACTION", "0.15"))
+BATCH_SIZE = 256
+EPOCHS = 80
+PATIENCE = 10
+VAL_FRACTION = 0.15
 
 # Labeling
-ALPHA = float(os.getenv("TCN_ALPHA", "0.25"))   # threshold factor for ATR-normalized move
-ATR_PERIOD = int(os.getenv("TCN_ATR_PERIOD", "14"))
+ALPHA = 0.25
+ATR_PERIOD = 14
 
 # Loss shaping
 USE_FOCAL = os.getenv("TCN_USE_FOCAL", "1") == "1"
-FOCAL_GAMMA = float(os.getenv("TCN_FOCAL_GAMMA", "2.0"))
+FOCAL_GAMMA = 2.0
 USE_RET_WEIGHTS = os.getenv("TCN_USE_RET_WEIGHTS", "1") == "1"
-RET_WEIGHT_POW = float(os.getenv("TCN_RET_WEIGHT_POW", "0.5"))  # sqrt magnitude by default
+RET_WEIGHT_POW = 0.5
 
 # Trading thresholds (defaults; will be overridden by learned adaptive thresholds if available)
-BUY_THRESHOLD = float(os.getenv("TCN_BUY_THRESHOLD", "0.55"))
-SELL_THRESHOLD = float(os.getenv("TCN_SELL_THRESHOLD", "0.45"))
+BUY_THRESHOLD = 0.55
+SELL_THRESHOLD = 0.45
 
 # Paths
 MODEL_ROOT = os.getenv("TCN_MODEL_DIR", "models")

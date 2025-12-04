@@ -1,4 +1,4 @@
-ALPACA_BASE_URL="https://paper-api.alpaca.markets"
+API_BASE_URL="https://paper-api.alpaca.markets"
 ML_MODEL="xgboost"
 SUB_VERSION="beta"
 RUN_SCHEDULE="off"

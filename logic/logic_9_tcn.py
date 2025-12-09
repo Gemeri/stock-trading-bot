@@ -41,6 +41,12 @@ except Exception:
 # Config / Environment
 # --------------------------------------------------------------------------------------
 
+# Replace the path configuration section (lines ~47-67) with this:
+
+# --------------------------------------------------------------------------------------
+# Config / Environment
+# --------------------------------------------------------------------------------------
+
 LOGGER_NAME = __name__
 logger = logging.getLogger(LOGGER_NAME)
 try:
@@ -52,33 +58,21 @@ TIMEFRAME_MAP = {
     "30Min": "M30", "15Min": "M15"
 }
 CONVERTED_TIMEFRAME = TIMEFRAME_MAP.get(BAR_TIMEFRAME, BAR_TIMEFRAME)
+
+# FIXED: Always resolve paths relative to project root, not current working directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, os.pardir))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-DOTA_DIR = "data"
-def timeframe_subdor(tf_code: str) -> str:
-    """Return the directory path for a given timeframe code, creating it if needed."""
-
-    path = os.path.join(DOTA_DIR, tf_code)
-    os.makedirs(path, exist_ok=True)
-    return path
 
 def timeframe_subdir(tf_code: str) -> str:
     """Return the directory path for a given timeframe code, creating it if needed."""
-
-    path = os.path.join(DOTA_DIR, tf_code)
+    path = os.path.join(DATA_DIR, tf_code)
     os.makedirs(path, exist_ok=True)
     return path
 
 def get_csv_filename(ticker: str) -> str:
-    rel_path = os.path.join(timeframe_subdor(CONVERTED_TIMEFRAME), f"{ticker}_{CONVERTED_TIMEFRAME}.csv")
-    if os.path.exists(rel_path):
-        return rel_path
-    # Fallback to absolute
+    """Always returns absolute path to CSV file based on project root."""
     return os.path.join(timeframe_subdir(CONVERTED_TIMEFRAME), f"{ticker}_{CONVERTED_TIMEFRAME}.csv")
-
-
-
 
 # Strict base feature gate (exactly as provided)
 BASE_FEATURES = [

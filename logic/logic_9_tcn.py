@@ -166,11 +166,9 @@ def _scaler_path(ticker: str) -> str:
 def _model_path(ticker: str, idx: int) -> str:
     return os.path.join(_model_dir(ticker), f"tcn_{idx}.pt")
 
-# NEW: countdown file path
 def _countdown_path(ticker: str) -> str:
     return os.path.join(_model_dir(ticker), "countdown.json")
 
-# ===== NEW: countdown helpers =====
 def _load_countdown(ticker: str) -> Dict[str, float]:
     p = _countdown_path(ticker)
     if os.path.exists(p):
@@ -994,6 +992,46 @@ def decide_action(p_up: float, position_qty: float, tau_buy: float, tau_sell: fl
         return "SELL"
     return "NONE"
 
+def decide_action_with_confidence(p_up: float, position_qty: float, tau_buy: float, tau_sell: float) -> Tuple[str, float]:
+    action = decide_action(p_up, position_qty, tau_buy, tau_sell)
+    
+    # Calculate confidence score
+    if action == "BUY":
+        # Confidence based on how much p_up exceeds tau_buy
+        # and how far from neutral (0.5)
+        threshold_confidence = min(1.0, (p_up - tau_buy) / (1.0 - tau_buy + 1e-6))
+        certainty_confidence = abs(p_up - 0.5) * 2  # Distance from neutral
+        # Combine: more weight on threshold clearance
+        confidence = 0.6 * threshold_confidence + 0.4 * certainty_confidence
+        
+    elif action == "SELL":
+        # Confidence based on how much p_up is below tau_sell
+        # and how far from neutral (0.5)
+        threshold_confidence = min(1.0, (tau_sell - p_up) / (tau_sell + 1e-6))
+        certainty_confidence = abs(p_up - 0.5) * 2  # Distance from neutral
+        # Combine: more weight on threshold clearance
+        confidence = 0.6 * threshold_confidence + 0.4 * certainty_confidence
+        
+    else:  # NONE
+        # Low confidence when no action - based on proximity to thresholds
+        dist_to_buy = abs(p_up - tau_buy)
+        dist_to_sell = abs(p_up - tau_sell)
+        min_dist = min(dist_to_buy, dist_to_sell)
+        
+        # If we're far from both thresholds, slightly higher confidence in holding
+        # If we're close to a threshold, lower confidence
+        if position_qty == 0:
+            # Not in position: confidence based on staying out
+            confidence = min(0.5, min_dist * 2)  # Cap at 0.5 for NONE actions
+        else:
+            # In position: confidence based on holding
+            confidence = min(0.5, min_dist * 2)
+    
+    # Ensure confidence is in [0, 1]
+    confidence = float(np.clip(confidence, 0.0, 1.0))
+    
+    return action, confidence
+
 # --------------------------------------------------------------------------------------
 # Public API: run_logic (live trading) & run_backtest
 # --------------------------------------------------------------------------------------
@@ -1066,28 +1104,21 @@ def run_logic(current_price, predicted_price, ticker):
         logger.exception(f"[{key}] run_logic failure: {e}")
 
 
-# ===== Replace run_backtest to use the same countdown cache (walk-forward safe) =====
-def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles, ticker):
-    """
-    Backtest entry point.
-    - Walk-forward: trains only on data <= current_timestamp when countdown triggers.
-    - Between retrains, reuses the cached model (faster).
-    - Countdown shared with live (per ticker+tf) as requested.
-    """
+def run_backtest(current_price, predicted_price, position_qty, current_timestamp, candles, ticker, confidence):
     logger = logging.getLogger(__name__)
     key = _ticker_key(ticker)
 
     try:
         df_full = _load_csv(ticker)
         if df_full.empty:
-            return "NONE"
+            return ("NONE", 0.0) if confidence else "NONE"
 
         ts = _safe_parse_ts(current_timestamp)
 
         # Cleaned subset for prediction window
         df_upto = _fill_and_clean(df_full.loc[df_full["timestamp"] <= ts].copy())
         if df_upto.empty or len(df_upto) < LOOKBACK:
-            return "NONE"
+            return ("NONE", 0.0) if confidence else "NONE"
 
         # Ensure cached models (may retrain if countdown expired)
         artifacts = _ensure_models_cached(ticker, up_to_ts=ts, decrement=True)
@@ -1096,14 +1127,26 @@ def run_backtest(current_price, predicted_price, position_qty, current_timestamp
         win_df = df_upto.tail(LOOKBACK).copy()
         p_up = _predict_p_up(artifacts.models, artifacts.scaler, artifacts.features, win_df, artifacts.temperature)
 
-        action = decide_action(p_up, position_qty, artifacts.buy_threshold, artifacts.sell_threshold)
-        logger.info(f"[{key} BT] ts={ts} | p_up={p_up:.4f} | current_price={current_price} | pos={position_qty} | action={action}")
-        return action
+        if confidence:
+            action, conf_score = decide_action_with_confidence(
+                p_up, position_qty, artifacts.buy_threshold, artifacts.sell_threshold
+            )
+            logger.info(
+                f"[{key} BT] ts={ts} | p_up={p_up:.4f} | current_price={current_price} | "
+                f"pos={position_qty} | action={action} | confidence={conf_score:.4f}"
+            )
+            return action, conf_score
+        else:
+            action = decide_action(p_up, position_qty, artifacts.buy_threshold, artifacts.sell_threshold)
+            logger.info(
+                f"[{key} BT] ts={ts} | p_up={p_up:.4f} | current_price={current_price} | "
+                f"pos={position_qty} | action={action}"
+            )
+            return action
 
     except Exception as e:
         logger.exception(f"[{key}] run_backtest failure: {e}")
-        return "NONE"
-    
+        return ("NONE", 0.0) if confidence else "NONE"
 
 def _read_tickerlist(list_path: str = os.path.join(DATA_DIR, "tickerlist.txt")) -> List[str]:
     """

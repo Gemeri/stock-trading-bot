@@ -2807,7 +2807,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
 
             # ── Run back-test once on full data ───────────────────────────
             try:
-                if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+                if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py" or TRADE_LOGIC == 9 or TRADE_LOGIC == "logic_9_tcn.py":
                     # New signature: return (action, confidence) when confidence=True
                     rb_result = logic_module.run_backtest(
                         current_price     = get_current_price(tck),
@@ -2836,7 +2836,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
             action = rb_result
             confidence_score: float | None = None
 
-            if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+            if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py" or TRADE_LOGIC == 9 or TRADE_LOGIC == "logic_9_tcn.py":
                 # Expected shape: (action, confidence)
                 if isinstance(rb_result, tuple) and len(rb_result) >= 2:
                     action, confidence_score = rb_result[0], rb_result[1]
@@ -2862,7 +2862,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
 
             # Keep tickers with a BUY signal
             if action_str == "BUY":
-                if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+                if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py" or TRADE_LOGIC == 9 or TRADE_LOGIC == "logic_9_tcn.py":
                     # If confidence is missing, treat as 0.0 so it sorts to the bottom.
                     if confidence_score is None or not np.isfinite(confidence_score):
                         confidence_score = 0.0
@@ -2871,7 +2871,7 @@ def select_best_tickers(top_n: int | None = None, skip_data: bool = False) -> li
                     results_plain.append(tck)
 
         # ── Finalise trade-logic selection ───────────────────────────────
-        if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+        if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py" or TRADE_LOGIC == 9 or TRADE_LOGIC == "logic_9_tcn.py":
             if not results_with_conf:
                 logging.info("No tickers produced a BUY signal.")
                 return []
@@ -4307,7 +4307,7 @@ def console_listener():
                             # 3. Call the user’s trading-logic module
                             # ───────────────────────────────────────────────────────────
                             print(logic_module)
-                            if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py":
+                            if TRADE_LOGIC == 25 or TRADE_LOGIC == "logic_25_catmulti.py" or TRADE_LOGIC == 9 or TRADE_LOGIC == "logic_9_tcn.py":
                                 action = logic_module.run_backtest(
                                     current_price = real_close,
                                     predicted_price = pred_close,

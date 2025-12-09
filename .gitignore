@@ -2,6 +2,11 @@
 .env
 /__pycache__
 /logic/__pycache__
-/sub/__pycache__
+/sub-old/__pycache__
+/sub-beta/__pycache__
 /catboost_info
 /*.csv
+*.pyc
+*.pyo
+/catboost-multi
+/models

@@ -175,7 +175,6 @@ def compute_features(
     """
     Build all required features for submodels (leakage-safe).
     - Base features from the tmp CSV (OHLCV + already-computed tech columns)
-    - Leader-based features from QQQ_h4.csv (or a path you pass in)
     - Optional cross-asset RV median from a basket (falls back to asset+leader median)
     """
     df = _ensure_dt_index(df_in.copy())
@@ -250,10 +249,8 @@ def compute_features(
         dn = np.minimum(r1, 0.0)
         df["semivar_dn_20"] = (dn ** 2).rolling(20, min_periods=5).mean()
 
-    # ---------- LEADER-BASED FEATURES (QQQ_h4.csv or custom) ----------
-    # Default path if not provided: sub/data/QQQ_h4.csv
     if leader_csv_path is None:
-        leader_csv_path = os.path.join(os.path.join("data", "H4"), "QQQ_h4.csv")
+        leader_csv_path = os.path.join(os.path.join("data", "H4"), "QQQ_H4.csv")
 
     leader_df = _load_leader_csv(leader_csv_path)
     if leader_df is None:
@@ -411,7 +408,6 @@ def _infer_asset_ticker() -> Optional[str]:
     """
     Priority:
       1) TARGET_TICKER / ASSET_TICKER / TICKER env
-      2) Parse from CSV_PATH filename like 'TSLA_h4.csv' -> 'TSLA'
     """
     for k in ("TARGET_TICKER", "ASSET_TICKER", "TICKER"):
         v = os.getenv(k, "").strip()
@@ -1758,9 +1754,7 @@ def _load_df_from_csv(path: str) -> pd.DataFrame:
         raise FileNotFoundError(f"CSV_PATH not found: {path}")
     base = pd.read_csv(path)
     base = _ensure_dt_index(base)
-
-    # Build technical & leader features (uses default leader at sub/data/QQQ_h4.csv; override via env)
-    leader_path_env = os.path.join(os.path.join("data", "H4"), "QQQ_h4.csv")
+    leader_path_env = os.path.join(os.path.join("data", "H4"), "QQQ_H4.csv")
 
     # Optional extra basket CSVs (comma-separated)
     basket_env = os.getenv("XASSET_BASKET_CSVS", "").strip()

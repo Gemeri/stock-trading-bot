@@ -30,3 +30,4 @@ catboost
 sb3_contrib
 shap
 statsmodels
+polygon-api-client

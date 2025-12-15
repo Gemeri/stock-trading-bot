@@ -715,9 +715,9 @@ def _get_feature_and_target_columns(df: pd.DataFrame) -> tuple[list[str], list[s
 
     return feature_cols, target_cols
 
-def call_sub_main(df, backtest_amount, position_open=False):
+def call_sub_main(ticker, df, backtest_amount, position_open=False):
     if SUB_VERSION == "beta":
-        sub_main_path = os.path.join(os.path.dirname(__file__), "sub", "main.py")
+        sub_main_path = os.path.join(os.path.dirname(__file__), "sub_beta", "main.py")
         spec = importlib.util.spec_from_file_location("sub_main", sub_main_path)
         sub_main = importlib.util.module_from_spec(spec)
         sys.modules["sub_main"] = sub_main
@@ -727,7 +727,7 @@ def call_sub_main(df, backtest_amount, position_open=False):
             csv_path = "_sub_tmp_live.csv"
             df.to_csv(csv_path, index=False)
             sub_main.CSV_PATH = csv_path
-            result = sub_main.run_live("TSLA", return_result=True, position_open=position_open)
+            result = sub_main.run_live(ticker, return_result=True, position_open=position_open)
             os.remove(csv_path)
             return result
         elif backtest_amount == -1:
@@ -741,11 +741,11 @@ def call_sub_main(df, backtest_amount, position_open=False):
             csv_path = "_sub_tmp_backtest.csv"
             df.to_csv(csv_path, index=False)
             sub_main.CSV_PATH = csv_path
-            results_df = sub_main.run_backtest("TSLA", backtest_amount, return_df=True)
+            results_df = sub_main.run_backtest(ticker, backtest_amount, return_df=True)
             os.remove(csv_path)
             return results_df
     else:
-        sub_main_path = os.path.join(os.path.dirname(__file__), "sub", "main.py")
+        sub_main_path = os.path.join(os.path.dirname(__file__), "sub_old", "main.py")
         spec = importlib.util.spec_from_file_location("sub_main", sub_main_path)
         sub_main = importlib.util.module_from_spec(spec)
         sys.modules["sub_main"] = sub_main
@@ -966,15 +966,6 @@ def get_single_model(model_name, input_shape=None, num_features=None, lstm_seq=6
     
 
 TRADE_LOGIC = config.TRADE_LOGIC
-
-MAIN_FEATURES = {
-    "timestamp","open","high","low","close","vwap",
-    "lagged_close_1","lagged_close_2","lagged_close_3","lagged_close_5","lagged_close_10","momentum","obv"
-}
-BASE_FEATURES = {
-    "timestamp","open","high","low","close","volume","vwap","transactions"
-}
-
 SHUTDOWN = False
 
 # -------------------------------
@@ -2184,7 +2175,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                 position_open = abs(pos_qty) > 0
             except Exception:
                 position_open = False
-        result  = call_sub_main(df_full, 0, position_open=position_open)
+        result  = call_sub_main(ticker, df_full, 0, position_open=position_open)
         logging.info(f"Sub-{mode} run_live returned: {result!r}")
 
         # ── decide what we pass back upstream ───────────────────────────────
@@ -4097,7 +4088,7 @@ def console_listener():
 
                     if "sub-vote" in ml_models or "sub-meta" in ml_models:
                         mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
-                        signal_df  = call_sub_main(df, 500)
+                        signal_df  = call_sub_main(BACKTEST_TICKER, df, 500)
 
                         # --- keep only actionable rows and order chronologically ---------------
                         trade_actions = (
@@ -5033,14 +5024,14 @@ def console_listener():
                                 logging.info(f"CSV '{csv_path}' does not exist. Skipping {ticker}.")
                                 continue
                             df = pd.read_csv(csv_path)
-                            call_sub_main(df, -1)
+                            call_sub_main(ticker, df, -1)
                     else:
                         csv_path = candle_csv_path(ticker_or_all, timeframe_to_code(BAR_TIMEFRAME))
                         if not os.path.exists(csv_path):
                             logging.info(f"CSV '{csv_path}' does not exist")
                         else:
                             df = pd.read_csv(csv_path)
-                            call_sub_main(df, -1)
+                            call_sub_main(ticker_or_all, df, -1)
             else:
                 logging.info("This functionality only exists for the beta version")
 
@@ -5076,4 +5067,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

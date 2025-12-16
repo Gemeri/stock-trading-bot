@@ -191,7 +191,6 @@ N_ESTIMATORS = 100
 RANDOM_SEED  = 42
 NY_TZ = pytz.timezone("America/New_York")
 
-NEWS_MODE = config.NEWS_MODE
 REWRITE = config.REWRITE
 
 
@@ -1041,11 +1040,6 @@ def predict_sentiment(text: str):
 # -------------------------------
 # 4b. Dictionary to map TRADE_LOGIC to actual module filenames
 # -------------------------------
-CLASSIFIER_MODELS = {
-    "forest_cls", "xgboost_cls", "lightgbm_cls", "transformer_cls",
-    "sub-vote", "sub_vote", "sub-meta", "sub_meta", "catboost_cls"
-}
-
 def get_logic_dir_and_json():
     logic_dir = "logic"
     json_path = os.path.join(logic_dir, "logic_scripts.json")
@@ -3472,7 +3466,9 @@ def trade_logic(current_price: float, predicted_price: float, ticker: str):
         ml_models = get_ml_models_for_ticker(ticker)
         classifier_stack = {"forest_cls", "xgboost_cls", "lightgbm_cls",
                             "transformer_cls", "sub-vote", "sub_meta",
-                            "sub-meta", "sub_vote", "catboost_cls"}
+                            "sub-meta", "sub_vote", "catboost_cls",
+                            "catboost_multi", "lightgbm_multi",
+                            "xgboost_multi"}
         logic_dir, _ = get_logic_dir_and_json()
 
         # ─── choose module ───────────────────────────────────────────────────
@@ -3716,7 +3712,7 @@ def update_env_variable(key: str, value: str):
 # 13. Additional Commands & Console
 # -------------------------------
 def console_listener():
-    global SHUTDOWN, TICKERS, BAR_TIMEFRAME, N_BARS, NEWS_MODE, TRADE_LOGIC, AI_TICKER_COUNT, AI_TICKERS, USE_FULL_SHARES
+    global SHUTDOWN, TICKERS, BAR_TIMEFRAME, N_BARS, TRADE_LOGIC, AI_TICKER_COUNT, AI_TICKERS, USE_FULL_SHARES
     while not SHUTDOWN:
         cmd_line = sys.stdin.readline().strip()
         if not cmd_line:
@@ -4898,7 +4894,6 @@ def console_listener():
             logging.info("  feature-importance [-r]")
             logging.info("  set-timeframe (timeframe)")
             logging.info("  set-nbars (Number of candles)")
-            logging.info("  set-news (on/off)")
             logging.info("  trade-logic <logic>")
             logging.info("  set-ntickers (Number)")
             logging.info("  ai-tickers")
@@ -4927,18 +4922,6 @@ def console_listener():
                 logging.info(f"Updated N_BARS in memory to {N_BARS}")
             except Exception as e:
                 logging.error(f"Cannot parse set-nbars: {e}")
-
-        elif cmd == "set-news":
-            if len(parts) < 2:
-                logging.info("Usage: set-news on/off")
-                continue
-            new_news = parts[1].lower()
-            if new_news not in ['on','off']:
-                logging.warning("set-news expects 'on' or 'off'.")
-                continue
-            update_env_variable("NEWS_MODE", new_news)
-            NEWS_MODE = new_news
-            logging.info(f"Updated NEWS_MODE in memory to {NEWS_MODE}")
 
         elif cmd == "trade-logic":
             if len(parts) < 2:

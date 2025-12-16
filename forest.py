@@ -30,6 +30,7 @@ from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 from timeframe import TIMEFRAME_SCHEDULE
 import ast
 from sklearn.linear_model import RidgeCV
+from alpaca.trading.enums import OrderSide, TimeInForce
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings(
@@ -38,12 +39,15 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
 from alpaca_trade_api.rest import REST, QuoteV2, APIError
 import lightgbm as lgb
 from sklearn.ensemble import RandomForestClassifier
-from xgboost            import   XGBClassifier
-from lightgbm           import  LGBMClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 from sklearn.calibration import CalibratedClassifierCV
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # LSTM/TF/Keras for deep learning models
 import tensorflow as tf
@@ -116,6 +120,7 @@ TICKERS: list[str] = []
 TICKER_ML_OVERRIDES: dict[str, str] = {}
 SELECTION_MODEL: str | None = None
 
+crypto_client = CryptoHistoricalDataClient()
 
 def timeframe_subdir(tf_code: str) -> str:
     """Return the directory path for a given timeframe code, creating it if needed."""
@@ -1156,68 +1161,106 @@ def fetch_candles(
     timeframe: str | None = None,
     last_timestamp: pd.Timestamp | None = None
 ) -> pd.DataFrame:
-    if not timeframe:
-        timeframe = BAR_TIMEFRAME
+    tf_str = canonical_timeframe(timeframe or BAR_TIMEFRAME)
+
+    ALPACA_TF_MAP: dict[str, TimeFrame] = {
+        "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+        "30Min": TimeFrame(30, TimeFrameUnit.Minute),
+        "1Hour": TimeFrame(1, TimeFrameUnit.Hour),
+        "2Hour": TimeFrame(2, TimeFrameUnit.Hour),
+        "4Hour": TimeFrame(4, TimeFrameUnit.Hour),
+        "1Day":  TimeFrame(1, TimeFrameUnit.Day),
+    }
+
+    is_crypto = "/" in ticker
     end_dt = datetime.now(tz=pytz.utc)
 
-    # -------- determine start date -----------------------------------------
     if last_timestamp is not None:
-        start_dt = (pd.to_datetime(last_timestamp, utc=True) +
-                    timedelta(seconds=1))
+        start_dt = pd.to_datetime(last_timestamp, utc=True).to_pydatetime() + timedelta(seconds=1)
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=pytz.utc)
+        else:
+            start_dt = start_dt.astimezone(pytz.utc)
     else:
-        bars_per_day = get_bars_per_day(timeframe)
+        bars_per_day = get_bars_per_day(tf_str)
         required_days = math.ceil((bars / bars_per_day) * 1.25)
         start_dt = end_dt - timedelta(days=required_days)
 
     logging.info(
-        f"[{ticker}] Fetching up-to-date {timeframe} bars "
+        f"[{ticker}] Fetching up-to-date {tf_str} bars "
         f"from {start_dt.isoformat()} to {end_dt.isoformat()} "
         f"(limit={bars})."
     )
 
     try:
-        barset = api.get_bars(
-            symbol=ticker,
-            timeframe=timeframe,
-            limit=bars,
-            start=start_dt.isoformat(),
-            end=end_dt.isoformat(),
-            adjustment='all',
-            feed='iex'
-        )
+        if is_crypto:
+            if tf_str not in ALPACA_TF_MAP:
+                raise ValueError(f"Unsupported crypto timeframe: {tf_str}")
+
+            request = CryptoBarsRequest(
+                symbol_or_symbols=ticker,
+                timeframe=ALPACA_TF_MAP[tf_str],
+                start=start_dt,
+                end=end_dt,
+                limit=bars
+            )
+            barset = crypto_client.get_crypto_bars(request)
+
+        else:
+            barset = api.get_bars(
+                symbol=ticker,
+                timeframe=tf_str,
+                limit=bars,
+                start=start_dt.isoformat(),
+                end=end_dt.isoformat(),
+                adjustment="all",
+                feed="iex",
+            )
+
     except Exception as e:
         logging.error(f"[{ticker}] Error fetching bars: {e}")
         return pd.DataFrame()
 
     df = pd.DataFrame()
-    if hasattr(barset, 'df'):
+    if hasattr(barset, "df"):
         df = barset.df
+    elif isinstance(barset, (list, tuple)):
+        df = pd.DataFrame(barset)
 
     if df.empty:
-        logging.warning(f"[{ticker}] No data returned from get_bars().")
+        logging.warning(f"[{ticker}] No data returned while fetching bars.")
         return pd.DataFrame()
 
     if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(ticker, level='symbol', drop_level=False)
+        lvl = "symbol" if "symbol" in df.index.names else 0
+        try:
+            df = df.xs(ticker, level=lvl)
+        except Exception:
+            pass
 
     df = df.reset_index()
 
-    # normalise expected columns -------------------------------------------
-    for c in ['timestamp', 'open', 'high', 'low', 'close', 'volume']:
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    else:
+        df["timestamp"] = pd.NaT
+
+    for c in ["open", "high", "low", "close", "volume"]:
         if c not in df.columns:
             df[c] = np.nan
-    if 'vwap' not in df.columns:
-        df['vwap'] = np.nan
-    if 'trade_count' in df.columns:
-        df.rename(columns={'trade_count': 'transactions'}, inplace=True)
-    else:
-        df['transactions'] = np.nan
 
-    final_cols = [
-        'timestamp', 'open', 'high', 'low', 'close',
-        'volume', 'vwap', 'transactions'
-    ]
+    if "vwap" not in df.columns:
+        df["vwap"] = np.nan
+
+    if "trade_count" in df.columns and "transactions" not in df.columns:
+        df.rename(columns={"trade_count": "transactions"}, inplace=True)
+    elif "transactions" not in df.columns:
+        df["transactions"] = np.nan
+
+    final_cols = ["timestamp", "open", "high", "low", "close", "volume", "vwap", "transactions"]
     df = df[final_cols]
+
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
     logging.info(f"[{ticker}] Fetched {len(df)} new bar(s).")
     return df
@@ -1560,13 +1603,17 @@ def fetch_news_sentiments(
         per_request_limit = max(int(articles_per_day), 50)
         page_token = None
         fetched_for_day = 0
-
+        news_symbol = ticker
+        if "/" in ticker:
+            base, quote = ticker.split("/", 1)
+            news_symbol = f"{base}{quote}"
+    # optionally also try base-only fallback: base
         while True:
             params = {
                 "start": start_str,
                 "end": end_str,
                 "sort": "desc",
-                "symbols": ticker,
+                "symbols": news_symbol,
                 "limit": per_request_limit,
                 "include_content": "true",
                 "exclude_contentless": "true",
@@ -3092,6 +3139,7 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
             logging.info("Total Ticker slots 2: %s", total_ticker_slots)
             split_cash = available_cash / total_ticker_slots
             logging.info("Split cash: %s", split_cash)
+            is_crypto = "/" in ticker
             max_shares = (split_cash // buy_price) if USE_FULL_SHARES else (split_cash / buy_price)
             logging.info("Max shares: %s", max_shares)
             final_qty = min(qty, max_shares)
@@ -3099,21 +3147,29 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
             if final_qty <= 0:
                 logging.info("[%s] Not enough split cash to buy any shares. Skipping.", ticker)
                 return
-            if USE_FULL_SHARES:
-                api.submit_order(
-                    symbol=ticker,
-                    qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
-                    side='buy',
-                    type='market',
-                    time_in_force='gtc'
-                )
+            if not is_crypto:
+                if USE_FULL_SHARES:
+                    api.submit_order(
+                        symbol=ticker,
+                        qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
+                        side='buy',
+                        type='market',
+                        time_in_force='gtc'
+                    )
+                else:
+                    api.submit_order(
+                        symbol=ticker,
+                        qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
+                        side='buy',
+                        type='market',
+                        time_in_force='day'
+                    )
             else:
                 api.submit_order(
                     symbol=ticker,
-                    qty=int(final_qty) if USE_FULL_SHARES else round(final_qty, 4),
-                    side='buy',
-                    type='market',
-                    time_in_force='day'
+                    notion=split_cash,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC
                 )
             log_qty = int(final_qty) if USE_FULL_SHARES else round(final_qty, 4)
             logging.info(

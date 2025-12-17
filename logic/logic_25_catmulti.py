@@ -7,7 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import config
-from catboost import CatBoostClassifier
+from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import roc_curve, auc
 
 # =====================================================
@@ -311,6 +311,7 @@ def _train_models_for_timestamp(
             verbose=False
         )
         ages = np.arange(len(X_train)-1, -1, -1)     # oldest gets largest age, newest gets 0
+        HALF_LIFE = 1500
         weights = np.exp(-np.log(2) * ages / HALF_LIFE)
         train_pool = Pool(X_train, y_train, weight=weights)
         model.fit(train_pool)

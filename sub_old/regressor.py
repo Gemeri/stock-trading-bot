@@ -54,22 +54,27 @@ def _as_2d_x(x: np.ndarray) -> np.ndarray:
         x = x.reshape(-1, x.shape[-1])
     return x
 
-def _clean_xy(X: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _clean_xy(X: np.ndarray, Y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
     Drop any rows where X or Y contains NaN/Inf. Ensures Y is 2D.
     """
     X = _as_2d_x(np.asarray(X, dtype=float))
     Y = _ensure_2d_y(np.asarray(Y, dtype=float))
 
+    w = None if sample_weight is None else np.asarray(sample_weight, dtype=float).reshape(-1)
+
     if X.shape[0] != Y.shape[0]:
         n = min(X.shape[0], Y.shape[0])
         X, Y = X[:n], Y[:n]
+        if w is not None:
+            w = w[:n]
 
     x_ok = np.isfinite(X).all(axis=1)
     y_ok = np.isfinite(Y).all(axis=1)
     ok = x_ok & y_ok
     Xc, Yc = X[ok], Y[ok]
-    return Xc, Yc
+    Wc = w[ok] if w is not None else None
+    return Xc, Yc, Wc
 
 def _split_train_val(
     X: np.ndarray,
@@ -77,14 +82,16 @@ def _split_train_val(
     min_train: int = 64,
     val_frac: float = 0.10,
     max_val: int = 200,
-) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    weights: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Robust tail split that guarantees non-empty labels for training.
     If dataset is small, skip validation entirely.
     """
     n = len(X)
+    w = None if weights is None else np.asarray(weights, dtype=float).reshape(-1)[:n]
     if n <= min_train + 1:
-        return X, Y, None, None
+        return X, Y, None, None, w, None
 
     val_size = int(round(val_frac * n))
     val_size = max(1, min(max_val, val_size))
@@ -93,25 +100,29 @@ def _split_train_val(
         val_size = max(1, n - min_train)
 
     if n - val_size < 1 or val_size < 1:
-        return X, Y, None, None
+        return X, Y, None, None, w, None
 
     X_tr, X_val = X[:-val_size], X[-val_size:]
     Y_tr, Y_val = Y[:-val_size], Y[-val_size:]
-    return X_tr, Y_tr, X_val, Y_val
+    W_tr = w[:-val_size] if w is not None else None
+    W_val = w[-val_size:] if w is not None else None
+    return X_tr, Y_tr, X_val, Y_val, W_tr, W_val
 
 
 # ---------- Fit / Predict ----------
-def fit(X_train: np.ndarray, Y_train: np.ndarray):
+def fit(X_train: np.ndarray, Y_train: np.ndarray, sample_weight: Optional[np.ndarray] = None):
     """
     Fit CatBoost regressor on RETURN targets (not levels).
     """
     logging.info("FIT CatBoostRegressor – training on return targets")
 
-    Xc, Yc = _clean_xy(X_train, Y_train)
+    Xc, Yc, Wc = _clean_xy(X_train, Y_train, sample_weight=sample_weight)
     if Xc.shape[0] == 0 or Yc.size == 0 or Yc.shape[0] == 0:
         raise ValueError("Training data is empty after cleaning (no usable labels/rows).")
 
-    X_tr, Y_tr, X_val, Y_val = _split_train_val(Xc, Yc, min_train=64, val_frac=0.10, max_val=200)
+    X_tr, Y_tr, X_val, Y_val, W_tr, W_val = _split_train_val(
+        Xc, Yc, min_train=64, val_frac=0.10, max_val=200, weights=Wc
+    )
 
     multi_output = (Y_tr.ndim == 2 and Y_tr.shape[1] > 1)
     loss = "MultiRMSE" if multi_output else "RMSE"
@@ -128,10 +139,13 @@ def fit(X_train: np.ndarray, Y_train: np.ndarray):
         verbose=False,
     )
 
+    train_pool = Pool(X_tr, Y_tr, weight=W_tr)
+
     if X_val is None:
-        model.fit(Pool(X_tr, Y_tr))
+        model.fit(train_pool)
     else:
-        model.fit(Pool(X_tr, Y_tr), eval_set=Pool(X_val, Y_val), use_best_model=True, early_stopping_rounds=60)
+        eval_pool = Pool(X_val, Y_val, weight=W_val)
+        model.fit(train_pool, eval_set=eval_pool, use_best_model=True, early_stopping_rounds=60)
 
     return model
 

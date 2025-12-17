@@ -45,6 +45,9 @@ MODE = ML_MODEL
 EXECUTION = globals().get("EXECUTION", "backtest")
 QUICK_TEST = False
 
+# Time-decay for training weights (applied to every submodel + meta model)
+HALF_LIFE = float(os.getenv("SUB_HALF_LIFE", "250"))
+
 HISTORY_PATH = os.path.join(RESULTS_DIR, f"submeta_history_{CONVERTED_TIMEFRAME}.csv")
 
 REG_UP, REG_DOWN = 0.3, -0.3  # regression vote mapping → direction (percent units; e.g. 0.3 = +0.3%)
@@ -94,6 +97,13 @@ def expand_channels(submods):
             chans.append({"mod": m, "h": None, "name": m.__name__})
     return chans
 
+
+def _time_decay_weights(n_samples: int, half_life: float = HALF_LIFE) -> np.ndarray:
+    if n_samples <= 0:
+        return np.array([])
+    ages = np.arange(n_samples - 1, -1, -1)
+    return np.exp(-np.log(2) * ages / half_life)
+
 # ---- SVR identification + helpers ------------------------------------------------------
 
 def is_svr_module(module) -> bool:
@@ -114,7 +124,8 @@ def _svr_predict_next_from_slice(df_slice: pd.DataFrame, module) -> float:
     if len(close) == 0:
         return np.nan
     try:
-        bundle = module.fit(close)
+        sw = _time_decay_weights(len(close))
+        bundle = module.fit(close, sample_weight=sw)
         # Append last close to enable next-step window (predict t+1 from window ending at t)
         close_ext = pd.concat([close, pd.Series([float(close.iloc[-1])])], ignore_index=True)
         y_pct = module.predict(bundle, close_ext)
@@ -124,7 +135,8 @@ def _svr_predict_next_from_slice(df_slice: pd.DataFrame, module) -> float:
 
 def _svr_train_on_series(close_series: pd.Series, module):
     close = pd.to_numeric(close_series, errors="coerce").replace([np.inf, -np.inf], np.nan).ffill().bfill()
-    return module.fit(close)
+    sw = _time_decay_weights(len(close))
+    return module.fit(close, sample_weight=sw)
 
 def _svr_predict_next_with_model(bundle, close_series: pd.Series, module) -> float:
     """
@@ -369,7 +381,8 @@ def backtest_submodels(
                         p = 0.5
                     else:
                         last_feats = d[m.FEATURES].iloc[[-1]]
-                        model = m.fit(tr[m.FEATURES].values, tr[label_col_for(m, h)].values, horizon=h)
+                        sw = _time_decay_weights(len(tr))
+                        model = m.fit(tr[m.FEATURES].values, tr[label_col_for(m, h)].values, horizon=h, sample_weight=sw)
                         p = m.predict(model, last_feats)[0]
                     lbl = 1 if df["close"].iat[t + h] > df["close"].iat[t] else 0
                 else:
@@ -378,7 +391,8 @@ def backtest_submodels(
                         p = 0.5
                     else:
                         last_feats = d[m.FEATURES].iloc[[-1]]
-                        model = m.fit(tr[m.FEATURES].values, tr["label"].values)
+                        sw = _time_decay_weights(len(tr))
+                        model = m.fit(tr[m.FEATURES].values, tr["label"].values, sample_weight=sw)
                         p = m.predict(model, last_feats)[0]
                     lbl = 1 if df["close"].iat[t + 1] > df["close"].iat[t] else 0
 
@@ -387,7 +401,8 @@ def backtest_submodels(
                 if len(X_tr) < 50:
                     p = np.nan
                 else:
-                    model = m.fit(X_tr, Y_tr)
+                    sw = _time_decay_weights(len(X_tr))
+                    model = m.fit(X_tr, Y_tr, sample_weight=sw)
                     yhat_multi = m.predict(model, last_feats)[0]  # returns
                     idx = m.MULTI_HORIZONS.index(h)
                     p = float(yhat_multi[idx])
@@ -404,7 +419,8 @@ def backtest_submodels(
                 if len(tr) < 50:
                     p = 0.0
                 else:
-                    model = m.fit(tr[m.FEATURES], tr["target"])
+                    sw = _time_decay_weights(len(tr))
+                    model = m.fit(tr[m.FEATURES], tr["target"], sample_weight=sw)
                     p = float(m.predict(model, last_feats)[0])
                 lbl = 1 if df["close"].iat[t + 1] > df["close"].iat[t] else 0
 
@@ -460,7 +476,7 @@ def walkforward_meta_backtest(cache_csv: str,
         X_train = build_meta_features(hist.iloc[:i], n_mods)
         y_train = hist.loc[:i-1, "meta_label"].values
 
-        meta = make_meta_model().fit(X_train, y_train)
+        meta = make_meta_model().fit(X_train, y_train, sample_weight=_time_decay_weights(len(y_train)))
 
         split_val = max(1, int(len(y_train) * 0.2))
         probs_val = meta.predict_proba(X_train[-split_val:])[:, 1]
@@ -582,7 +598,8 @@ def quick_test(df: pd.DataFrame, initial_frac: float = 0.6, return_df: bool = Fa
 
             X_tr = tr[feat_cols].values
             y_tr = tr[lbl_col].astype(int).values
-            model = m.fit(X_tr, y_tr, horizon=h) if h is not None else m.fit(X_tr, y_tr)
+            sw = _time_decay_weights(len(y_tr))
+            model = m.fit(X_tr, y_tr, horizon=h, sample_weight=sw) if h is not None else m.fit(X_tr, y_tr, sample_weight=sw)
 
             dv = d.loc[va_idx, feat_cols]
             mask = np.isfinite(dv.values).all(axis=1)
@@ -609,7 +626,8 @@ def quick_test(df: pd.DataFrame, initial_frac: float = 0.6, return_df: bool = Fa
 
             X_tr = tr_all[feat_cols].values
             Y_tr = tr_all[[f"target_h{int(hh)}" for hh in m.MULTI_HORIZONS]].values
-            model = m.fit(X_tr, Y_tr)
+            sw = _time_decay_weights(len(X_tr))
+            model = m.fit(X_tr, Y_tr, sample_weight=sw)
 
             dv = d.loc[va_idx, feat_cols]
             mask = np.isfinite(dv.values).all(axis=1)
@@ -677,7 +695,7 @@ def quick_test(df: pd.DataFrame, initial_frac: float = 0.6, return_df: bool = Fa
     X_tr, y_tr = X[:split_b], y[:split_b]
     X_te, y_te = X[split_b:], y[split_b:]
 
-    meta = make_meta_model().fit(X_tr, y_tr)
+    meta = make_meta_model().fit(X_tr, y_tr, sample_weight=_time_decay_weights(len(y_tr)))
     p_tr = meta.predict_proba(X_tr)[:, 1]
     p_te = meta.predict_proba(X_te)[:, 1]
 
@@ -812,7 +830,8 @@ def _recompute_missing_columns_on_existing_rows(
                             p = 0.5
                         else:
                             last_feats = d[m.FEATURES].iloc[[-1]]
-                            model = m.fit(X_tr, y_tr, horizon=int(h))
+                            sw = _time_decay_weights(len(y_tr))
+                            model = m.fit(X_tr, y_tr, horizon=int(h), sample_weight=sw)
                             p = float(m.predict(model, last_feats)[0])
                     else:
                         X_tr, y_tr = prepare_train(slc, m)
@@ -820,7 +839,8 @@ def _recompute_missing_columns_on_existing_rows(
                             p = 0.5
                         else:
                             last_feats = d[m.FEATURES].iloc[[-1]]
-                            model = m.fit(X_tr, y_tr)
+                            sw = _time_decay_weights(len(y_tr))
+                            model = m.fit(X_tr, y_tr, sample_weight=sw)
                             p = float(m.predict(model, last_feats)[0])
 
                 elif hasattr(m, "compute_targets"):  # regression (RETURNS)
@@ -828,7 +848,8 @@ def _recompute_missing_columns_on_existing_rows(
                     if len(X_tr) < 50:
                         p = np.nan
                     else:
-                        model = m.fit(X_tr, Y_tr)
+                        sw = _time_decay_weights(len(X_tr))
+                        model = m.fit(X_tr, Y_tr, sample_weight=sw)
                         yhat_multi = m.predict(model, last_feats)[0]
                         idx_h = m.MULTI_HORIZONS.index(int(h))
                         p = float(yhat_multi[idx_h])
@@ -843,7 +864,8 @@ def _recompute_missing_columns_on_existing_rows(
                     if len(tr) < 50:
                         p = 0.0
                     else:
-                        model = m.fit(tr[m.FEATURES], tr["target"])
+                        sw = _time_decay_weights(len(tr))
+                        model = m.fit(tr[m.FEATURES], tr["target"], sample_weight=sw)
                         p = float(m.predict(model, last_feats)[0])
 
                 preds.append(p)
@@ -1020,7 +1042,8 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
                             p = 0.5
                         else:
                             last_feats = d[m.FEATURES].iloc[[-1]]
-                            model = m.fit(X_tr, y_tr, horizon=int(h))
+                            sw = _time_decay_weights(len(y_tr))
+                            model = m.fit(X_tr, y_tr, horizon=int(h), sample_weight=sw)
                             p = float(m.predict(model, last_feats)[0])
                         lbl = int(df["close"].iat[i + int(h)] > df["close"].iat[i])
                     else:
@@ -1029,7 +1052,8 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
                             p = 0.5
                         else:
                             last_feats = d[m.FEATURES].iloc[[-1]]
-                            model = m.fit(X_tr, y_tr)
+                            sw = _time_decay_weights(len(y_tr))
+                            model = m.fit(X_tr, y_tr, sample_weight=sw)
                             p = float(m.predict(model, last_feats)[0])
                         lbl = int(df["close"].iat[i + 1] > df["close"].iat[i])
 
@@ -1038,7 +1062,8 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
                     if len(X_tr) < 50:
                         p = np.nan
                     else:
-                        model = m.fit(X_tr, Y_tr)
+                        sw = _time_decay_weights(len(X_tr))
+                        model = m.fit(X_tr, Y_tr, sample_weight=sw)
                         yhat_multi = m.predict(model, last_feats)[0]
                         idx_h = m.MULTI_HORIZONS.index(int(h))
                         p = float(yhat_multi[idx_h])
@@ -1055,7 +1080,8 @@ def update_submeta_history(CSV_PATH, HISTORY_PATH,
                     if len(tr) < 50:
                         p = 0.0
                     else:
-                        model = m.fit(tr[m.FEATURES], tr["target"])
+                        sw = _time_decay_weights(len(tr))
+                        model = m.fit(tr[m.FEATURES], tr["target"], sample_weight=sw)
                         p = float(m.predict(model, last_feats)[0])
                     lbl = int(d["target"].iloc[-1] > 0)
 
@@ -1124,7 +1150,7 @@ def train_and_save_meta(cache_csv: str,
     X_val, y_val = X[split:], y[split:]
 
     meta = make_meta_model()
-    meta.fit(X_tr, y_tr)
+    meta.fit(X_tr, y_tr, sample_weight=_time_decay_weights(len(y_tr)))
 
     probs_val = meta.predict_proba(X_val)[:, 1]
     up, down = optimize_asymmetric_thresholds(probs_val, y_val, metric=metric)
@@ -1208,7 +1234,7 @@ def run_backtest(return_df: bool = False, start_open: bool = False):
             y = back["meta_label"].values.astype(int)
             split = int(len(y) * 0.6)
             if split >= 50:
-                meta_tmp = make_meta_model().fit(X[:split], y[:split])
+                meta_tmp = make_meta_model().fit(X[:split], y[:split], sample_weight=_time_decay_weights(len(y[:split])))
                 _save_shap_report(X[split:], y[split:], meta_tmp, get_meta_feature_names(back, k), FEATURE_ANALYTICS_DIR, tag="subvote_snapshot")
         except Exception as e:
             print(f"[FEATURE-ANALYTICS] (sub-vote backtest) Failed to write SHAP snapshot: {e}")
@@ -1299,21 +1325,24 @@ def run_live(return_result: bool = True, position_open: bool = False):
                     X_tr, y_tr = prepare_train_for_horizon(df, m, h)
                     if len(y_tr) < 50:
                         preds.append(0.5); continue
-                    model = m.fit(X_tr, y_tr, horizon=h)
+                    sw = _time_decay_weights(len(y_tr))
+                    model = m.fit(X_tr, y_tr, horizon=h, sample_weight=sw)
                     feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
                     preds.append(m.predict(model, feats)[0])
                 else:
                     X_tr, y_tr = prepare_train(df, m)
                     if len(y_tr) < 50:
                         preds.append(0.5); continue
-                    model = m.fit(X_tr, y_tr)
+                    sw = _time_decay_weights(len(y_tr))
+                    model = m.fit(X_tr, y_tr, sample_weight=sw)
                     feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
                     preds.append(m.predict(model, feats)[0])
             elif hasattr(m, "compute_targets"):  # regression (RETURNS)
                 X_tr, Y_tr, last_feats = prepare_train_regression_multi(df, m)
                 if len(X_tr) < 50:
                     preds.append(np.nan); continue
-                model = m.fit(X_tr, Y_tr)
+                sw = _time_decay_weights(len(X_tr))
+                model = m.fit(X_tr, Y_tr, sample_weight=sw)
                 yhat_multi = m.predict(model, last_feats)[0]
                 idx = m.MULTI_HORIZONS.index(h)
                 preds.append(float(yhat_multi[idx]))
@@ -1322,7 +1351,8 @@ def run_live(return_result: bool = True, position_open: bool = False):
                 preds.append(p)
             else:
                 X_tr, y_tr = prepare_train(df, m)
-                model = m.fit(X_tr, y_tr)
+                sw = _time_decay_weights(len(y_tr))
+                model = m.fit(X_tr, y_tr, sample_weight=sw)
                 feats = row(df, m, t)
                 preds.append(m.predict(model, feats)[0])
 
@@ -1378,7 +1408,8 @@ def run_live(return_result: bool = True, position_open: bool = False):
                 if len(y_tr) < 50:
                     p = 0.5
                 else:
-                    model = m.fit(X_tr, y_tr, horizon=h)
+                    sw = _time_decay_weights(len(y_tr))
+                    model = m.fit(X_tr, y_tr, horizon=h, sample_weight=sw)
                     feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
                     p = m.predict(model, feats)[0]
             else:
@@ -1386,7 +1417,8 @@ def run_live(return_result: bool = True, position_open: bool = False):
                 if len(y_tr) < 50:
                     p = 0.5
                 else:
-                    model = m.fit(X_tr, y_tr)
+                    sw = _time_decay_weights(len(y_tr))
+                    model = m.fit(X_tr, y_tr, sample_weight=sw)
                     feats = m.compute_labels(df)[m.FEATURES].iloc[[t]]
                     p = m.predict(model, feats)[0]
             current_probs.append(float(p))
@@ -1395,7 +1427,8 @@ def run_live(return_result: bool = True, position_open: bool = False):
             if len(X_tr) < 50:
                 p = np.nan
             else:
-                model = m.fit(X_tr, Y_tr)
+                sw = _time_decay_weights(len(X_tr))
+                model = m.fit(X_tr, Y_tr, sample_weight=sw)
                 yhat_multi = m.predict(model, last_feats)[0]
                 idx = m.MULTI_HORIZONS.index(h)
                 p = float(yhat_multi[idx])  # return
@@ -1405,7 +1438,8 @@ def run_live(return_result: bool = True, position_open: bool = False):
             current_probs.append(float(p))
         else:
             X_tr, y_tr = prepare_train(df, m)
-            model = m.fit(X_tr, y_tr)
+            sw = _time_decay_weights(len(y_tr))
+            model = m.fit(X_tr, y_tr, sample_weight=sw)
             feats = row(df, m, t)
             p = float(m.predict(model, feats)[0])
             current_probs.append(p)

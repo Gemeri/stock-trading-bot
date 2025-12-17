@@ -50,14 +50,14 @@ def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
     d["label"] = lab
     return d.reset_index(drop=True)
 
-def fit(X: np.ndarray, y: np.ndarray):
+def fit(X: np.ndarray, y: np.ndarray, sample_weight: np.ndarray | None = None):
     base = RandomForestClassifier(
         n_estimators=400, max_depth=8, min_samples_leaf=5,
         max_features="sqrt", n_jobs=-1, random_state=42, class_weight="balanced"
     )
     splitter = PurgedTimeSeriesCV(n_splits=5, gap=1)
     model = CalibratedClassifierCV(base, method="isotonic", cv=splitter, n_jobs=-1)
-    model.fit(X,y)
+    model.fit(X, y, sample_weight=sample_weight)
     return model
 
 def predict(model, X: np.ndarray) -> np.ndarray:

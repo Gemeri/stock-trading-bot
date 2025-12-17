@@ -13,6 +13,7 @@ load_dotenv()
 def get_csv_filename(ticker):
     return tools.get_csv_filename(ticker)
 
+CONVERTED_TIMEFRAME = tools.CONVERTED_TIMEFRAME
 # --- Logging ---
 LOGGER = logging.getLogger("logic_ga_rl")
 LOGGER.setLevel(logging.INFO)
@@ -21,6 +22,9 @@ if not LOGGER.handlers:
     formatter = logging.Formatter("[%(levelname)s][%(asctime)s] %(message)s")
     ch.setFormatter(formatter)
     LOGGER.addHandler(ch)
+
+GA_MODEL_PATH = "_GA_MODEL.pkl"
+RL_MODEL_PATH = "_RL_MODEL.pkl"
 
 # ------------------------------------------------------------------------
 # Genetic Algorithm Section

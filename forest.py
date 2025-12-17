@@ -2161,15 +2161,15 @@ def _fit_base_classifiers(
     pos_weight = ((len(y_bin) - y_bin.sum()) / y_bin.sum()) if y_bin.sum() else 1.0
 
     # ── tree models ────────────────────────────────────────────────────────
-        if "forest_cls" in model_names:
-            rf_raw = RandomForestClassifier(
-                n_estimators=400,          # a bit deeper
-                max_depth=None,
-                min_samples_leaf=5,
-                class_weight="balanced_subsample",
-                random_state=RANDOM_SEED,
-            )
-            models["forest_cls"] = make_pipeline(rf_raw).fit(X_scaled, y_bin, sample_weight=add_weights(len(X_scaled)))
+    if "forest_cls" in model_names:
+        rf_raw = RandomForestClassifier(
+            n_estimators=400,          # a bit deeper
+            max_depth=None,
+            min_samples_leaf=5,
+            class_weight="balanced_subsample",
+            random_state=RANDOM_SEED,
+        )
+        models["forest_cls"] = make_pipeline(rf_raw).fit(X_scaled, y_bin, sample_weight=add_weights(len(X_scaled)))
 
     # ▸ xgboost
     if "xgboost_cls" in model_names:
@@ -2672,7 +2672,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
             verbose=0,
             validation_split=0.18,
             callbacks=[es, cp],
-            add_weights(len(X_lstm_win))
+            sample_weight=add_weights(len(X_lstm_win))
         )
         lstm_model.load_weights("lstm_best_model.keras")
         last_seq = X_lstm_np[-seq_len:,:].reshape(1,seq_len,-1)
@@ -5226,4 +5226,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

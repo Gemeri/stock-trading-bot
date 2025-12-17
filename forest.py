@@ -149,6 +149,7 @@ def fs_safe_ticker(ticker: str) -> str:
 
     return s
 
+HALF_LIFE = 1500
 def add_weights(n_samples: int) -> np.ndarray:
     ages = np.arange(n_samples - 1, -1, -1)
     return np.exp(-np.log(2) * ages / HALF_LIFE)
@@ -5226,3 +5227,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

@@ -4247,7 +4247,7 @@ def console_listener():
                                 )
                             else:
                                 continue
-                            mdl.fit(X_train, y_train, sample_weights=add_weights(len(X_train)))
+                            mdl.fit(X_train, y_train, sample_weight=add_weights(len(X_train)))
                             model_stack.append(mdl)
 
                         if not model_stack:

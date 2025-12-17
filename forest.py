@@ -122,6 +122,33 @@ SELECTION_MODEL: str | None = None
 
 crypto_client = CryptoHistoricalDataClient()
 
+_WINDOWS_RESERVED = {
+    "CON","PRN","AUX","NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+def fs_safe_ticker(ticker: str) -> str:
+    s = (ticker or "").strip()
+
+    # Common pairs: BTC/USD -> BTC-USD
+    s = s.replace("/", "-").replace("\\", "-")
+
+    # Replace any remaining illegal Windows filename chars + control chars
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", s)
+
+    # Windows can't end filenames with dot or space
+    s = s.rstrip(" .")
+
+    if not s:
+        s = "UNKNOWN"
+
+    # Avoid reserved device names
+    if s.upper() in _WINDOWS_RESERVED:
+        s = "_" + s
+
+    return s
+
 def timeframe_subdir(tf_code: str) -> str:
     """Return the directory path for a given timeframe code, creating it if needed."""
 
@@ -193,35 +220,74 @@ NY_TZ = pytz.timezone("America/New_York")
 
 REWRITE = config.REWRITE
 
+def normalize_timestamp_utc(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
+    """
+    Ensure df[col] is timezone-aware UTC datetime, and remove unparseable timestamps.
+    This prevents tz-mixed sorting bugs and NaT rows accidentally surviving rolling trims.
+    """
+    if df is None or df.empty or col not in df.columns:
+        return df if df is not None else pd.DataFrame()
+
+    df = df.copy()
+    df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+    df = df[df[col].notna()]
+    return df
+
 
 def limit_df_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Trim DataFrame to keep the most recent ROLLING_CANDLES rows.
-
-    When a ``timestamp`` column is available, rows are sorted chronologically
-    before trimming so that the newest candles are preserved even if the input
-    ordering changes. Falls back to the original index ordering otherwise.
     """
-    if ROLLING_CANDLES > 0 and len(df) > ROLLING_CANDLES:
-        if 'timestamp' in df.columns:
-            df = df.copy()
-            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-            df = df.sort_values('timestamp').tail(ROLLING_CANDLES)
-        else:
+    Trim DataFrame to keep the most recent ROLLING_CANDLES rows.
+
+    Key guarantees:
+    - timestamps are normalized to UTC (prevents tz-aware/naive ordering bugs)
+    - duplicates on timestamp keep the *latest* row (prevents old candle overwriting new)
+    - rolling keeps the newest timestamps
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+
+    if ROLLING_CANDLES <= 0:
+        # Still normalize + dedupe for correctness, but do not trim.
+        if "timestamp" in df.columns:
+            df = normalize_timestamp_utc(df, "timestamp")
+            df = df.sort_values("timestamp", kind="mergesort")
+            df = df.drop_duplicates(subset=["timestamp"], keep="last")
+        return df.reset_index(drop=True)
+
+    if len(df) <= ROLLING_CANDLES:
+        # Still normalize + dedupe to avoid future issues.
+        if "timestamp" in df.columns:
+            df = normalize_timestamp_utc(df, "timestamp")
+            df = df.sort_values("timestamp", kind="mergesort")
+            df = df.drop_duplicates(subset=["timestamp"], keep="last")
+        return df.reset_index(drop=True)
+
+    df = df.copy()
+    if "timestamp" in df.columns:
+        df = normalize_timestamp_utc(df, "timestamp")
+        df = df.sort_values("timestamp", kind="mergesort")
+        df = df.drop_duplicates(subset=["timestamp"], keep="last")
+
+        if len(df) > ROLLING_CANDLES:
             df = df.iloc[-ROLLING_CANDLES:]
-        df = df.reset_index(drop=True)
-    return df
+    else:
+        df = df.iloc[-ROLLING_CANDLES:]
+
+    return df.reset_index(drop=True)
 
 
 
 def read_csv_limited(path: str) -> pd.DataFrame:
-    """Read a CSV and apply rolling candle limit."""
+    """Read a CSV and apply rolling candle limit (with UTC timestamp normalization)."""
     try:
         df = pd.read_csv(path)
     except Exception as e:
         logging.error(f"Error reading CSV {path}: {e}")
         return pd.DataFrame()
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+    if "timestamp" in df.columns:
+        df = normalize_timestamp_utc(df, "timestamp")
+
     return limit_df_rows(df)
 
 def _load_primary_greed_series() -> pd.DataFrame:
@@ -410,11 +476,13 @@ def _load_alt_greed_map() -> dict:
     return {d: float(np.mean(vals)) for d, vals in day_to_vals.items()}
 
 
-def attach_greed_index(df_existing: pd.DataFrame, df_new: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def attach_greed_index(ticker, df_existing: pd.DataFrame, df_new: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Attach greed_index feature to candle data using multiple data sources.
 
     Uses CNN time series when available; falls back to local CSV (by date) and then
     Alternative.me (JSON) daily values keyed by date. Forward-fills across gaps.
+
+    If ticker contains '/', only Alternative.me (_load_alt_greed_map) is used.
     """
     if (df_existing is None or df_existing.empty) and (df_new is None or df_new.empty):
         return df_existing, df_new
@@ -434,53 +502,77 @@ def attach_greed_index(df_existing: pd.DataFrame, df_new: pd.DataFrame) -> tuple
     if timestamps.empty:
         return df_existing, df_new
 
-    primary_df = _load_primary_greed_series()
-    if not primary_df.empty:
-        primary_df = primary_df[primary_df['timestamp'] >= timestamps.iloc[0]].reset_index(drop=True)
-
-    primary_times = primary_df['timestamp'].tolist() if not primary_df.empty else []
-    primary_values = primary_df['value'].tolist() if not primary_df.empty else []
-    primary_idx = 0
-
-    local_map = _load_local_greed_map()
-    alt_map = None
+    use_alt_only = isinstance(ticker, str) and ('/' in ticker)
 
     greed_mapping: dict[pd.Timestamp, float] = {}
-    prev_ts: pd.Timestamp | None = None
     last_value: float | None = None
 
-    for ts in timestamps:
-        interval_values: list[float] = []
-        while primary_idx < len(primary_times) and primary_times[primary_idx] <= ts:
-            candidate_time = primary_times[primary_idx]
-            candidate_value = primary_values[primary_idx]
-            if (prev_ts is None or candidate_time > prev_ts) and pd.notna(candidate_value):
-                interval_values.append(float(candidate_value))
-            primary_idx += 1
+    if use_alt_only:
+        alt_map = _load_alt_greed_map()
 
-        value: float | None = None
-        if interval_values:
-            value = float(np.mean(interval_values))
-        else:
+        for ts in timestamps:
+            value: float | None = None
             date_key = ts.date()
-            fallback = local_map.get(date_key)
-            if fallback is None:
-                if alt_map is None:
-                    alt_map = _load_alt_greed_map()
-                fallback = alt_map.get(date_key) if alt_map else None
+            fallback = alt_map.get(date_key) if alt_map else None
+
             if fallback is not None and pd.notna(fallback):
                 try:
                     value = float(fallback)
                 except (TypeError, ValueError):
                     value = None
 
-        if value is None and last_value is not None:
-            value = last_value
+            if value is None and last_value is not None:
+                value = last_value
 
-        greed_mapping[ts] = float(value) if value is not None else np.nan
-        if value is not None:
-            last_value = value
-        prev_ts = ts
+            greed_mapping[ts] = float(value) if value is not None else np.nan
+            if value is not None:
+                last_value = value
+    else:
+        primary_df = _load_primary_greed_series()
+        if not primary_df.empty:
+            primary_df = primary_df[primary_df['timestamp'] >= timestamps.iloc[0]].reset_index(drop=True)
+
+        primary_times = primary_df['timestamp'].tolist() if not primary_df.empty else []
+        primary_values = primary_df['value'].tolist() if not primary_df.empty else []
+        primary_idx = 0
+
+        local_map = _load_local_greed_map()
+        alt_map = None
+
+        prev_ts: pd.Timestamp | None = None
+
+        for ts in timestamps:
+            interval_values: list[float] = []
+            while primary_idx < len(primary_times) and primary_times[primary_idx] <= ts:
+                candidate_time = primary_times[primary_idx]
+                candidate_value = primary_values[primary_idx]
+                if (prev_ts is None or candidate_time > prev_ts) and pd.notna(candidate_value):
+                    interval_values.append(float(candidate_value))
+                primary_idx += 1
+
+            value: float | None = None
+            if interval_values:
+                value = float(np.mean(interval_values))
+            else:
+                date_key = ts.date()
+                fallback = local_map.get(date_key)
+                if fallback is None:
+                    if alt_map is None:
+                        alt_map = _load_alt_greed_map()
+                    fallback = alt_map.get(date_key) if alt_map else None
+                if fallback is not None and pd.notna(fallback):
+                    try:
+                        value = float(fallback)
+                    except (TypeError, ValueError):
+                        value = None
+
+            if value is None and last_value is not None:
+                value = last_value
+
+            greed_mapping[ts] = float(value) if value is not None else np.nan
+            if value is not None:
+                last_value = value
+            prev_ts = ts
 
     if df_existing is not None and not df_existing.empty and 'timestamp' in df_existing.columns:
         df_existing['greed_index'] = df_existing['timestamp'].map(greed_mapping)
@@ -488,6 +580,7 @@ def attach_greed_index(df_existing: pd.DataFrame, df_new: pd.DataFrame) -> tuple
         df_new['greed_index'] = df_new['timestamp'].map(greed_mapping)
 
     return df_existing, df_new
+
 
 def _timestamp_to_str(value):
     if value is None:
@@ -1190,7 +1283,6 @@ def fetch_candles(
         if is_crypto:
             if tf_str not in ALPACA_TF_MAP:
                 raise ValueError(f"Unsupported crypto timeframe: {tf_str}")
-
             request = CryptoBarsRequest(
                 symbol_or_symbols=ticker,
                 timeframe=ALPACA_TF_MAP[tf_str],
@@ -1266,32 +1358,43 @@ def fetch_candles_plus_features_and_predclose(
     rewrite_mode: str
 ) -> pd.DataFrame:
     tf_code       = timeframe_to_code(timeframe)
-    csv_filename  = candle_csv_path(ticker, tf_code)
-    sentiment_csv = sentiment_csv_path(ticker, tf_code)
+    ticker_fs     = fs_safe_ticker(ticker)
+    csv_filename  = candle_csv_path(ticker_fs, tf_code)
+    sentiment_csv = sentiment_csv_path(ticker_fs, tf_code)
 
     def get_features(df: pd.DataFrame):
-        exclude = {'predicted_close'}
+        exclude = {"predicted_close"}
         return [c for c in POSSIBLE_FEATURE_COLS if c in df.columns and c not in exclude]
-    
 
     # ───── 1. load historical CSV (if present & not rewriting) ─────────────
     if rewrite_mode == "off" and os.path.exists(csv_filename):
         try:
             df_existing = read_csv_limited(csv_filename)
-            last_ts = df_existing['timestamp'].max()
-            if pd.notna(last_ts) and last_ts.tzinfo is None:
-                last_ts = last_ts.tz_localize('UTC')
+            if not df_existing.empty and "timestamp" in df_existing.columns:
+                df_existing = normalize_timestamp_utc(df_existing, "timestamp")
+                last_ts = df_existing["timestamp"].max()
+                if pd.isna(last_ts):
+                    last_ts = None
+                else:
+                    # Ensure UTC
+                    last_ts = pd.Timestamp(last_ts)
+                    if last_ts.tzinfo is None:
+                        last_ts = last_ts.tz_localize("UTC")
+                    else:
+                        last_ts = last_ts.tz_convert("UTC")
+            else:
+                last_ts = None
         except Exception as e:
             logging.error(f"[{ticker}] Problem loading old CSV: {e}")
             df_existing = pd.DataFrame()
             last_ts = None
     else:
         df_existing = pd.DataFrame()
-        last_ts     = None
+        last_ts = None
 
     first_missing_pred_idx = None
-    if 'predicted_close' in df_existing.columns:
-        na_mask = df_existing['predicted_close'].isna().to_numpy()
+    if "predicted_close" in df_existing.columns:
+        na_mask = df_existing["predicted_close"].isna().to_numpy()
         if na_mask.any():
             first_missing_pred_idx = int(np.argmax(na_mask))
 
@@ -1329,12 +1432,12 @@ def fetch_candles_plus_features_and_predclose(
         return df_existing.copy()
 
     # normalize timestamps only if we actually have new rows
-    if has_new:
-        df_candles_new['timestamp'] = pd.to_datetime(df_candles_new['timestamp'], utc=True)
+    if has_new and "timestamp" in df_candles_new.columns:
+        df_candles_new = normalize_timestamp_utc(df_candles_new, "timestamp")
 
     # if we do have new rows, keep only those newer than last_ts
-    if has_new and last_ts is not None:
-        df_candles_new = df_candles_new[df_candles_new['timestamp'] > last_ts]
+    if has_new and last_ts is not None and "timestamp" in df_candles_new.columns:
+        df_candles_new = df_candles_new[df_candles_new["timestamp"] > last_ts]
         has_new = not df_candles_new.empty
         if not has_new and not is_backfill_only:
             logging.info(f"[{ticker}] No candles newer than {last_ts}.")
@@ -1342,40 +1445,46 @@ def fetch_candles_plus_features_and_predclose(
 
     if has_new or is_backfill_only:
         try:
-            df_existing, df_candles_new = attach_greed_index(df_existing, df_candles_new)
+            df_existing, df_candles_new = attach_greed_index(ticker, df_existing, df_candles_new)
         except Exception as e:
             logging.error(f"[{ticker}] Failed to attach greed index feature: {e}")
 
-    df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment', 'news_count'])
+    df_sent_old = pd.DataFrame(columns=["timestamp", "sentiment", "news_count"])
     last_sentiment_known = None
     if os.path.exists(sentiment_csv):
         try:
-            df_sent_old = pd.read_csv(sentiment_csv, parse_dates=['timestamp'])
-            if 'sentiment' in df_sent_old.columns:
-                df_sent_old['sentiment'] = pd.to_numeric(df_sent_old['sentiment'], errors='coerce')
-                series = df_sent_old['sentiment'].dropna()
+            df_sent_old = pd.read_csv(sentiment_csv, parse_dates=["timestamp"])
+            if "timestamp" in df_sent_old.columns:
+                df_sent_old = normalize_timestamp_utc(df_sent_old, "timestamp")
+
+            if "sentiment" in df_sent_old.columns:
+                df_sent_old["sentiment"] = pd.to_numeric(df_sent_old["sentiment"], errors="coerce")
+                series = df_sent_old["sentiment"].dropna()
                 if not series.empty:
                     last_sentiment_known = float(series.iloc[-1])
         except Exception as e:
             logging.error(f"[{ticker}] Problem loading old sentiment CSV: {e}")
-            df_sent_old = pd.DataFrame(columns=['timestamp', 'sentiment', 'news_count'])
+            df_sent_old = pd.DataFrame(columns=["timestamp", "sentiment", "news_count"])
 
     # ───── 4) attach incremental sentiment only when adding new candles ─────
     if has_new:
         if last_ts is not None:
-            news_days = 1; start_dt = last_ts
+            news_days = 1
+            start_dt = last_ts
         else:
-            news_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650); start_dt = None
+            news_days = NUM_DAYS_MAPPING.get(BAR_TIMEFRAME, 1650)
+            start_dt = None
 
         articles_per_day = ARTICLES_PER_DAY_MAPPING.get(BAR_TIMEFRAME, 1)
         candle_days: set[date] = set()
-        for ts in df_candles_new['timestamp']:
+        for ts in df_candles_new["timestamp"]:
             stamp = pd.Timestamp(ts)
             if stamp.tzinfo is None:
-                stamp = stamp.tz_localize('UTC')
+                stamp = stamp.tz_localize("UTC")
             else:
-                stamp = stamp.tz_convert('UTC')
+                stamp = stamp.tz_convert("UTC")
             candle_days.add(stamp.date())
+
         news_list = fetch_news_sentiments(
             ticker,
             news_days,
@@ -1383,57 +1492,74 @@ def fetch_candles_plus_features_and_predclose(
             start_dt=start_dt,
             days_of_interest=candle_days
         )
+
         sentiments, news_counts = assign_sentiment_to_candles(
             df_candles_new,
             news_list,
             last_sentiment_fallback=last_sentiment_known
         )
-        df_candles_new['sentiment'] = sentiments
-        df_candles_new['news_count'] = news_counts
+        df_candles_new["sentiment"] = sentiments
+        df_candles_new["news_count"] = news_counts
 
     if has_new:
         try:
             df_sent_new = pd.DataFrame({
-                "timestamp": df_candles_new['timestamp'],
+                "timestamp": df_candles_new["timestamp"],
                 "sentiment": [f"{s:.15f}" for s in sentiments],
                 "news_count": news_counts
             })
-            (pd.concat([df_sent_old, df_sent_new])
-            .drop_duplicates(subset=['timestamp'])
-            .sort_values('timestamp')
-            .to_csv(sentiment_csv, index=False))
+
+            df_sent_all = pd.concat([df_sent_old, df_sent_new], ignore_index=True)
+            df_sent_all = normalize_timestamp_utc(df_sent_all, "timestamp")
+            df_sent_all = df_sent_all.sort_values("timestamp", kind="mergesort")
+            # IMPORTANT: keep='last' so new sentiment overwrites old on same timestamp
+            df_sent_all = df_sent_all.drop_duplicates(subset=["timestamp"], keep="last")
+
+            df_sent_all.to_csv(sentiment_csv, index=False)
         except Exception as e:
             logging.error(f"[{ticker}] Unable to update sentiment CSV: {e}")
 
-    df_combined = (pd.concat([df_existing, df_candles_new], ignore_index=True)
-                     .drop_duplicates(subset=['timestamp'])
-                     .sort_values('timestamp')
-                     .reset_index(drop=True))
+    # ───── 5) combine (FIXED: stable sort + keep newest duplicates) ─────────
+    df_combined = pd.concat([df_existing, df_candles_new], ignore_index=True, sort=False)
+
+    if "timestamp" in df_combined.columns:
+        df_combined = normalize_timestamp_utc(df_combined, "timestamp")
+        df_combined = df_combined.sort_values("timestamp", kind="mergesort")
+        # IMPORTANT: keep='last' ensures "new candle wins" when timestamps collide
+        df_combined = df_combined.drop_duplicates(subset=["timestamp"], keep="last")
+        df_combined = df_combined.reset_index(drop=True)
+    else:
+        df_combined = df_combined.reset_index(drop=True)
 
     # 6) features
     df_combined = add_features(df_combined)
     df_combined = compute_custom_features(df_combined)
 
     for col in df_combined.columns:
-        if col != 'timestamp':
-            df_combined[col] = pd.to_numeric(df_combined[col], errors='coerce')
+        if col != "timestamp":
+            df_combined[col] = pd.to_numeric(df_combined[col], errors="coerce")
 
-    if 'predicted_close' not in df_combined.columns:
-        df_combined['predicted_close'] = np.nan
+    if "predicted_close" not in df_combined.columns:
+        df_combined["predicted_close"] = np.nan
 
     # 7) regenerate predicted_close
     ml_models     = get_ml_models_for_ticker(ticker)
     has_regressor = any(m in ["xgboost", "forest", "rf", "randomforest",
                               "lstm", "transformer", "catboost"] for m in ml_models)
 
-    # choose start: earliest missing OR start of new rows
-    n_start_new = len(df_combined) - len(df_candles_new)
+    # choose start: earliest missing OR start of new rows (more robust than len diff)
+    if has_new and "timestamp" in df_candles_new.columns and not df_candles_new.empty and "timestamp" in df_combined.columns:
+        first_new_ts = df_candles_new["timestamp"].min()
+        n_start_new = int(df_combined["timestamp"].searchsorted(first_new_ts, side="left"))
+    else:
+        n_start_new = len(df_combined)
+
     if first_missing_pred_idx is not None:
         n_start = min(first_missing_pred_idx, n_start_new)
     else:
         n_start = n_start_new
 
-    if has_regressor and DISABLE_PRED_CLOSE == 'False':
+    if has_regressor and DISABLE_PRED_CLOSE == "False":
         start = max(1, n_start)
         end = len(df_combined)
         total = max(0, end - start)
@@ -1443,20 +1569,20 @@ def fetch_candles_plus_features_and_predclose(
                     dynamic_ncols=True,
                     leave=False)
             if tqdm and total > 0 else range(start, end))
-        logging.info(f"[{ticker}] Rolling ML predicted_close from index {max(1, n_start)} over {len(df_combined)-max(1,n_start)} rows…")
-        if 'predicted_close' not in df_combined.columns:
-            df_combined['predicted_close'] = np.nan
+
+        logging.info(
+            f"[{ticker}] Rolling ML predicted_close from index {start} over {end - start} rows…"
+        )
 
         if len(df_combined) - n_start > 0:
-            logging.info(f"[{ticker}] Rolling ML predicted_close for "
-                         f"{len(df_combined) - n_start} new row(s)…")
+            logging.info(f"[{ticker}] Rolling ML predicted_close for {len(df_combined) - n_start} new row(s)…")
 
             feature_cols = get_features(df_combined)
 
             for i in iterator:
                 try:
                     X_train = df_combined.iloc[:i][feature_cols]
-                    y_train = df_combined.iloc[:i]['close']
+                    y_train = df_combined.iloc[:i]["close"]
 
                     m = ml_models[0]
                     if m in ["forest", "rf", "randomforest"]:
@@ -1464,20 +1590,22 @@ def fetch_candles_plus_features_and_predclose(
                             n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
                     elif m == "xgboost":
                         mdl = xgb.XGBRegressor(
-                                n_estimators=114, 
-                                max_depth=9, 
-                                learning_rate=0.14264252588219034,
-                                subsample=0.5524803023252148,
-                                colsample_bytree=0.7687841723045249,
-                                gamma=0.5856035407199236,
-                                reg_alpha=0.5063880221467401,
-                                reg_lambda=0.0728996118523866,
-                            )
+                            n_estimators=114,
+                            max_depth=9,
+                            learning_rate=0.14264252588219034,
+                            subsample=0.5524803023252148,
+                            colsample_bytree=0.7687841723045249,
+                            gamma=0.5856035407199236,
+                            reg_alpha=0.5063880221467401,
+                            reg_lambda=0.0728996118523866,
+                        )
                     elif m == "catboost":
-                        mdl = CatBoostRegressor(iterations=600, depth=6, learning_rate=0.05,
-                                                l2_leaf_reg=3, bagging_temperature=0.5,
-                                                loss_function="RMSE", eval_metric="RMSE",
-                                                random_seed=RANDOM_SEED, verbose=False)
+                        mdl = CatBoostRegressor(
+                            iterations=600, depth=6, learning_rate=0.05,
+                            l2_leaf_reg=3, bagging_temperature=0.5,
+                            loss_function="RMSE", eval_metric="RMSE",
+                            random_seed=RANDOM_SEED, verbose=False
+                        )
                     elif m in ["lightgbm", "lgbm"]:
                         mdl = lgb.LGBMRegressor(
                             n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
@@ -1492,23 +1620,26 @@ def fetch_candles_plus_features_and_predclose(
                         Transformer = get_single_model(
                             "transformer",
                             num_features=X_train.shape[1],
-                            lstm_seq=X_train.shape[0])
+                            lstm_seq=X_train.shape[0]
+                        )
                         mdl = Transformer(
                             num_features=X_train.shape[1],
-                            seq_len=X_train.shape[0])
+                            seq_len=X_train.shape[0]
+                        )
                     else:
                         mdl = RandomForestRegressor(
                             n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
 
                     mdl.fit(X_train, y_train)
-                    X_pred = df_combined.iloc[[i-1]][feature_cols]
-                    df_combined.at[i, 'predicted_close'] = mdl.predict(X_pred)[0]
+                    X_pred = df_combined.iloc[[i - 1]][feature_cols]
+                    df_combined.at[i, "predicted_close"] = mdl.predict(X_pred)[0]
                 except Exception as e:
                     logging.error(f"[{ticker}] predicted_close error idx={i}: {e}")
-                    df_combined.at[i, 'predicted_close'] = np.nan
+                    df_combined.at[i, "predicted_close"] = np.nan
 
     # ───── 8. trim, save & return  ─────────────────────────────────────────
     df_combined = limit_df_rows(df_combined)
+
     try:
         df_combined.to_csv(csv_filename, index=False)
         logging.info(f"[{ticker}] CSV updated – now {len(df_combined)} rows.")
@@ -1516,7 +1647,8 @@ def fetch_candles_plus_features_and_predclose(
         logging.error(f"[{ticker}] Unable to write {csv_filename}: {e}")
 
     if DISABLE_PRED_CLOSE:
-        df_combined = df_combined.drop(columns=['predicted_close'], errors='ignore')
+        df_combined = df_combined.drop(columns=["predicted_close"], errors="ignore")
+
     return df_combined
 
 # -------------------------------
@@ -1743,15 +1875,17 @@ def save_news_to_csv(ticker: str, news_list: list):
         rows.append(row)
 
     df_news = pd.DataFrame(rows)
-    csv_filename = os.path.join(DATA_DIR, f"{ticker}_articles_sentiment.csv")
+    ticker_fs = fs_safe_ticker(ticker)
+    csv_filename = os.path.join(DATA_DIR, f"{ticker_fs}_articles_sentiment.csv")
     df_news.to_csv(csv_filename, index=False)
     logging.info(f"[{ticker}] Saved articles with sentiment to {csv_filename}")
 
 def merge_sentiment_from_csv(df, ticker):
     tf_code = timeframe_to_code(BAR_TIMEFRAME)
-    sentiment_csv_filename = sentiment_csv_path(ticker, tf_code)
+    ticker_fs = fs_safe_ticker(ticker)
+    sentiment_csv_filename = sentiment_csv_path(ticker_fs, tf_code)
     if not os.path.exists(sentiment_csv_filename):
-        logging.error(f"Sentiment CSV {sentiment_csv_filename} not found for ticker {ticker}.")
+        logging.error(f"Sentiment CSV {sentiment_csv_filename} not found for ticker {ticker_fs}.")
         return df
     
     try:
@@ -3539,7 +3673,8 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
     TICKERS = tickers_run    
     for ticker in tickers_run:
         tf_code = timeframe_to_code(BAR_TIMEFRAME)
-        csv_filename = candle_csv_path(ticker, tf_code)
+        ticker_fs = fs_safe_ticker(ticker)
+        csv_filename = candle_csv_path(ticker_fs, tf_code)
 
         if not skip_data:
             df = fetch_candles_plus_features_and_predclose(
@@ -3749,13 +3884,15 @@ def console_listener():
                 )
 
                 tf_code = timeframe_to_code(timeframe)
-                csv_filename = candle_csv_path(ticker, tf_code)
+                ticker_fs = fs_safe_ticker(ticker)
+                csv_filename = candle_csv_path(ticker_fs, tf_code)
                 df.to_csv(csv_filename, index=False)
                 logging.info(f"[{ticker}] Saved candle data + advanced features (minus disabled) to {csv_filename}.")
 
         elif cmd == "predict-next":
             tf_code = timeframe_to_code(BAR_TIMEFRAME)
-            csv_filename = candle_csv_path(BACKTEST_TICKER, tf_code)
+            ticker_fs = fs_safe_ticker(BACKTEST_TICKER)
+            csv_filename = candle_csv_path(ticker_fs, tf_code)
             if skip_data:
                 logging.info(f"[{BACKTEST_TICKER}] predict-next -r: Using existing CSV {csv_filename}")
                 if not os.path.exists(csv_filename):
@@ -3905,7 +4042,8 @@ def console_listener():
             #  Prepare / load data ONCE, reused for all logic scripts
             # --------------------------------------------------------------
             tf_code = timeframe_to_code(timeframe_for_backtest)
-            csv_filename = candle_csv_path(BACKTEST_TICKER, tf_code)
+            ticker_fs = fs_safe_ticker(BACKTEST_TICKER)
+            csv_filename = candle_csv_path(ticker_fs, tf_code)
 
             if skip_data:
                 logging.info(
@@ -4018,12 +4156,17 @@ def console_listener():
                 timestamps = []
                 trade_records = []
                 portfolio_records = []
-                start_balance = 10000.0
-                cash = start_balance
                 position_qty = 0
                 avg_entry_price = 0.0
                 last_action = None
                 start_iter = 0
+
+                ticker_has_slash = "/" in str(BACKTEST_TICKER)
+                allow_shorting = USE_SHORT and (not ticker_has_slash)
+                buy_fee_rate = 0.0025 if ticker_has_slash else 0.0
+
+                start_balance = 10000.0 if not ticker_has_slash else 1000000.0
+                cash = start_balance
 
                 def record_trade(action, tstamp, shares, curr_price, pred_price, pl):
                     trade_records.append({
@@ -4159,10 +4302,10 @@ def console_listener():
                         actuals            = []
                         timestamps         = []
 
-                        START_BALANCE      = 10_000.0
-                        cash               = START_BALANCE
-                        position_qty       = 0
-                        avg_entry_price    = 0.0
+                        START_BALANCE  = 10_000.0 if not ticker_has_slash else 1_000_000.0
+                        cash = START_BALANCE
+                        position_qty = 0
+                        avg_entry_price = 0.0
 
                         # convenience -----------------------------------------------------------
                         def record_trade(act, ts, qty, px, pl=None):
@@ -4248,7 +4391,11 @@ def console_listener():
                                 if shares_to_buy > 0:
                                     position_qty    = shares_to_buy
                                     avg_entry_price = price
-                                    record_trade("BUY", ts, shares_to_buy, price)
+                                    # NEW: 0.25% fee on BUY only for slash tickers
+                                    fee = shares_to_buy * price * buy_fee_rate
+                                    if fee:
+                                        cash -= fee
+                                    record_trade("BUY", ts, shares_to_buy, price, pl=(-fee if fee else None))
 
                             elif raw_act == "SELL":
                                 if position_qty > 0:
@@ -4377,76 +4524,57 @@ def console_listener():
                             actuals.append(real_close)
                             timestamps.append(row_data["timestamp"])
 
-                            # Normalize action based on current position and rules
                             if action == "BUY":
                                 if position_qty > 0:
-                                    # 1. Already long: do nothing
                                     action = "NONE"
                                 elif position_qty < 0:
-                                    # 3. Short exists: treat BUY as COVER (close short only)
                                     action = "COVER"
 
                             elif action == "SELL":
                                 if position_qty > 0:
-                                    # 1. Long position: keep SELL to close it
                                     pass
                                 elif position_qty == 0:
-                                    # 2. Flat and allowed to short: convert SELL to SHORT
-                                    if USE_SHORT:
+                                    # NEW: shorting disabled for slash tickers
+                                    if allow_shorting:
                                         action = "SHORT"
                                     else:
                                         action = "NONE"
-                                else:  # position_qty < 0
-                                    # 3. Already short: do nothing
+                                else:
                                     action = "NONE"
 
                             elif action == "SHORT":
-                                if position_qty != 0:
-                                    # Remove flip logic (no close+short in same step)
+                                # NEW: shorting disabled for slash tickers
+                                if (not allow_shorting) or position_qty != 0:
                                     action = "NONE"
 
                             elif action == "COVER":
                                 if position_qty >= 0:
-                                    # Only valid when actually short
                                     action = "NONE"
 
-                            # ───────────────────────────────────────────────────────────
                             # Execute normalized action
-                            # ───────────────────────────────────────────────────────────
                             if action == "BUY":
-                                # 2. Flat: open a long, buy all possible shares
                                 shares_to_buy = int(cash // real_close)
                                 if shares_to_buy > 0:
                                     position_qty    = shares_to_buy
                                     avg_entry_price = real_close
+
+                                    # NEW: 0.25% fee on BUY only for slash tickers
+                                    fee = shares_to_buy * real_close * buy_fee_rate
+                                    if fee:
+                                        cash -= fee
+
                                     record_trade(
                                         "BUY",
                                         row_data["timestamp"],
                                         shares_to_buy,
                                         real_close,
                                         pred_close,
-                                        None,
+                                        (-fee if fee else None),
                                     )
-
-                            elif action == "SELL":
-                                # 1. Long exists: close entire long
-                                if position_qty > 0:
-                                    pl = (real_close - avg_entry_price) * position_qty
-                                    cash += pl
-                                    record_trade(
-                                        "SELL",
-                                        row_data["timestamp"],
-                                        position_qty,
-                                        real_close,
-                                        pred_close,
-                                        pl,
-                                    )
-                                    position_qty    = 0
-                                    avg_entry_price = 0.0
 
                             elif action == "SHORT":
-                                # 2. Flat (from SELL when USE_SHORT=True): open full short
-                                if position_qty == 0:
+                                # NEW: shorting disabled for slash tickers (no-op)
+                                if allow_shorting and position_qty == 0:
                                     shares_to_short = int(cash // real_close)
                                     if shares_to_short > 0:
                                         position_qty    = -shares_to_short
@@ -4459,22 +4587,6 @@ def console_listener():
                                             pred_close,
                                             None,
                                         )
-
-                            elif action == "COVER":
-                                # 3. From BUY when short, or explicit COVER: close entire short
-                                if position_qty < 0:
-                                    pl = (avg_entry_price - real_close) * abs(position_qty)
-                                    cash += pl
-                                    record_trade(
-                                        "COVER",
-                                        row_data["timestamp"],
-                                        abs(position_qty),
-                                        real_close,
-                                        pred_close,
-                                        pl,
-                                    )
-                                    position_qty    = 0
-                                    avg_entry_price = 0.0
 
                             val = get_portfolio_value(
                                 position_qty, cash, real_close, avg_entry_price
@@ -4542,7 +4654,7 @@ def console_listener():
 
                 # ---------------- save artefacts ----------------
                 tf_code       = timeframe_to_code(timeframe_for_backtest)
-                results_dir   = os.path.join("results", tf_code, logic_num_str)
+                results_dir   = os.path.join("results", tf_code, BACKTEST_TICKER, logic_num_str)
                 os.makedirs(results_dir, exist_ok=True)
 
                 # ▸ prediction CSV & plot — only when we *have* predictions

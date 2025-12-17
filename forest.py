@@ -149,6 +149,11 @@ def fs_safe_ticker(ticker: str) -> str:
 
     return s
 
+def add_weights(n_samples: int) -> np.ndarray:
+    ages = np.arange(n_samples - 1, -1, -1)
+    return np.exp(-np.log(2) * ages / HALF_LIFE)
+
+
 def timeframe_subdir(tf_code: str) -> str:
     """Return the directory path for a given timeframe code, creating it if needed."""
 
@@ -1630,7 +1635,8 @@ def fetch_candles_plus_features_and_predclose(
                         mdl = RandomForestRegressor(
                             n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
 
-                    mdl.fit(X_train, y_train)
+                    weights = add_weights(len(X_train))
+                    mdl.fit(X_train, y_train, sample_weight=weights)
                     X_pred = df_combined.iloc[[i - 1]][feature_cols]
                     df_combined.at[i, "predicted_close"] = mdl.predict(X_pred)[0]
                 except Exception as e:
@@ -2155,15 +2161,15 @@ def _fit_base_classifiers(
     pos_weight = ((len(y_bin) - y_bin.sum()) / y_bin.sum()) if y_bin.sum() else 1.0
 
     # ── tree models ────────────────────────────────────────────────────────
-    if "forest_cls" in model_names:
-        rf_raw = RandomForestClassifier(
-            n_estimators=400,          # a bit deeper
-            max_depth=None,
-            min_samples_leaf=5,
-            class_weight="balanced_subsample",
-            random_state=RANDOM_SEED,
-        )
-        models["forest_cls"] = make_pipeline(rf_raw).fit(X_scaled, y_bin)
+        if "forest_cls" in model_names:
+            rf_raw = RandomForestClassifier(
+                n_estimators=400,          # a bit deeper
+                max_depth=None,
+                min_samples_leaf=5,
+                class_weight="balanced_subsample",
+                random_state=RANDOM_SEED,
+            )
+            models["forest_cls"] = make_pipeline(rf_raw).fit(X_scaled, y_bin, sample_weight=add_weights(len(X_scaled)))
 
     # ▸ xgboost
     if "xgboost_cls" in model_names:
@@ -2178,14 +2184,14 @@ def _fit_base_classifiers(
             scale_pos_weight=pos_weight,
             tree_method="hist",
         )
-        models["xgboost_cls"] = make_pipeline(xgb_raw).fit(X_scaled, y_bin)
+        models["xgboost_cls"] = make_pipeline(xgb_raw).fit(X_scaled, y_bin, sample_weight=add_weights(len(X_scaled)))
 
     if "catboost_cls" in model_names:
         cb_raw = CatBoostClassifier(iterations=600, depth=6, learning_rate=0.05,
                                     l2_leaf_reg=3, bagging_temperature=0.5,
                                     loss_function="Logloss", eval_metric="AUC",
                                     random_seed=RANDOM_SEED, verbose=False)
-        models["catboost_cls"] = make_pipeline(cb_raw).fit(X_scaled, y_bin)
+        models["catboost_cls"] = make_pipeline(cb_raw).fit(X_scaled, y_bin, sample_weight=add_weights(len(X_scaled)))
 
     # ▸ lightgbm
     if "lightgbm_cls" in model_names:
@@ -2198,7 +2204,7 @@ def _fit_base_classifiers(
             random_state=RANDOM_SEED,
             is_unbalance=True,
         )
-        models["lightgbm_cls"] = make_pipeline(lgb_raw).fit(X_scaled, y_bin)
+        models["lightgbm_cls"] = make_pipeline(lgb_raw).fit(X_scaled, y_bin, sample_weight=add_weights(len(X_scaled)))
 
     # ── transformer classifier ────────────────────────────────────────────
     if "transformer_cls" in model_names:
@@ -2415,7 +2421,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                 random_state=RANDOM_SEED,
                 tree_method="hist",
             )
-            xgb_multi.fit(X_multi_scaled, y_encoded)
+            xgb_multi.fit(X_multi_scaled, y_encoded, sample_weight=add_weights(len(X_multi_scaled)))
             proba_preds.append(xgb_multi.predict_proba(X_last_multi)[0])
 
         if "catboost_multi" in ml_models:
@@ -2430,7 +2436,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                 random_seed=RANDOM_SEED,
                 verbose=False,
             )
-            cb_multi.fit(X_multi_scaled, y_encoded)
+            cb_multi.fit(X_multi_scaled, y_encoded, sample_weight=add_weights(len(X_multi_scaled)))
             proba_preds.append(cb_multi.predict_proba(X_last_multi)[0])
 
         if "lightgbm_multi" in ml_models:
@@ -2444,7 +2450,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                 num_class=3,
                 random_state=RANDOM_SEED,
             )
-            lgb_multi.fit(X_multi_scaled, y_encoded)
+            lgb_multi.fit(X_multi_scaled, y_encoded, sample_weight=add_weights(len(X_multi_scaled)))
             proba_preds.append(lgb_multi.predict_proba(X_last_multi)[0])
 
         if not proba_preds:
@@ -2530,7 +2536,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
             # FOREST
             try:
                 rf_model_meta = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                rf_model_meta.fit(local_X, local_y)
+                rf_model_meta.fit(local_X, local_y, sample_weight=add_weights(len(local_X)))
                 rf_pred = rf_model_meta.predict(X_pred_row)[0]
             except:
                 rf_pred = np.nan
@@ -2547,7 +2553,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                     reg_alpha=0.5063880221467401,
                     reg_lambda=0.0728996118523866,
                 )
-                xgb_model_meta.fit(local_X, local_y)
+                xgb_model_meta.fit(local_X, local_y, sample_weight=add_weights(len(local_X)))
                 xgb_pred = xgb_model_meta.predict(X_pred_row)[0]
             except:
                 xgb_pred = np.nan
@@ -2557,7 +2563,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                                                 l2_leaf_reg=3, bagging_temperature=0.5,
                                                 loss_function="RMSE", eval_metric="RMSE",
                                                 random_seed=RANDOM_SEED, verbose=False)
-                cb_model_meta.fit(local_X, local_y)
+                cb_model_meta.fit(local_X, local_y, sample_weight=add_weights(len(local_X)))
                 cb_pred = cb_model_meta.predict(X_pred_row)[0]
             except:
                 cb_pred = np.nan
@@ -2565,7 +2571,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
             # LIGHTGBM
             try:
                 lgbm_model_meta = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-                lgbm_model_meta.fit(local_X, local_y)
+                lgbm_model_meta.fit(local_X, local_y, sample_weight=add_weights(len(local_X)))
                 lgbm_pred = lgbm_model_meta.predict(X_pred_row)[0]
             except:
                 lgbm_pred = np.nan
@@ -2585,7 +2591,8 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                         batch_size=32,
                         verbose=0,
                         validation_split=0.18,
-                        callbacks=[es, cp]
+                        callbacks=[es, cp], 
+                        sample_weight=add_weights(len(X_lstm_win))
                     )
                     last_seq = local_X.iloc[-seq_len:].values.reshape(1,seq_len,-1)
                     lstm_pred = lstm_model_meta.predict(last_seq, verbose=0)[0][0]
@@ -2664,7 +2671,8 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
             batch_size=32,
             verbose=0,
             validation_split=0.18,
-            callbacks=[es, cp]
+            callbacks=[es, cp],
+            add_weights(len(X_lstm_win))
         )
         lstm_model.load_weights("lstm_best_model.keras")
         last_seq = X_lstm_np[-seq_len:,:].reshape(1,seq_len,-1)
@@ -2683,7 +2691,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
             reg_alpha=0.5063880221467401,
             reg_lambda=0.0728996118523866,
         )
-        xgb_model.fit(X, y)
+        xgb_model.fit(X, y, add_weights(len(X)))
         xgb_pred = xgb_model.predict(last_row_df)[0]
         out_preds.append(xgb_pred)
         out_names.append("xgb_pred")
@@ -2693,21 +2701,21 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                                                 l2_leaf_reg=3, bagging_temperature=0.5,
                                                 loss_function="RMSE", eval_metric="RMSE",
                                                 random_seed=RANDOM_SEED, verbose=False)
-        cb_model.fit(X, y)
+        cb_model.fit(X, y, add_weights(len(X)))
         cb_pred = cb_model.predict(last_row_df)[0]
         out_preds.append(cb_pred)
         out_names.append("cb_pred")
 
     if "lightgbm" in ml_models or "lgbm" in ml_models:
         lgbm_model = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-        lgbm_model.fit(X, y)
+        lgbm_model.fit(X, y, add_weights(len(X)))
         lgbm_pred = lgbm_model.predict(last_row_df)[0]
         out_preds.append(lgbm_pred)
         out_names.append("lgbm_pred")
 
     if "forest" in ml_models or "rf" in ml_models or "randomforest" in ml_models:
         rf_model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-        rf_model.fit(X, y)
+        rf_model.fit(X, y, add_weights(len(X)))
         rf_pred = rf_model.predict(last_row_df)[0]
         out_preds.append(rf_pred)
         out_names.append("rf_pred")
@@ -4238,7 +4246,7 @@ def console_listener():
                                 )
                             else:
                                 continue
-                            mdl.fit(X_train, y_train)
+                            mdl.fit(X_train, y_train, sample_weights=add_weights(len(X_train)))
                             model_stack.append(mdl)
 
                         if not model_stack:
@@ -4882,7 +4890,7 @@ def console_listener():
                     else:
                         model = xgb.XGBClassifier(**model_kwargs)
 
-                    model.fit(X_train, y_train)
+                    model.fit(X_train, y_train, add_weights(len(X_train)))
 
                     # SHAP for the single test row
                     try:

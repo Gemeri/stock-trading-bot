@@ -36,14 +36,14 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Logger
 logger = logging.getLogger(__name__)
 
-
+HALF_LIFE = 1500
 # ---- Utilities ---------------------------------------------------------------
 def add_weights(n_samples: int) -> np.ndarray:
     ages = np.arange(n_samples - 1, -1, -1)
     return np.exp(-np.log(2) * ages / HALF_LIFE)
 
 def _state_path(ticker: str) -> str:
-    return os.path.join(CACHE_DIR, f"{ticker}_{CONVERTED_TIMEFRAME}_state.json")
+    return os.path.join(CACHE_DIR, f"{ticker}_{tools.CONVERTED_TIMEFRAME}_state.json")
 
 def _load_state(ticker: str) -> Dict[str, Any]:
     path = _state_path(ticker)

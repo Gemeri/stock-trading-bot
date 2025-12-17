@@ -53,7 +53,7 @@ _full_df: pd.DataFrame | None = None      # loaded once, reused
 _model_cache: Dict[str, " _ModelCache"] = {}   # key = time-bucket ISO
 
 def get_csv_filename(ticker):
-    return tools.get_csv_filename(tickers)
+    return tools.get_csv_filename(ticker)
 
 # ------------------------------------------------------------------
 # Ensure a DataFrame has all FEATURE columns; create missing ones = 0

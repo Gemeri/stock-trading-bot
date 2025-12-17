@@ -47,7 +47,7 @@ def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
     d["label"] = lab
     return d.reset_index(drop=True)
 
-def fit(X: np.ndarray, y: np.ndarray):
+def fit(X: np.ndarray, y: np.ndarray, sample_weight: np.ndarray | None = None):
     # class weights for balance
     pos = float((y==1).sum()); neg = float((y==0).sum())
     if pos > 0 and neg > 0:
@@ -65,7 +65,7 @@ def fit(X: np.ndarray, y: np.ndarray):
     )
     splitter = PurgedTimeSeriesCV(n_splits=5, gap=1)
     model = CalibratedClassifierCV(base, method="isotonic", cv=splitter)
-    model.fit(X,y)
+    model.fit(X, y, sample_weight=sample_weight)
     return model
 
 def predict(model, X: np.ndarray) -> np.ndarray:

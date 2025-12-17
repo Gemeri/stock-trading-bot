@@ -161,6 +161,7 @@ def _train_rbf_svr(
     X: np.ndarray,
     y: np.ndarray,
     enable_cv: bool,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> Tuple[object, StandardScaler, StandardScaler]:
     """
     Trains an RBF SVR on standardized X and y.
@@ -216,10 +217,13 @@ def _train_rbf_svr(
             verbose=0,
             refit=True,
         )
-        gs.fit(Xs, ys)
+        if sample_weight is not None:
+            gs.fit(Xs, ys, sample_weight=sample_weight)
+        else:
+            gs.fit(Xs, ys)
         model = gs.best_estimator_
     else:
-        model = base.fit(Xs, ys)
+        model = base.fit(Xs, ys, sample_weight=sample_weight)
 
     return model, x_scaler, y_scaler
 
@@ -228,8 +232,11 @@ def _train_rbf_svr(
 # Public API
 # --------------------------------------------------------------------------------------
 
-def fit(X: Union[pd.DataFrame, pd.Series, np.ndarray, list, tuple],
-        Y: Optional[Union[pd.Series, np.ndarray, list]] = None) -> ModelBundle:
+def fit(
+    X: Union[pd.DataFrame, pd.Series, np.ndarray, list, tuple],
+    Y: Optional[Union[pd.Series, np.ndarray, list]] = None,
+    sample_weight: Optional[np.ndarray] = None,
+) -> ModelBundle:
     """
     Train an RBF SVR on the provided series using ONLY the 'close' values.
 
@@ -256,7 +263,12 @@ def fit(X: Union[pd.DataFrame, pd.Series, np.ndarray, list, tuple],
 
     # Build supervised dataset and train
     X_lag, y = _build_supervised_from_close(close, SVR_LOOKBACK)
-    model, x_scaler, y_scaler = _train_rbf_svr(X_lag, y, enable_cv=SVR_ENABLE_CV)
+    sw = None
+    if sample_weight is not None and len(y):
+        sw_arr = np.asarray(sample_weight, dtype=float).reshape(-1)
+        sw = sw_arr[-len(y):] if len(sw_arr) >= len(y) else sw_arr
+
+    model, x_scaler, y_scaler = _train_rbf_svr(X_lag, y, enable_cv=SVR_ENABLE_CV, sample_weight=sw)
 
     return ModelBundle(model=model, x_scaler=x_scaler, y_scaler=y_scaler, lookback=SVR_LOOKBACK)
 

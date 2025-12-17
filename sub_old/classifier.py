@@ -93,7 +93,7 @@ def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
 
     return d.reset_index(drop=True)
 
-def fit(X_train: np.ndarray, y_train: np.ndarray, horizon: Optional[int] = None):
+def fit(X_train: np.ndarray, y_train: np.ndarray, horizon: Optional[int] = None, sample_weight: np.ndarray | None = None):
     hgap = 1 if horizon is None else int(horizon)
     base = XGBClassifier(
         n_estimators=400, learning_rate=0.03, max_depth=4,
@@ -103,7 +103,7 @@ def fit(X_train: np.ndarray, y_train: np.ndarray, horizon: Optional[int] = None)
     )
     splitter = PurgedTimeSeriesCV(n_splits=5, gap=hgap)
     model = CalibratedClassifierCV(base, method="isotonic", cv=splitter, n_jobs=-1)
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train, sample_weight=sample_weight)
     return model
 
 def predict(model, X: np.ndarray) -> np.ndarray:

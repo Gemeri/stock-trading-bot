@@ -56,14 +56,14 @@ def compute_labels(df: pd.DataFrame) -> pd.DataFrame:
     d["label"] = lab
     return d.reset_index(drop=True)
 
-def fit(X: np.ndarray, y: np.ndarray):
+def fit(X: np.ndarray, y: np.ndarray, sample_weight: np.ndarray | None = None):
     base = HistGradientBoostingClassifier(
         max_depth=4, learning_rate=0.06, max_iter=400,
         min_samples_leaf=20, l2_regularization=0.0, random_state=42
     )
     splitter = PurgedTimeSeriesCV(n_splits=5, gap=1)
     model = CalibratedClassifierCV(base, method="isotonic", cv=splitter, n_jobs=-1)
-    model.fit(X, y)
+    model.fit(X, y, sample_weight=sample_weight)
     return model
 
 def predict(model, X: np.ndarray) -> np.ndarray:

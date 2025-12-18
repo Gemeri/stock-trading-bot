@@ -4567,7 +4567,7 @@ def console_listener():
                                     position_qty    = shares_to_buy
                                     avg_entry_price = real_close
 
-                                    # NEW: 0.25% fee on BUY only for slash tickers
+                                    # 0.25% fee on BUY only for slash tickers
                                     fee = shares_to_buy * real_close * buy_fee_rate
                                     if fee:
                                         cash -= fee
@@ -4581,8 +4581,24 @@ def console_listener():
                                         (-fee if fee else None),
                                     )
 
+                            elif action == "SELL":
+                                # close long
+                                if position_qty > 0:
+                                    pl = (real_close - avg_entry_price) * position_qty
+                                    cash += pl
+                                    record_trade(
+                                        "SELL",
+                                        row_data["timestamp"],
+                                        position_qty,
+                                        real_close,
+                                        pred_close,
+                                        pl,
+                                    )
+                                    position_qty = 0
+                                    avg_entry_price = 0.0
+
                             elif action == "SHORT":
-                                # NEW: shorting disabled for slash tickers (no-op)
+                                # short entry (only if allowed and flat)
                                 if allow_shorting and position_qty == 0:
                                     shares_to_short = int(cash // real_close)
                                     if shares_to_short > 0:
@@ -4596,6 +4612,23 @@ def console_listener():
                                             pred_close,
                                             None,
                                         )
+
+                            elif action == "COVER":
+                                # close short
+                                if position_qty < 0:
+                                    qty = abs(position_qty)
+                                    pl = (avg_entry_price - real_close) * qty
+                                    cash += pl
+                                    record_trade(
+                                        "COVER",
+                                        row_data["timestamp"],
+                                        qty,
+                                        real_close,
+                                        pred_close,
+                                        pl,
+                                    )
+                                    position_qty = 0
+                                    avg_entry_price = 0.0
 
                             val = get_portfolio_value(
                                 position_qty, cash, real_close, avg_entry_price

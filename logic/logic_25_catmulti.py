@@ -6,7 +6,8 @@ from typing import Dict, Any, List, Tuple, Optional
 from tqdm import tqdm  
 import numpy as np
 import pandas as pd
-import config
+import logic.tools as tools
+import forest
 from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import roc_curve, auc
 
@@ -16,30 +17,12 @@ from sklearn.metrics import roc_curve, auc
 
 logger = logging.getLogger(__name__)
 
-# Timeframe and data path configuration
-BAR_TIMEFRAME = config.BAR_TIMEFRAME
-TIMEFRAME_MAP = {
-    "4Hour": "H4", "2Hour": "H2", "1Hour": "H1",
-    "30Min": "M30", "15Min": "M15"
-}
-CONVERTED_TIMEFRAME = TIMEFRAME_MAP.get(BAR_TIMEFRAME, BAR_TIMEFRAME)
-
 DATA_DIR = "data"
 CATBOOST_DIR = "catboost-multi"
 os.makedirs(CATBOOST_DIR, exist_ok=True)
 
 # Base features (strict gate)
-BASE_FEATURES = [
-    'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions', 'sentiment',
-    'greed_index', 'news_count', 'news_volume_z', 'price_change', 'high_low_range',
-    'macd_line', 'macd_signal', 'macd_histogram', 'rsi', 'roc', 'atr', 'ema_9',
-    'ema_21', 'ema_50', 'ema_200', 'adx', 'obv', 'bollinger_percB', 'returns_1',
-    'returns_3', 'returns_5', 'std_5', 'std_10', 'lagged_close_1', 'lagged_close_2',
-    'lagged_close_3', 'lagged_close_5', 'lagged_close_10', 'candle_body_ratio',
-    'wick_dominance', 'gap_vs_prev', 'volume_zscore', 'atr_zscore', 'rsi_zscore',
-    'month', 'hour_sin', 'hour_cos', 'day_of_week_sin', 'day_of_week_cos',
-    'days_since_high', 'days_since_low', "d_sentiment"
-]
+BASE_FEATURES = tools.FEATURES
 
 # CatBoost and ensemble hyperparameters
 TRAINING_WINDOW = 4000
@@ -63,28 +46,20 @@ GRID_SEARCH_WINDOW_CANDLES = 100
 # PATH HELPERS
 # =====================================================
 
-DATA_DIR = "data"
-def timeframe_subdir(tf_code: str) -> str:
-    """Return the directory path for a given timeframe code, creating it if needed."""
-
-    path = os.path.join(DATA_DIR, tf_code)
-    os.makedirs(path, exist_ok=True)
-    return path
-
 def get_csv_filename(ticker):
-    return os.path.join(timeframe_subdir(CONVERTED_TIMEFRAME), f"{ticker}_{CONVERTED_TIMEFRAME}.csv")
+    return tools.get_csv_filename(ticker)
 
 
 def _get_model_meta_path(ticker: str) -> str:
-    return os.path.join(CATBOOST_DIR, f"{ticker}_meta.json")
+    return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_meta.json")
 
 
 def _get_model_path(ticker: str, offset: int) -> str:
-    return os.path.join(CATBOOST_DIR, f"{ticker}_target_{offset}.cbm")
+    return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_target_{offset}.cbm")
 
 
 def _get_risk_state_path(ticker: str) -> str:
-    return os.path.join(CATBOOST_DIR, f"{ticker}_risk_state.json")
+    return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_risk_state.json")
 
 
 # =====================================================
@@ -311,7 +286,7 @@ def _train_models_for_timestamp(
             verbose=False
         )
         ages = np.arange(len(X_train)-1, -1, -1)     # oldest gets largest age, newest gets 0
-        HALF_LIFE = 1500
+        HALF_LIFE = 500
         weights = np.exp(-np.log(2) * ages / HALF_LIFE)
         train_pool = Pool(X_train, y_train, weight=weights)
         model.fit(train_pool)

@@ -2692,7 +2692,7 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
             reg_alpha=0.5063880221467401,
             reg_lambda=0.0728996118523866,
         )
-        xgb_model.fit(X, y, add_weights(len(X)))
+        xgb_model.fit(X, y, sample_weight=add_weights(len(X)))
         xgb_pred = xgb_model.predict(last_row_df)[0]
         out_preds.append(xgb_pred)
         out_names.append("xgb_pred")
@@ -2702,21 +2702,21 @@ def train_and_predict(df: pd.DataFrame, return_model_stack=False, ticker: str | 
                                                 l2_leaf_reg=3, bagging_temperature=0.5,
                                                 loss_function="RMSE", eval_metric="RMSE",
                                                 random_seed=RANDOM_SEED, verbose=False)
-        cb_model.fit(X, y, add_weights(len(X)))
+        cb_model.fit(X, y, sample_weight=add_weights(len(X)))
         cb_pred = cb_model.predict(last_row_df)[0]
         out_preds.append(cb_pred)
         out_names.append("cb_pred")
 
     if "lightgbm" in ml_models or "lgbm" in ml_models:
         lgbm_model = lgb.LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-        lgbm_model.fit(X, y, add_weights(len(X)))
+        lgbm_model.fit(X, y, sample_weight=add_weights(len(X)))
         lgbm_pred = lgbm_model.predict(last_row_df)[0]
         out_preds.append(lgbm_pred)
         out_names.append("lgbm_pred")
 
     if "forest" in ml_models or "rf" in ml_models or "randomforest" in ml_models:
         rf_model = RandomForestRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED)
-        rf_model.fit(X, y, add_weights(len(X)))
+        rf_model.fit(X, y, sample_weight=add_weights(len(X)))
         rf_pred = rf_model.predict(last_row_df)[0]
         out_preds.append(rf_pred)
         out_names.append("rf_pred")
@@ -4924,7 +4924,7 @@ def console_listener():
                     else:
                         model = xgb.XGBClassifier(**model_kwargs)
 
-                    model.fit(X_train, y_train, add_weights(len(X_train)))
+                    model.fit(X_train, y_train, sample_weight=add_weights(len(X_train)))
 
                     # SHAP for the single test row
                     try:

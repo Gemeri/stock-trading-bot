@@ -25,7 +25,6 @@ os.makedirs(CATBOOST_DIR, exist_ok=True)
 BASE_FEATURES = tools.FEATURES
 
 # CatBoost and ensemble hyperparameters
-TRAINING_WINDOW = 4000
 RETRAIN_EVERY = 1
 PER_CLASS_AUC_THRESHOLD = 0.0
 GINI_THRESHOLD = 0.09
@@ -201,21 +200,8 @@ def _train_models_for_timestamp(
         )
         return {"models": [], "feature_cols": feature_cols, "target_offsets": []}
 
-    # Decide training window slice
-    if n <= TRAINING_WINDOW:
-        # Use all data up to current_time (no trim to TRAINING_WINDOW)
-        window_df = df_cut.copy()
-        logger.info(
-            f"Using full history up to {current_time} for training "
-            f"(len={n} <= TRAINING_WINDOW={TRAINING_WINDOW})."
-        )
-    else:
-        # Use the last TRAINING_WINDOW rows
-        window_df = df_cut.iloc[-TRAINING_WINDOW:].copy()
-        logger.info(
-            f"Using rolling window of size TRAINING_WINDOW={TRAINING_WINDOW} "
-            f"out of total {n} candles up to {current_time}."
-        )
+    window_df = df_cut.copy()
+
 
     X_window_full = window_df[feature_cols]
 
@@ -286,7 +272,7 @@ def _train_models_for_timestamp(
             verbose=False
         )
         ages = np.arange(len(X_train)-1, -1, -1)     # oldest gets largest age, newest gets 0
-        HALF_LIFE = 500
+        HALF_LIFE = 750
         weights = np.exp(-np.log(2) * ages / HALF_LIFE)
         train_pool = Pool(X_train, y_train, weight=weights)
         model.fit(train_pool)

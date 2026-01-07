@@ -18,4 +18,5 @@ V
 NKE
 ORCL
 INTC
+CVX
 selection_model=logic_25_catmulti.py

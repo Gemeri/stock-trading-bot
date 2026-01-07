@@ -25,6 +25,7 @@ setup_logging(logging.INFO)
 
 logger = logging.getLogger(__name__)
 import alpaca_trade_api as tradeapi
+import logic.logic_25_catmulti as catmulti
 
 # -------------------------------
 # 1. Load Configuration (from .env)
@@ -53,7 +54,6 @@ SUBMETA_USE_ACTION = os.getenv("SUBMETA_USE_ACTION", "false").strip().lower() ==
 
 # scheduling & run‑mode ----------------------------------------------------------------------
 RUN_SCHEDULE = config.RUN_SCHEDULE
-SENTIMENT_OFFSET_MINUTES = config.SENTIMENT_OFFSET_MINUTES
 BACKTEST_TICKER = config.BACKTEST_TICKER
 DISABLE_PRED_CLOSE = config.DISABLE_PRED_CLOSE
 USE_SHORT = config.USE_SHORT
@@ -216,12 +216,15 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
 
 def setup_schedule_for_timeframe(timeframe: str) -> None:
 
+    # --- weekly job that must ALWAYS be scheduled -----------------------------------------
+    # Runs every Saturday at 06:00 New York time, regardless of RUN_SCHEDULE.
+    schedule.every().saturday.at("06:00").do(catmulti.get_best_half_life)
+
     # --- honour master switch --------------------------------------------------------------
+    # If RUN_SCHEDULE is off, we still keep the ALWAYS-on Saturday job above.
     if RUN_SCHEDULE == "off":
-        schedule.clear()
-        logging.info("RUN_SCHEDULE=off – no jobs have been queued.")
+        logging.info("RUN_SCHEDULE=off – daily timeframe jobs not queued (Saturday half-life job still queued).")
         return
-    # ---------------------------------------------------------------------------------------
 
     # choose a known table key --------------------------------------------------------------
     if timeframe not in TIMEFRAME_SCHEDULE:
@@ -229,7 +232,6 @@ def setup_schedule_for_timeframe(timeframe: str) -> None:
         timeframe = "1Day"
 
     times_list = TIMEFRAME_SCHEDULE[timeframe]
-    schedule.clear()
 
     # build the jobs ------------------------------------------------------------------------
     for t in times_list:
@@ -237,6 +239,7 @@ def setup_schedule_for_timeframe(timeframe: str) -> None:
         schedule.every().day.at(t).do(lambda t=t: ranking.maybe_update_best_tickers(t))
 
     logging.info(f"Scheduling prepared for {timeframe}: {times_list}")
+
 
 def run_job(scheduled_time_ny: str):
     logging.info(f"Starting scheduled trading job at NY time {scheduled_time_ny}...")

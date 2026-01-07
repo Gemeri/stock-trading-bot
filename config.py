@@ -2,7 +2,6 @@ API_BASE_URL="https://api.alpaca.markets"
 ML_MODEL="catboost"
 SUB_VERSION="beta"
 RUN_SCHEDULE="off"
-SENTIMENT_OFFSET_MINUTES=1
 REWRITE="off"
 META_MODEL_TYPE="cat"
 USE_FULL_SHARES=False

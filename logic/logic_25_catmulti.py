@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
-from tqdm import tqdm  
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import logic.tools as tools
@@ -11,7 +11,8 @@ import forest
 from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import roc_curve, auc
 from bot.trading.orders import buy_shares, sell_shares
-
+import bot.selection.loader as loader
+import bot.cli.backtest as backtest
 
 # =====================================================
 # CONFIGURATION
@@ -33,6 +34,7 @@ GINI_THRESHOLD = 0.09
 ENTROPY_THRESHOLD = 0.90
 VAL_FRACTION = 0.2
 LOOKAHEAD_HORIZONS = [2, 4, 6, 8, 10, 12]
+HALF_LIFE_OPTIONS = [500, 750, 100]
 QUANTILE_WINDOW = 32
 
 # Trading / risk parameters
@@ -42,6 +44,12 @@ GAIN_CLOSE_RATE = 0.10
 COOL_OFF_AFTER_CLOSE_TRADE = 3
 GRID_SEARCH_ENABLED = True
 GRID_SEARCH_WINDOW_CANDLES = 100
+
+# Optional: global override (kept for compatibility / debugging)
+# - If HALF_LIFE_OVERRIDE is not None, it overrides all tickers and cache.
+HALF_LIFE_OVERRIDE: Optional[int] = None
+
+_HALF_LIFE_OVERRIDE_BY_TICKER: Dict[str, int] = {}
 
 # =====================================================
 # PATH HELPERS
@@ -61,6 +69,81 @@ def _get_model_path(ticker: str, offset: int) -> str:
 
 def _get_risk_state_path(ticker: str) -> str:
     return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_risk_state.json")
+
+
+def _get_half_life_cache_path(ticker: str) -> str:
+    return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_half_life.json")
+
+
+# =====================================================
+# JSON HELPERS
+# =====================================================
+
+def _read_json(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+# =====================================================
+# HALF-LIFE SELECTION (CACHE + OVERRIDES)
+# =====================================================
+
+def get_desired_half_life(ticker: str, default: int = 500) -> int:
+    """
+    Returns the desired half-life for this ticker.
+
+    Priority:
+      1) Global override HALF_LIFE_OVERRIDE (if set)
+      2) Per-ticker in-memory override (used during tuning loops)
+      3) Per-ticker cached best half-life on disk
+      4) default
+    """
+    if HALF_LIFE_OVERRIDE is not None:
+        return max(1, int(HALF_LIFE_OVERRIDE))
+
+    if ticker in _HALF_LIFE_OVERRIDE_BY_TICKER:
+        return max(1, int(_HALF_LIFE_OVERRIDE_BY_TICKER[ticker]))
+
+    cache = _read_json(_get_half_life_cache_path(ticker))
+    hl = cache.get("best_half_life", None)
+    try:
+        hl = int(hl)
+    except Exception:
+        hl = None
+
+    if hl is None:
+        return max(1, int(default))
+
+    return max(1, int(hl))
+
+
+def save_desired_half_life(
+    ticker: str,
+    best_half_life: int,
+    best_score: float,
+    all_scores: List[Dict[str, Any]],
+) -> None:
+    payload = {
+        "ticker": ticker,
+        "best_half_life": int(best_half_life),
+        "best_score": float(best_score),
+        "all_scores": all_scores,
+        "selected_at": datetime.utcnow().isoformat(),
+        "half_life_options": list(HALF_LIFE_OPTIONS),
+    }
+    _write_json_atomic(_get_half_life_cache_path(ticker), payload)
 
 
 # =====================================================
@@ -179,7 +262,6 @@ def _get_feature_and_target_columns(df: pd.DataFrame) -> Tuple[List[str], List[s
     return feature_cols, target_cols
 
 
-
 # =====================================================
 # MODEL TRAINING AND CACHING
 # =====================================================
@@ -190,6 +272,7 @@ def _train_models_for_timestamp(
     feature_cols: List[str],
     target_cols: List[str],
     is_backtest: bool = False,
+    half_life: int = 500,
 ) -> Dict[str, Any]:
 
     df_cut = df[df["time"] <= current_time].copy()
@@ -200,11 +283,17 @@ def _train_models_for_timestamp(
         logger.info(
             f"Not enough data to train (need > 600 candles, have {n})."
         )
-        return {"models": [], "feature_cols": feature_cols, "target_offsets": []}
+        return {
+            "models": [],
+            "feature_cols": feature_cols,
+            "target_offsets": [],
+            "label_mapping": {-1: 0, 0: 1, 1: 2},
+            "reverse_mapping": {0: -1, 1: 0, 2: 1},
+            "trained_until": current_time.isoformat(),
+            "half_life": max(1, int(half_life)),
+        }
 
     window_df = df_cut.copy()
-
-
     X_window_full = window_df[feature_cols]
 
     # Label mapping
@@ -214,6 +303,8 @@ def _train_models_for_timestamp(
     models_cache: List[Dict[str, Any]] = []
     target_offsets: List[int] = []
 
+    hl = max(1, int(half_life))
+
     for target_col in target_cols:
         offset = int(target_col.split("_", 1)[1])
 
@@ -221,10 +312,6 @@ def _train_models_for_timestamp(
         y_window_raw = window_df[target_col].map(label_mapping)
 
         # --- Horizon-specific cut (backtest only) ---
-        # For horizon t, we drop the last t candles from both X and y.
-        # This ensures that for all remaining rows, their forward label
-        # uses information that would be available at current_time in a
-        # realistic backtest.
         if is_backtest and offset > 0:
             effective_len = len(window_df) - offset
             if effective_len <= 0:
@@ -258,7 +345,7 @@ def _train_models_for_timestamp(
         y_val = y_window.iloc[split_index:]
 
         logger.info(
-            f"Training CatBoost for {target_col} (offset={offset}), "
+            f"Training CatBoost for {target_col} (offset={offset}, half_life={hl}), "
             f"class distribution: {y_train.value_counts().to_dict()}"
         )
 
@@ -273,9 +360,10 @@ def _train_models_for_timestamp(
             early_stopping_rounds=20,
             verbose=False
         )
-        ages = np.arange(len(X_train)-1, -1, -1)     # oldest gets largest age, newest gets 0
-        HALF_LIFE = 750
-        weights = np.exp(-np.log(2) * ages / HALF_LIFE)
+
+        # Exponential decay weights (half-life)
+        ages = np.arange(len(X_train) - 1, -1, -1)  # oldest gets largest age, newest gets 0
+        weights = np.exp(-np.log(2) * ages / float(hl))
         train_pool = Pool(X_train, y_train, weight=weights)
         model.fit(train_pool)
 
@@ -317,9 +405,9 @@ def _train_models_for_timestamp(
         "target_offsets": target_offsets,
         "label_mapping": {-1: 0, 0: 1, 1: 2},
         "reverse_mapping": {0: -1, 1: 0, 2: 1},
-        "trained_until": current_time.isoformat()
+        "trained_until": current_time.isoformat(),
+        "half_life": hl,
     }
-
 
 
 def _save_models_to_disk(ticker: str, train_result: Dict[str, Any]) -> None:
@@ -329,6 +417,7 @@ def _save_models_to_disk(ticker: str, train_result: Dict[str, Any]) -> None:
     label_mapping = train_result.get("label_mapping", {-1: 0, 0: 1, 1: 2})
     reverse_mapping = train_result.get("reverse_mapping", {0: -1, 1: 0, 2: 1})
     trained_until = train_result.get("trained_until", None)
+    half_life = int(train_result.get("half_life", 500))
 
     for m in models_cache:
         offset = m["offset"]
@@ -344,7 +433,8 @@ def _save_models_to_disk(ticker: str, train_result: Dict[str, Any]) -> None:
         "reverse_mapping": reverse_mapping,
         "trained_until": trained_until,
         "runs_since_retrain": 0,
-        "retrain_every": RETRAIN_EVERY
+        "retrain_every": RETRAIN_EVERY,
+        "half_life": half_life,
     }
 
     with open(_get_model_meta_path(ticker), "w") as f:
@@ -366,6 +456,7 @@ def _load_models_from_disk(ticker: str) -> Tuple[List[Dict[str, Any]], Dict[str,
 
     meta["label_mapping"] = label_mapping
     meta["reverse_mapping"] = reverse_mapping
+
     models_cache: List[Dict[str, Any]] = []
 
     for offset in target_offsets:
@@ -389,7 +480,8 @@ def _update_meta_retrain_counter(ticker: str, meta: Dict[str, Any], reset: bool)
             "reverse_mapping": {0: -1, 1: 0, 2: 1},
             "trained_until": None,
             "runs_since_retrain": 0,
-            "retrain_every": RETRAIN_EVERY
+            "retrain_every": RETRAIN_EVERY,
+            "half_life": None,
         }
 
     if reset:
@@ -399,6 +491,9 @@ def _update_meta_retrain_counter(ticker: str, meta: Dict[str, Any], reset: bool)
 
     if "retrain_every" not in meta:
         meta["retrain_every"] = RETRAIN_EVERY
+
+    if "half_life" not in meta:
+        meta["half_life"] = None
 
     with open(_get_model_meta_path(ticker), "w") as f:
         json.dump(meta, f)
@@ -419,7 +514,7 @@ def _load_risk_state(ticker: str) -> Dict[str, Any]:
             "take_profit_price": None,
             "loss_close_rate": LOSS_CLOSE_RATE,
             "gain_close_rate": GAIN_CLOSE_RATE,
-            "cooloff_after_close_trade": COOL_OFF_AFTER_CLOSE_TRADE,  # NEW: per-ticker cooloff
+            "cooloff_after_close_trade": COOL_OFF_AFTER_CLOSE_TRADE,  # per-ticker cooloff
             "last_close_timestamp": None,
             "last_action": None  # "close_long" or "close_short"
         }
@@ -437,7 +532,6 @@ def _load_risk_state(ticker: str) -> Dict[str, Any]:
     return state
 
 
-
 def _save_risk_state(ticker: str, state: Dict[str, Any]) -> None:
     """
     Persist risk state JSON to disk.
@@ -450,6 +544,7 @@ def _save_risk_state(ticker: str, state: Dict[str, Any]) -> None:
 # =====================================================
 # ENSEMBLE PREDICTION
 # =====================================================
+
 def _grid_search_execution_params(
     df_hist: pd.DataFrame,
     ticker: str,
@@ -619,7 +714,6 @@ def _grid_search_execution_params(
     return best_tuple
 
 
-
 def _get_pred_target_for_timestamp(
     df: pd.DataFrame,
     current_time: datetime,
@@ -661,6 +755,16 @@ def _get_pred_target_for_timestamp(
     # Load cached models and meta
     models_cache, meta = _load_models_from_disk(ticker)
 
+    # Desired (per-ticker) half-life from cache/override
+    desired_half_life = get_desired_half_life(ticker, default=HALF_LIFE_OPTIONS[0])
+
+    trained_half_life: Optional[int] = None
+    if meta:
+        try:
+            trained_half_life = int(meta.get("half_life", None))
+        except Exception:
+            trained_half_life = None
+
     # Parse trained_until
     trained_until_str = meta.get("trained_until") if meta else None
     trained_until: Optional[datetime] = None
@@ -691,15 +795,24 @@ def _get_pred_target_for_timestamp(
         logger.info(
             f"runs_since_retrain={runs_since_retrain} ≥ retrain_every={retrain_every}, retraining."
         )
+    elif trained_half_life is None:
+        need_retrain = True
+        logger.info(f"No half_life in meta for {ticker}, retraining.")
+    elif trained_half_life != desired_half_life:
+        need_retrain = True
+        logger.info(
+            f"{ticker} half_life changed: trained={trained_half_life}, desired={desired_half_life}; retraining."
+        )
 
     if need_retrain:
-        # 1) Train models
+        # 1) Train models with the per-ticker desired half-life
         train_result = _train_models_for_timestamp(
             df=df_cut,
             current_time=current_time,
             feature_cols=feature_cols,
             target_cols=target_cols,
             is_backtest=is_backtest,
+            half_life=desired_half_life,
         )
         _save_models_to_disk(ticker, train_result)
 
@@ -813,6 +926,7 @@ def _get_pred_target_for_timestamp(
     _update_meta_retrain_counter(ticker, meta, reset=need_retrain)
 
     return pred_target, models_up, models_down, models_stable, model_stats
+
 
 def _compute_action_confidence(
     action: str,
@@ -1006,7 +1120,7 @@ def _decide_trade_action(
             risk_state["last_direction"] = None
 
         elif q == 0:
-            # Open long via BUY (parameters already tuned in risk_state, if grid search is enabled)
+            # Open long via BUY
             action = "BUY"
             reason = "LONG: open long"
             risk_state["last_entry_price"] = float(current_price)
@@ -1075,7 +1189,6 @@ def _decide_trade_action(
     return action, debug_info
 
 
-
 # =====================================================
 # PUBLIC ENTRYPOINTS
 # =====================================================
@@ -1108,9 +1221,6 @@ def run_logic(current_price, predicted_price, ticker):
     latest_row = df.iloc[-1]
     current_timestamp = latest_row["time"]
 
-    # Sanity check: ensure passed current_price is consistent (optional)
-    # but do not enforce strictly to avoid accidental runtime issues.
-    # Decide action using shared engine
     action, debug_info = _decide_trade_action(
         current_price=float(current_price),
         current_timestamp=current_timestamp,
@@ -1212,3 +1322,88 @@ def run_backtest(
 
     return action
 
+
+# =====================================================
+# HALF-LIFE TUNING (OFFLINE)
+# =====================================================
+
+def _extract_score(result: Any) -> float:
+    """
+    Convert bot.cli.backtest.run_backtest(...) output to a single float to maximize.
+
+    Adjust this if your CLI returns a different structure.
+    """
+    if result is None:
+        return float("-inf")
+
+    if isinstance(result, (int, float, np.floating, np.integer)):
+        val = float(result)
+        return val if np.isfinite(val) else float("-inf")
+
+    if isinstance(result, dict):
+        for key in ("score", "pnl", "total_pnl", "return", "sharpe"):
+            if key in result:
+                val = float(result[key])
+                return val if np.isfinite(val) else float("-inf")
+
+    return float("-inf")
+
+
+def get_best_half_life(force: bool = False) -> None:
+    """
+    Cycles through each ticker and each HALF_LIFE_OPTIONS value, runs your backtest,
+    and caches the best half-life per ticker to:
+        catboost-multi/<TICKER>_half_life.json
+
+    Tie-break rule:
+      - highest score wins
+      - if scores tie, the higher half-life wins
+    """
+    tickers = loader.load_tickerlist()
+
+    for ticker in tqdm(tickers, desc="Half-life tuning"):
+        cache_path = _get_half_life_cache_path(ticker)
+        if os.path.exists(cache_path) and not force:
+            continue
+
+        all_scores: List[Dict[str, Any]] = []
+        best_score = float("-inf")
+        best_hl: Optional[int] = None
+
+        for hl in HALF_LIFE_OPTIONS:
+            try:
+                forest.BACKTEST_TICKER = ticker
+
+                # Force this ticker to use the candidate half-life during evaluation
+                _HALF_LIFE_OVERRIDE_BY_TICKER[ticker] = int(hl)
+
+                # Run your CLI backtest and score it
+                result = backtest.run_backtest(["backtest", str(hl), "simple"])
+                score = _extract_score(result)
+
+            except Exception as e:
+                logger.exception(f"[{ticker}] Half-life test failed for hl={hl}: {e}")
+                score = float("-inf")
+
+            all_scores.append({"half_life": int(hl), "score": float(score)})
+
+            # Tie-breaker: higher half-life wins when score equal
+            if best_hl is None or (float(score), int(hl)) > (float(best_score), int(best_hl)):
+                best_score = float(score)
+                best_hl = int(hl)
+
+        # Clear in-memory override for this ticker
+        _HALF_LIFE_OVERRIDE_BY_TICKER.pop(ticker, None)
+
+        if best_hl is None:
+            logger.warning(f"[{ticker}] No valid half-life results; not caching.")
+            continue
+
+        save_desired_half_life(
+            ticker=ticker,
+            best_half_life=best_hl,
+            best_score=best_score,
+            all_scores=all_scores,
+        )
+
+        logger.info(f"[{ticker}] Best half-life={best_hl} score={best_score}")

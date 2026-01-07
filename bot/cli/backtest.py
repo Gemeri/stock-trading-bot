@@ -4,6 +4,7 @@ import bot.trading.logic as logicScript
 from catboost import CatBoostRegressor
 import bot.stuffs.candles as candles
 import bot.ml.pipelines as pipelines
+import bot.ml.registry as registry
 import bot.ml.stacking as stacking
 import matplotlib.pyplot as plt
 import bot.ml.models as models
@@ -183,6 +184,7 @@ def clear_backtest_cache(path: str) -> None:
 
 
 def run_backtest(parts):
+    logging.info(parts)
     final_values_by_logic = {}
     if len(parts) < 2:
         logging.warning(
@@ -238,7 +240,7 @@ def run_backtest(parts):
         LOGIC_MODULE_MAP = json.load(f) if os.path.getsize(json_path) else {}
 
     # Precompute ML models for ticker once (still reused below)
-    ml_models = pipelines.get_ml_models_for_ticker(forest.BACKTEST_TICKER)
+    ml_models = registry.get_ml_models_for_ticker(forest.BACKTEST_TICKER)
 
     # --------------------------------------------------------------
     #  Determine which logic module(s) to run
@@ -431,7 +433,7 @@ def run_backtest(parts):
 
         if approach in ["simple", "complex"]:
             # (Re)fetch ml models inside approach block, as original code did
-            ml_models = pipelines.get_ml_models_for_ticker(forest.BACKTEST_TICKER)
+            ml_models = registry.get_ml_models_for_ticker(forest.BACKTEST_TICKER)
             if approach == "simple":
                 horizon_buffer = max(0, horizon_gap - 1)
                 train_df = df.iloc[:train_end]

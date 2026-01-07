@@ -7,6 +7,8 @@ import copy
 import pickle
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
+from bot.trading.orders import buy_shares, sell_shares
+
 
 import numpy as np
 import pandas as pd
@@ -437,7 +439,7 @@ def run_logic(current_price: float,
         logger.info(f"Live Logic: Model action = {action}")
         # 6) Trade execution
         try:
-            from forest import api, buy_shares, sell_shares
+            from forest import api
             cash = api.get_cash()
             logger.info(f"Live: Current cash {cash}, pos {position_qty}")
             if action == "BUY":

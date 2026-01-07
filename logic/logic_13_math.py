@@ -14,6 +14,8 @@ import pandas as pd
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
 from sklearn.utils import check_random_state
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # gplearn
 from gplearn.genetic import SymbolicRegressor
@@ -297,7 +299,7 @@ def run_logic(current_price: float, _predicted_price: float, ticker: str):
     feat_row = _load_full_data(ticker).iloc[-1][FEATURES].values.reshape(1, -1)
     pred = cache.model.predict(feat_row)[0]
 
-    from forest import api, buy_shares, sell_shares   # type: ignore
+    from forest import api
     try:
         cash = float(api.get_account().cash)
         qty = float(api.get_position(ticker).qty)

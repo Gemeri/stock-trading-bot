@@ -6,6 +6,8 @@ import pandas as pd
 from typing import Tuple, Dict, Any, List
 from dotenv import load_dotenv
 import logic.tools as tools
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # --- Module Initialization ---
 load_dotenv()
@@ -338,7 +340,7 @@ def load_rl(filename: str) -> RLQAgent:
 
 def run_logic(current_price, predicted_price, ticker):
     import sys
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 
     # Locate pre-trained models
     ga_path = f"{ticker}_{CONVERTED_TIMEFRAME}{GA_MODEL_PATH}"

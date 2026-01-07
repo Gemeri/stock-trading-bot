@@ -10,6 +10,7 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.optimizers import Adam
+from bot.trading.orders import buy_shares, sell_shares
 
 agent = None
 STATE_SIZE = None
@@ -184,7 +185,7 @@ THRESHOLD = 0.01        # 1 % difference required between predicted & current
 def run_logic(current_price: float, predicted_price: float, ticker: str):
     init_models_if_needed(ticker)
 
-    from forest import api, buy_shares, sell_shares, short_shares, close_short
+    from forest import api
 
     # ------------------------------------------------------------------ data
     try:
@@ -218,23 +219,14 @@ def run_logic(current_price: float, predicted_price: float, ticker: str):
         action = "NONE"
 
     # ------------------------------------------------------------- execution
-    if action == "BUY":
+    if action == "BUY" or action == "COVER":
         max_shares = int(cash // current_price)
         buy_shares(ticker, max_shares, current_price, predicted_price)
         logging.info(f"Executed BUY for {ticker}")
 
-    elif action == "SELL":
+    elif action == "SELL" or action == "SHORT":
         sell_shares(ticker, position_qty, current_price, predicted_price)
         logging.info(f"Executed SELL for {ticker}")
-
-    elif action == "SHORT":
-        max_shares = int(cash // current_price)
-        short_shares(ticker, max_shares, current_price, predicted_price)
-        logging.info(f"Executed SHORT for {ticker}")
-
-    elif action == "COVER":
-        close_short(ticker, abs(position_qty), current_price)
-        logging.info(f"Executed COVER for {ticker}")
 
     else:
         logging.debug("No action taken.")

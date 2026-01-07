@@ -9,6 +9,8 @@ from sklearn.preprocessing import StandardScaler
 from collections import deque
 import functools
 import logic.tools as tools
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # For genetic programming
 from deap import base, creator, tools, gp
@@ -40,7 +42,7 @@ FEATURE_COLUMNS = tools.FEATURES
 
 # =========== API/EXECUTION STUBS ===========
 try:
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 except ImportError:
     class DummyAPI:
         cash = 100000

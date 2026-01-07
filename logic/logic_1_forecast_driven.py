@@ -1,7 +1,8 @@
 import logging
+from bot.trading.orders import buy_shares, sell_shares
 
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 
     logger = logging.getLogger(__name__)
 

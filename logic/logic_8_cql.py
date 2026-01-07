@@ -13,6 +13,8 @@ import logic.tools as tools
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # --------------------------- Logging -----------------------------------------
 
@@ -407,7 +409,7 @@ def run_logic(current_price: float, predicted_price: float, ticker: str):
     - Executes BUY (max shares) / SELL (all) / NONE
     """
     import logging
-    from forest import api, buy_shares, sell_shares  # provided by caller's environment
+    from forest import api
 
     logger = logging.getLogger(__name__)
     logger.info(f"[{ticker}] Starting CQL training (live).")

@@ -15,8 +15,6 @@ try:
 except ImportError:
     print("Not running from script")
 from typing import List, Tuple, Dict, Optional
-
-
 # ---- Logging Setup ---- #
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger("EvoBot")
@@ -683,23 +681,16 @@ class Candidate:
         lines.append("    import pandas as pd")
         lines.append("    import numpy as np")
         lines.append("    from dotenv import load_dotenv")
-        lines.append("    from forest import api, buy_shares, sell_shares")
+        lines.append("    from forest import api")
+        lines.append("    import logic.tools as tools")
+        lines.append("    from bot.trading.orders import buy_shares, sell_shares")
         lines.append("")
         lines.append("    logger = logging.getLogger(__name__)")
         lines.append("")
         lines.append("    load_dotenv()")
-        lines.append("    BAR_TIMEFRAME = os.getenv(\"BAR_TIMEFRAME\", \"1Hour\")")
-        lines.append("    TIMEFRAME_MAP = {")
-        lines.append("        \"4Hour\": \"H4\",")
-        lines.append("        \"2Hour\": \"H2\",")
-        lines.append("        \"1Hour\": \"H1\",")
-        lines.append("        \"30Min\": \"M30\",")
-        lines.append("        \"15Min\": \"M15\"")
-        lines.append("    }")
-        lines.append("    CONVERTED_TIMEFRAME = TIMEFRAME_MAP.get(BAR_TIMEFRAME, BAR_TIMEFRAME)")
         lines.append("")
         lines.append("    def _csv_filename(tkr: str) -> str:")
-        lines.append("        return os.path.join(\"data\", f\"{tkr}_{CONVERTED_TIMEFRAME}.csv\")")
+        lines.append("        return tools.get_csv_filename(tkr)")
         lines.append("")
         lines.append("    @lru_cache(maxsize=16)")
         lines.append("    def _latest_row(tkr: str):")

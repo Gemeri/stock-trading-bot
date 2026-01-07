@@ -12,6 +12,8 @@ import logic.tools as tools
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3ʳᵈ-party: gplearn provides fast, pure-Python symbolic regression
@@ -27,7 +29,7 @@ except ImportError as e:  # pragma: no cover
 
 # Optional: forest trading API ------------------------------------------------
 try:
-    from forest import api, buy_shares, sell_shares  # type: ignore
+    from forest import api
 except Exception:  # Local or back-test environment – stub out the API.
     api = None  # type: ignore
 

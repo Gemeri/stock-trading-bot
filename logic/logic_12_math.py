@@ -10,6 +10,8 @@ from sklearn.model_selection import TimeSeriesSplit
 from skopt import gp_minimize
 from scipy.stats import zscore
 import logic.tools as tools
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # ========== ENV VARS, PATHS, LOGGING ==========
 
@@ -252,7 +254,7 @@ def plot_equity_curve(curve, filename):
 # ========== LIVE TRADE INTERFACE ==========
 
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 
     logger.info(f"[{ticker}] Live logic: Price={current_price}, Predicted={predicted_price}")
     try:

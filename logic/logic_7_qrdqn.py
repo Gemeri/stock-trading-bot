@@ -19,6 +19,8 @@ from sb3_contrib import QRDQN
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import ProgressBarCallback
 from stable_baselines3.common.utils import set_random_seed
+from bot.trading.orders import buy_shares, sell_shares
+
 
 
 # ------------------------------
@@ -321,7 +323,7 @@ def _action_to_str(action: int) -> str:
 
 def run_logic(current_price: float, predicted_price: float, ticker: str) -> None:
     import logging
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 
     log = logging.getLogger(__name__)
 

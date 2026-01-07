@@ -8,6 +8,8 @@ import logic.tools as tools
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # === Environment Setup ===
 load_dotenv()
@@ -100,7 +102,7 @@ def _train_or_update_model(ticker, df_train):
     return scaler, model
 
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 
     # Load/cached model and scaler for the ticker
     global _MODEL_CACHE

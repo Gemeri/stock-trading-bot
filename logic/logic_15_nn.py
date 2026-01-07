@@ -7,6 +7,8 @@ import torch
 import logic.tools as tools
 import torch.nn as nn
 import torch.optim as optim
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # --------------- ENVIRONMENT CONFIGURATION -----------------
 load_dotenv()
@@ -99,7 +101,7 @@ def _standardize(train_df: pd.DataFrame, test_row: pd.Series):
 _model_cache = {}  # Cache models for re-use during a single run (backtest only)
 
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 
     try:
         filename = get_csv_filename(ticker)

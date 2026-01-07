@@ -6,7 +6,8 @@ from stable_baselines3 import PPO
 from sklearn.ensemble import RandomForestRegressor
 import gym
 from gym import spaces
-from forest import api, buy_shares, sell_shares
+from bot.trading.orders import buy_shares, sell_shares
+from forest import api
 import logging
 import logic.tools as tools
 

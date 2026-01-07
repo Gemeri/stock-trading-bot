@@ -7,6 +7,8 @@ import logging
 from dotenv import load_dotenv
 import os
 import logic.tools as tools
+from bot.trading.orders import buy_shares, sell_shares
+
 
 load_dotenv()
 timeframe_mapping = {"4Hour": "H4", "2Hour": "H2", "1Hour": "H1", "30Min": "M30", "15Min": "M15"}
@@ -202,7 +204,7 @@ def genetic_algorithm_cv(train_data, population_size=50, generations=30,
 # ----------------------------
 
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares
+    from forest import api
     try:
         df = pd.read_csv(get_csv_filename(ticker))
     except Exception as e:

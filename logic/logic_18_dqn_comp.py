@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 from stable_baselines3 import DQN
 from dotenv import load_dotenv
 import logic.tools as tools
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # =============================================================================
 # Load .env variables and set up configuration
@@ -203,7 +205,7 @@ def preprocess_candles_for_backtest(candles, current_timestamp, predicted_price)
 # Main External Trade Logic Functions
 # =============================================================================
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares, short_shares, close_short
+    from forest import api
 
     # Load and preprocess the CSV data
     df = load_and_preprocess_csv(get_csv_filename(ticker), predicted_price)

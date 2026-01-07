@@ -14,6 +14,8 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback
 from tqdm import tqdm
 import logic.tools as tools
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # ─────────────────────────────── Configuration ─────────────────────────────────
 INITIAL_BAL = 1_000.0
@@ -179,7 +181,7 @@ def _infer_action(model: SAC, env: StockTradingEnv,
     return 0
 
 def run_logic(current_price: float, predicted_price: float, ticker: str):
-    from forest import api, buy_shares, sell_shares   # noqa
+    from forest import api
     logger = logging.getLogger(__name__)
 
     # 1) Load history (with possible historic predictions if present)

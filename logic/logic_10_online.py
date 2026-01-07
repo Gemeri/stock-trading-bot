@@ -14,13 +14,14 @@ import logic.tools as tools
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.policies import ActorCriticPolicy
+from bot.trading.orders import buy_shares, sell_shares
 
 # Memory system
 import faiss
 from sentence_transformers import SentenceTransformer
 
 # Your trading API
-from forest import api, buy_shares, sell_shares
+from forest import api
 
 # ---------------------------------
 # Configuration & Utilities
@@ -232,3 +233,84 @@ def run_backtest(current_price: float,
         return "SELL"
     else:
         return "NONE"
+
+def run_logic(current_price, predicted_price, ticker):
+    try:
+        account = api.get_account()
+        cash = float(account.cash)
+    except Exception as e:
+        logger.error(f"[{ticker}] Error fetching account details: {e}")
+        return
+
+    # Retrieve current position for the ticker
+    try:
+        pos = api.get_position(ticker)
+        position_qty = float(pos.qty)
+    except Exception:
+        position_qty = 0.0  # Assume no position if none exists
+
+    # Load & preprocess full CSV history
+    try:
+        csv_path = get_csv_filename(ticker)  # uses tools.get_csv_filename(ticker)
+        full = pd.read_csv(csv_path, parse_dates=["timestamp"])
+    except Exception as e:
+        logger.error(f"[{ticker}] Error reading CSV ({ticker}): {e}")
+        return
+
+    if full is None or full.empty:
+        logger.error(f"[{ticker}] CSV is empty; cannot run logic.")
+        return
+
+    full = preprocess_df(full, FEATURES)
+
+    # Use history up to the latest available timestamp in the CSV (avoid any future data conceptually)
+    current_timestamp = pd.to_datetime(full["timestamp"].iloc[-1])
+    hist = full[full["timestamp"] <= current_timestamp].reset_index(drop=True)
+
+    if len(hist) < 2:
+        logger.error(f"[{ticker}] Not enough rows in CSV to run env/model (need >= 2).")
+        return
+
+    env = TradingEnv(hist)
+
+    # train/load + online tune
+    model_path = f"{ticker}_ppo.zip"
+    norm_stats_path = model_path.replace(".zip", "_vecnormalize.pkl")
+    model, vec_env = train_or_load_agent(env, model_path)
+
+    # optional small online update each cycle
+    model.learn(total_timesteps=10_000)
+    model.save(model_path, exclude=EXCLUDE_ON_SAVE)
+    vec_env.save(norm_stats_path)
+
+    # Build obs from last CSV row (NOT from candles)
+    last_row = hist.iloc[-1]
+    last_obs = last_row[FEATURES].values.astype(np.float32)
+
+    # VecNormalize expects (n_env, obs_dim)
+    obs = np.expand_dims(last_obs, axis=0)
+    obs = vec_env.normalize_obs(obs)
+
+    action, _ = model.predict(obs, deterministic=True)
+    action = int(action[0])
+
+    if action == 1:
+        if position_qty == 0:
+            max_shares = int(cash // current_price)
+            if max_shares > 0:
+                logger.info(f"[{ticker}] BUY signal. Buying {max_shares} shares at {current_price}.")
+                buy_shares(ticker, max_shares, current_price, predicted_price)
+            else:
+                logger.info(f"[{ticker}] BUY signal but insufficient cash.")
+        else:
+            logger.info(f"[{ticker}] BUY signal but already holding shares; no action taken.")
+
+    elif action == 2:
+        if position_qty > 0:
+            logger.info(f"[{ticker}] SELL signal. Selling {position_qty} shares at {current_price}.")
+            sell_shares(ticker, position_qty, current_price, predicted_price)
+        else:
+            logger.info(f"[{ticker}] SELL signal but no position; no action taken.")
+
+    else:
+        logger.info(f"[{ticker}] NONE signal; no trade action taken.")

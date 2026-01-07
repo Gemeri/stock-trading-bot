@@ -5,6 +5,7 @@ import logging
 from typing import Optional, Tuple, Dict, Any
 
 import logic.tools as tools
+from bot.trading.orders import buy_shares, sell_shares
 import numpy as np
 import pandas as pd
 
@@ -336,7 +337,7 @@ def _decide_action(
 
 # ---- Live Trading Entrypoint -------------------------------------------------
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares  # Provided by your framework
+    from forest import api
 
     logger = logging.getLogger(__name__)
     # Account & position

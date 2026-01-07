@@ -14,6 +14,8 @@ from torch.optim import Adam
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 import logic.tools as tools
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # --------------------------------------------------------------------------
 # ------------------------------  CONFIG  ----------------------------------
@@ -432,7 +434,7 @@ def _prepare_env(full_df: pd.DataFrame, predicted_price: float, stop_ts=None):
 
 # -------------------------  RUN LOGIC  ------------------------------------
 def run_logic(current_price: float, predicted_price: float, ticker: str):
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)

@@ -183,6 +183,7 @@ def clear_backtest_cache(path: str) -> None:
 
 
 def run_backtest(parts):
+    final_values_by_logic = {}
     if len(parts) < 2:
         logging.warning(
             "Usage: backtest <N> [simple|complex] [timeframe?] [-r?] "
@@ -1025,4 +1026,23 @@ def run_backtest(parts):
                 f"[{forest.BACKTEST_TICKER}] Saved portfolio plot for {logic_module_name} → {port_png}"
             )
 
+        if portfolio_records:
+            final_value = float(portfolio_records[-1]["portfolio_value"])
+        else:
+            # fallback (should be rare): if no records, at least return cash
+            final_value = float(cash)
+
+        final_values_by_logic[logic_module_name] = final_value
+        logging.info(
+            f"[{forest.BACKTEST_TICKER}] FINAL portfolio value — {logic_module_name}: {final_value:.2f}"
+        )
+
         clear_backtest_cache(cache_path)
+
+    # ✅ return value(s)
+    if run_all:
+        return final_values_by_logic
+    # single mode: return the only value (or None if nothing ran)
+    if logic_modules_to_run:
+        return final_values_by_logic.get(logic_modules_to_run[0])
+    return None

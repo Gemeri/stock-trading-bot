@@ -24,6 +24,11 @@ try:
 except ImportError:
     print("Not running from script")
 
+try:
+    from bot.trading.orders import buy_shares, sell_shares
+except ImportError:
+    print("Not running from script") 
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 TCN_CACHE_DIR = "tcn-cache"
@@ -1064,7 +1069,7 @@ def run_logic(current_price, predicted_price, ticker):
     Live trading entry point.
     - Uses cached TCN from tcn-cache and retrains only when countdown hits 0 or cache invalid.
     """
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 
     logger = logging.getLogger(__name__)
     key = _ticker_key(ticker)

@@ -12,6 +12,8 @@ import pandas as pd
 from sklearn.svm import SVR
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # --------------------------------------------------------------------------------------
 # Configuration & CSV access (kept here for self-containment and reliability)
@@ -247,7 +249,7 @@ def _safe_int_shares(cash: float, price: float) -> int:
 # --------------------------------------------------------------------------------------
 
 def run_logic(current_price: float, predicted_price: float, ticker: str):
-    from forest import api, buy_shares, sell_shares  # imported here to avoid issues in non-trading contexts
+    from forest import api
 
     logger = logging.getLogger(__name__)
 

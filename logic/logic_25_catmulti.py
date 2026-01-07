@@ -10,6 +10,8 @@ import logic.tools as tools
 import forest
 from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import roc_curve, auc
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # =====================================================
 # CONFIGURATION
@@ -1079,7 +1081,7 @@ def _decide_trade_action(
 # =====================================================
 
 def run_logic(current_price, predicted_price, ticker):
-    from forest import api, buy_shares, sell_shares  # imported here to keep script importable
+    from forest import api
 
     logger = logging.getLogger(__name__)
 

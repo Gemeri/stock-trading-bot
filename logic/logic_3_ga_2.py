@@ -12,6 +12,8 @@ import pandas as pd
 from deap import algorithms, base, creator, tools
 from sklearn.preprocessing import StandardScaler
 from deap import algorithms
+from bot.trading.orders import buy_shares, sell_shares
+
 
 # ── Hyper‑parameters (easy tuning) ───────────────────────────────────────────
 POP_SIZE: int = 100
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 # ── Optional trading API stubs ───────────────────────────────────────────────
 try:
-    from forest import api, buy_shares, sell_shares
+    from forest import api
 except ModuleNotFoundError:
     logger.warning("Trading API not found – using stubs (back‑test mode).")
 

@@ -183,7 +183,7 @@ def clear_backtest_cache(path: str) -> None:
         logging.warning(f"Unable to remove backtest cache {path}: {e}")
 
 
-def run_backtest(parts):
+def run_backtest(parts, use_ml=True):
     logging.info(parts)
     final_values_by_logic = {}
     if len(parts) < 2:

@@ -1330,8 +1330,6 @@ def run_backtest(
 def _extract_score(result: Any) -> float:
     """
     Convert bot.cli.backtest.run_backtest(...) output to a single float to maximize.
-
-    Adjust this if your CLI returns a different structure.
     """
     if result is None:
         return float("-inf")
@@ -1378,7 +1376,7 @@ def get_best_half_life(force: bool = False) -> None:
                 _HALF_LIFE_OVERRIDE_BY_TICKER[ticker] = int(hl)
 
                 # Run your CLI backtest and score it
-                result = backtest.run_backtest(["backtest", str(hl), "simple"])
+                result = backtest.run_backtest(["backtest", "500", "simple"], use_ml=False)
                 score = _extract_score(result)
 
             except Exception as e:

@@ -79,6 +79,7 @@ BING_API_KEY  = os.getenv("BING_API_KEY", "")
 OPENAI_API_KEY= os.getenv("OPENAI_API_KEY", "")
 AI_TICKER_COUNT = config.AI_TICKER_COUNT
 AI_TICKERS: list[str] = []
+USE_TICKER_SELECTION = config.USE_TICKER_SELECTION
 
 # maximum number of distinct tickers allowed in portfolio (0=unlimited)
 MAX_TICKERS = config.MAX_TICKERS
@@ -125,7 +126,7 @@ import bot.ml.stacking as stacking
 
 def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
     selected, check = ranking.load_best_ticker_cache()
-    if check == None:
+    if check == None and USE_TICKER_SELECTION == True:
         selected = ranking.select_best_tickers(top_n=TICKERLIST_TOP_N,
                                     skip_data=skip_data)
     loader._ensure_ai_tickers()
@@ -268,11 +269,14 @@ def run_job(scheduled_time_ny: str):
                 return
 
     global TICKERS
-    cached, _ = ranking.load_best_ticker_cache()
-    if cached:
-        TICKERS = cached
+    if USE_TICKER_SELECTION == True:
+        cached, _ = ranking.load_best_ticker_cache()
+        if cached:
+            TICKERS = cached
+        else:
+            TICKERS = ranking.compute_and_cache_best_tickers()
     else:
-        TICKERS = ranking.compute_and_cache_best_tickers()
+        TICKERS = loader.load_tickerlist()
 
     _perform_trading_job(skip_data=False, scheduled_time_ny=scheduled_time_ny)
 

@@ -240,7 +240,7 @@ def run_backtest(parts, use_ml=True):
         LOGIC_MODULE_MAP = json.load(f) if os.path.getsize(json_path) else {}
 
     # Precompute ML models for ticker once (still reused below)
-    ml_models = registry.get_ml_models_for_ticker(forest.BACKTEST_TICKER)
+    ml_models = registry.get_ml_models_for_ticker(forest.BACKTEST_TICKER) if use_ml else []
 
     # --------------------------------------------------------------
     #  Determine which logic module(s) to run
@@ -274,7 +274,7 @@ def run_backtest(parts, use_ml=True):
         )
     else:
         # Original single-logic behaviour
-        if {
+        if use_ml and {
             "forest_cls", "xgboost_cls", "lightgbm_cls",
             "transformer_cls", "sub-vote", "sub_meta",
             "sub-meta", "sub_vote", "catboost_cls"
@@ -432,74 +432,78 @@ def run_backtest(parts, use_ml=True):
                 return csh
 
         if approach in ["simple", "complex"]:
-            # (Re)fetch ml models inside approach block, as original code did
-            ml_models = registry.get_ml_models_for_ticker(forest.BACKTEST_TICKER)
-            if approach == "simple":
-                horizon_buffer = max(0, horizon_gap - 1)
-                train_df = df.iloc[:train_end]
-                if horizon_buffer > 0:
-                    if len(train_df) <= horizon_buffer:
+            if use_ml:
+                # (Re)fetch ml models inside approach block, as original code did
+                ml_models = registry.get_ml_models_for_ticker(forest.BACKTEST_TICKER)
+                if approach == "simple":
+                    horizon_buffer = max(0, horizon_gap - 1)
+                    train_df = df.iloc[:train_end]
+                    if horizon_buffer > 0:
+                        if len(train_df) <= horizon_buffer:
+                            logging.error(
+                                f"[{forest.BACKTEST_TICKER}] Not enough training rows after horizon cut."
+                            )
+                            continue
+                        train_df = train_df.iloc[:-horizon_buffer]
+                    test_df  = df.iloc[train_end:]
+                    idx_list = list(test_df.index)
+
+                    feature_cols = [c for c in forest.POSSIBLE_FEATURE_COLS if c in train_df.columns]
+                    X_train = train_df[feature_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                    y_train = train_df['target']
+
+                    model_stack = []
+                    for m in ml_models:
+                        if m in ["forest", "rf", "randomforest"]:
+                            mdl = RandomForestRegressor(
+                                n_estimators=N_ESTIMATORS,
+                                random_state=RANDOM_SEED
+                            )
+                        elif m == "xgboost":
+                            mdl = xgb.XGBRegressor(
+                                n_estimators=114,
+                                max_depth=9,
+                                learning_rate=0.14264252588219034,
+                                subsample=0.5524803023252148,
+                                colsample_bytree=0.7687841723045249,
+                                gamma=0.5856035407199236,
+                                reg_alpha=0.5063880221467401,
+                                reg_lambda=0.0728996118523866,
+                            )
+                        elif m == "catboost":
+                            mdl = CatBoostRegressor(
+                                iterations=600, depth=6, learning_rate=0.05,
+                                l2_leaf_reg=3, bagging_temperature=0.5,
+                                loss_function="RMSE", eval_metric="RMSE",
+                                random_seed=42, verbose=False
+                            )
+                        elif m in ["lightgbm", "lgbm"]:
+                            mdl = lgb.LGBMRegressor(
+                                n_estimators=N_ESTIMATORS,
+                                random_state=RANDOM_SEED
+                            )
+                        else:
+                            continue
+                        pipelines.fixed_fit(X_train, y_train, mdl)
+                        model_stack.append(mdl)
+
+                    if not model_stack:
                         logging.error(
-                            f"[{forest.BACKTEST_TICKER}] Not enough training rows after horizon cut."
+                            f"[{forest.BACKTEST_TICKER}] No supported model for simple backtest."
                         )
                         continue
-                    train_df = train_df.iloc[:-horizon_buffer]
-                test_df  = df.iloc[train_end:]
-                idx_list = list(test_df.index)
+                else:  # complex
+                    idx_list = list(range(train_end, total_len))
 
-                feature_cols = [c for c in forest.POSSIBLE_FEATURE_COLS if c in train_df.columns]
-                X_train = train_df[feature_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-                y_train = train_df['target']
-
-                model_stack = []
-                for m in ml_models:
-                    if m in ["forest", "rf", "randomforest"]:
-                        mdl = RandomForestRegressor(
-                            n_estimators=N_ESTIMATORS,
-                            random_state=RANDOM_SEED
-                        )
-                    elif m == "xgboost":
-                        mdl = xgb.XGBRegressor(
-                            n_estimators=114,
-                            max_depth=9,
-                            learning_rate=0.14264252588219034,
-                            subsample=0.5524803023252148,
-                            colsample_bytree=0.7687841723045249,
-                            gamma=0.5856035407199236,
-                            reg_alpha=0.5063880221467401,
-                            reg_lambda=0.0728996118523866,
-                        )
-                    elif m == "catboost":
-                        mdl = CatBoostRegressor(
-                            iterations=600, depth=6, learning_rate=0.05,
-                            l2_leaf_reg=3, bagging_temperature=0.5,
-                            loss_function="RMSE", eval_metric="RMSE",
-                            random_seed=42, verbose=False
-                        )
-                    elif m in ["lightgbm", "lgbm"]:
-                        mdl = lgb.LGBMRegressor(
-                            n_estimators=N_ESTIMATORS,
-                            random_state=RANDOM_SEED
-                        )
-                    else:
-                        continue
-                    pipelines.fixed_fit(X_train, y_train, mdl)
-                    model_stack.append(mdl)
-
-                if not model_stack:
+                min_train_rows = len(train_df) if approach == "simple" else len(df.iloc[:train_end]) - max(0, horizon_gap - 1)
+                if min_train_rows < 70:
                     logging.error(
-                        f"[{forest.BACKTEST_TICKER}] No supported model for simple backtest."
+                        f"[{forest.BACKTEST_TICKER}] Not enough training rows for {approach} approach."
                     )
                     continue
-            else:  # complex
-                idx_list = list(range(train_end, total_len))
-
-            min_train_rows = len(train_df) if approach == "simple" else len(df.iloc[:train_end]) - max(0, horizon_gap - 1)
-            if min_train_rows < 70:
-                logging.error(
-                    f"[{forest.BACKTEST_TICKER}] Not enough training rows for {approach} approach."
-                )
-                continue
+            else:
+                test_df = df.iloc[train_end:]
+                idx_list = list(test_df.index)
 
             total_iterations = len(idx_list)
             resume_data = restore_backtest_state(
@@ -526,7 +530,7 @@ def run_backtest(parts, use_ml=True):
                     f"at candle {start_iter} of {total_iterations}."
                 )
 
-            if "sub-vote" in ml_models or "sub-meta" in ml_models:
+            if use_ml and ("sub-vote" in ml_models or "sub-meta" in ml_models):
                 mode       = "sub-vote" if "sub-vote" in ml_models else "sub-meta"
                 signal_df  = models.call_sub_main(forest.BACKTEST_TICKER, df, 500)
 
@@ -691,29 +695,32 @@ def run_backtest(parts, use_ml=True):
                     if i_ < start_iter:
                         continue
 
-                    if approach == "simple":
-                        if row_idx == 0:
-                            continue
-                        feat_row = df.loc[row_idx - 1, feature_cols]
-                        X_pred = pd.DataFrame([feat_row], columns=feature_cols)
-                        X_pred = X_pred.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-                        preds = [mdl.predict(X_pred)[0] for mdl in model_stack]
-                        pred_close = float(np.mean(preds))
-                    else:
-                        sub_df = df.iloc[:row_idx]
-                        if horizon_gap > 1:
-                            if len(sub_df) <= horizon_gap - 1:
-                                logging.error(
-                                    f"[{forest.BACKTEST_TICKER}] Not enough rows for training after horizon cut."
-                                )
-                                break
-                            sub_df_for_training = sub_df.iloc[: -(horizon_gap - 1)]
+                    if use_ml:
+                        if approach == "simple":
+                            if row_idx == 0:
+                                continue
+                            feat_row = df.loc[row_idx - 1, feature_cols]
+                            X_pred = pd.DataFrame([feat_row], columns=feature_cols)
+                            X_pred = X_pred.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                            preds = [mdl.predict(X_pred)[0] for mdl in model_stack]
+                            pred_close = float(np.mean(preds))
                         else:
-                            sub_df_for_training = sub_df
-                        pred_close = stacking.train_and_predict(
-                            sub_df_for_training,
-                            ticker=forest.BACKTEST_TICKER
-                        )
+                            sub_df = df.iloc[:row_idx]
+                            if horizon_gap > 1:
+                                if len(sub_df) <= horizon_gap - 1:
+                                    logging.error(
+                                        f"[{forest.BACKTEST_TICKER}] Not enough rows for training after horizon cut."
+                                    )
+                                    break
+                                sub_df_for_training = sub_df.iloc[: -(horizon_gap - 1)]
+                            else:
+                                sub_df_for_training = sub_df
+                            pred_close = stacking.train_and_predict(
+                                sub_df_for_training,
+                                ticker=forest.BACKTEST_TICKER
+                            )
+                    else:
+                        pred_close = 0.0
                     row_data   = df.loc[row_idx]
                     real_close = row_data["close"]
 

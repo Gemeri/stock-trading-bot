@@ -11,7 +11,7 @@ next_price_col = "open"
 require_full_horizon = True
 out_prefix = ""
 
-def add_good_enough_band_labels(
+def build_labels(
     df: pd.DataFrame,
     action_type: int,
 ) -> pd.DataFrame:

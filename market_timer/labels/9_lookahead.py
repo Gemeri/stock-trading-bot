@@ -5,7 +5,7 @@ lookahead = 9
 close_col = "close"
 label_col = "label"
 
-def label_lookahead_extrema(
+def build_labels(
     df: pd.DataFrame,
     action_type: int,
 ) -> pd.DataFrame:

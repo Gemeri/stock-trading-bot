@@ -4,7 +4,7 @@ import numpy as np
 window=9
 threshold_pct=0.5
 
-def label_market_timing(df, action_type):
+def build_labels(df, action_type):
     # Validate inputs
     if action_type not in [0, 1]:
         raise ValueError("action_type must be 0 (SELL) or 1 (BUY)")
@@ -103,14 +103,14 @@ if __name__ == "__main__":
     print("=" * 80)
     print("EXAMPLE 1: BUY ACTION (action_type=1)")
     print("=" * 80)
-    df_buy = label_market_timing(sample_df, action_type=1, window=9, threshold_pct=0.5)
+    df_buy = build_labels(sample_df, action_type=1, window=9, threshold_pct=0.5)
     print("\nFirst 20 rows with labels:")
     print(df_buy[['close', 'optimal_price', 'price_diff_pct', 'candles_to_optimal', 'label']].head(20))
     
     print("\n" + "=" * 80)
     print("EXAMPLE 2: SELL ACTION (action_type=0)")
     print("=" * 80)
-    df_sell = label_market_timing(sample_df, action_type=0, window=9, threshold_pct=0.5)
+    df_sell = build_labels(sample_df, action_type=0, window=9, threshold_pct=0.5)
     print("\nFirst 20 rows with labels:")
     print(df_sell[['close', 'optimal_price', 'price_diff_pct', 'candles_to_optimal', 'label']].head(20))
     

@@ -5,7 +5,7 @@ tp_percent=0.03
 sl_percent=0.015
 horizon=9
 
-def label_triple_barrier(df, action_type):
+def build_labels(df, action_type):
     labels = []
     prices = df['close'].values
     

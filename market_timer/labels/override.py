@@ -13,7 +13,7 @@ out_prefix = ""
 opportunity_horizon = None
 min_opportunity = 0.0
 
-def add_execute_until_deterioration_labels(
+def build_labels(
     df: pd.DataFrame,
     action_flag: int,              # 1 = BUY, 0 = SELL
 ) -> pd.DataFrame:

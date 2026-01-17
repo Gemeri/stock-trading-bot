@@ -228,8 +228,8 @@ def execution_backtest(
             )
 
     accuracy = (correct / total) if total else 0.0
-    logging.info("Accuracy: " + accuracy)
-    logging.info(correct + "/" + total + " Correct")
+    logging.info(f"Accuracy: {accuracy:.4f}")
+    logging.info(f"{correct}/{total} Correct")
     return {
         "ticker": ticker,
         "samples": total,

@@ -5,6 +5,7 @@ import bot.stuffs.candles as candles
 import bot.ml.pipelines as pipelines
 import bot.trading.orders as orders
 import bot.cli.backtest as backtest
+import market_timer.timer as timer
 import bot.ml.stacking as stacking
 import matplotlib.pyplot as plt
 import bot.ml.models as models
@@ -407,6 +408,24 @@ def console_listener():
             logging.info("  sell (ticker) <amount|$dollars>")
             logging.info("  commands")
 
+        elif cmd == "backtest-execute":
+            if len(parts) < 4:
+                logging.info("Usage: backtest-execute <label number> <model name> <direction number (0 SELL, 1 BUY)>")
+                continue
+            tf_code = candles.timeframe_to_code(forest.BAR_TIMEFRAME)
+            ticker_fs = candles.fs_safe_ticker(forest.BACKTEST_TICKER)
+            csv_filename = candles.candle_csv_path(ticker_fs, tf_code)
+            df = candles.read_csv_limited(csv_filename)
+            timer.execution_backtest(df, forest.BACKTEST_TICKER, parts[1], parts[2], parts[3])
+        elif cmd == "get-execution":
+            if len(parts) < 4:
+                logging.info("Usage: get-execution <label number> <model name> <direction number (0 SELL, 1 BUY)>")
+                continue
+            tf_code = candles.timeframe_to_code(forest.BAR_TIMEFRAME)
+            ticker_fs = candles.fs_safe_ticker(forest.BACKTEST_TICKER)
+            csv_filename = candles.candle_csv_path(ticker_fs, tf_code)
+            df = candles.read_csv_limited(csv_filename)
+            timer.get_execution_decision(df, forest.BACKTEST_TICKER, parts[1], parts[2], parts[3])
         elif cmd == "set-timeframe":
             if len(parts) < 2:
                 logging.info("Usage: set-timeframe 4Hour/1Day/etc.")

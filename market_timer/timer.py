@@ -2,6 +2,9 @@ import importlib
 from typing import Callable, Tuple
 import numpy as np
 import pandas as pd
+import logging
+
+logger = logging.getLogger(__name__)
 
 USE_STATIC_THRESHOLDS = True
 
@@ -145,6 +148,13 @@ def execution_backtest(
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (SELL) or 1 (BUY)")
 
+    # tqdm progress bar (safe fallback if tqdm isn't installed)
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        def tqdm(iterable, **kwargs):
+            return iterable
+
     label_builder, label_col = _get_label_builder(label)
     full_labeled = label_builder(df.copy(), direction)
     if label == 2 and "label_execute_final" in full_labeled.columns:
@@ -159,7 +169,14 @@ def execution_backtest(
     total = 0
     correct = 0
 
-    for idx in range(start_idx, n):
+    it = tqdm(
+        range(start_idx, n),
+        total=(n - start_idx),
+        desc=f"Backtest {ticker} ({'BUY' if direction == 1 else 'SELL'})",
+        unit="step",
+    )
+
+    for idx in it:
         y_true = y_full.iloc[idx]
         if pd.isna(y_true):
             continue
@@ -191,18 +208,28 @@ def execution_backtest(
             else:
                 probas_train = _predict_proba_series(model, fitted, X_train)
                 threshold = _best_threshold_from_grid(probas_train, y_train)
+
             x_pred = X_full.iloc[[idx]]
             prob_execute = _predict_proba(model, fitted, x_pred)
             predicted = 1 if prob_execute >= threshold else 0
         except Exception:
-            fallback_threshold = 0.5 if USE_STATIC_THRESHOLDS else 0.5
+            fallback_threshold = 0.5
             predicted = int(y_train.mean() >= fallback_threshold)
 
         total += 1
         if int(y_true) == predicted:
             correct += 1
 
+        # Update bar info occasionally to avoid slowing the loop
+        if total and (total % 25 == 0):
+            it.set_postfix(
+                samples=total,
+                acc=f"{(correct / total):.4f}",
+            )
+
     accuracy = (correct / total) if total else 0.0
+    logging.info("Accuracy: " + accuracy)
+    logging.info(correct + "/" + total + " Correct")
     return {
         "ticker": ticker,
         "samples": total,

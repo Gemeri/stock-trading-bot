@@ -416,7 +416,9 @@ def console_listener():
             ticker_fs = candles.fs_safe_ticker(forest.BACKTEST_TICKER)
             csv_filename = candles.candle_csv_path(ticker_fs, tf_code)
             df = candles.read_csv_limited(csv_filename)
-            timer.execution_backtest(df, forest.BACKTEST_TICKER, parts[1], parts[2], parts[3])
+            label = int(parts[1])
+            direction = int(parts[3])
+            timer.execution_backtest(df, forest.BACKTEST_TICKER, label=label, model=parts[2], direction=direction)
         elif cmd == "get-execution":
             if len(parts) < 4:
                 logging.info("Usage: get-execution <label number> <model name> <direction number (0 SELL, 1 BUY)>")

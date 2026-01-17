@@ -3,6 +3,7 @@ from typing import Callable, Tuple
 import numpy as np
 import pandas as pd
 
+USE_STATIC_THRESHOLDS = True
 
 def _get_label_builder(label: int) -> Tuple[Callable[[pd.DataFrame, int], pd.DataFrame], str]:
     if label == 1:
@@ -67,6 +68,35 @@ def _predict_proba(model_name: str, model, x_pred: pd.DataFrame) -> float:
         return float(proba[-1])
     raise ValueError(f"Unsupported model: {model_name!r}")
 
+def _predict_proba_series(model_name: str, model, x_pred: pd.DataFrame) -> np.ndarray:
+    model_name = model_name.lower()
+    if model_name in {"cat", "catboost", "cb"}:
+        from market_timer.models import cat
+
+        return np.asarray(cat.predict(model, x_pred), dtype=float)
+    if model_name in {"lstm"}:
+        from market_timer.models import lstm
+
+        return np.asarray(lstm.predict(model, x_pred), dtype=float)
+    raise ValueError(f"Unsupported model: {model_name!r}")
+
+
+def _best_threshold_from_grid(probas: np.ndarray, y_true: pd.Series) -> float:
+    if probas.size == 0:
+        return 0.5
+    y_arr = np.asarray(y_true, dtype=int)
+    grid = np.linspace(0.5, 0.8, num=31)
+    best_threshold = 0.5
+    best_accuracy = -1.0
+    for threshold in grid:
+        preds = (probas >= threshold).astype(int)
+        accuracy = float((preds == y_arr).mean())
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_threshold = float(threshold)
+    return best_threshold
+
+
 
 def get_execution_decision(
     df: pd.DataFrame,
@@ -94,10 +124,15 @@ def get_execution_decision(
         raise ValueError("No labeled rows available for training.")
 
     fitted = _fit_model(model, X_train, y_train)
+    if USE_STATIC_THRESHOLDS:
+        threshold = 0.5
+    else:
+        probas_train = _predict_proba_series(model, fitted, X_train)
+        threshold = _best_threshold_from_grid(probas_train, y_train)
     x_pred = X.tail(1)
     prob_execute = _predict_proba(model, fitted, x_pred)
 
-    return "EXECUTE" if prob_execute >= 0.5 else "WAIT"
+    return "EXECUTE" if prob_execute >= threshold else "WAIT"
 
 
 def execution_backtest(
@@ -151,11 +186,17 @@ def execution_backtest(
 
         try:
             fitted = _fit_model(model, X_train, y_train)
+            if USE_STATIC_THRESHOLDS:
+                threshold = 0.5
+            else:
+                probas_train = _predict_proba_series(model, fitted, X_train)
+                threshold = _best_threshold_from_grid(probas_train, y_train)
             x_pred = X_full.iloc[[idx]]
             prob_execute = _predict_proba(model, fitted, x_pred)
-            predicted = 1 if prob_execute >= 0.5 else 0
+            predicted = 1 if prob_execute >= threshold else 0
         except Exception:
-            predicted = int(y_train.mean() >= 0.5)
+            fallback_threshold = 0.5 if USE_STATIC_THRESHOLDS else 0.5
+            predicted = int(y_train.mean() >= fallback_threshold)
 
         total += 1
         if int(y_true) == predicted:

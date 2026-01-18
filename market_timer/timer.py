@@ -8,6 +8,15 @@ logger = logging.getLogger(__name__)
 
 USE_STATIC_THRESHOLDS = True
 
+
+def _is_rl_model(model_name: str) -> bool:
+    return model_name.lower() in {"rl"}
+
+
+def _direction_to_str(direction: int) -> str:
+    return "BUY" if direction == 1 else "SELL"
+
+
 def _get_label_builder(label: int) -> Tuple[Callable[[pd.DataFrame, int], pd.DataFrame], str]:
     if label == 1:
         module = importlib.import_module("market_timer.labels.goodenough")
@@ -111,6 +120,14 @@ def get_execution_decision(
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (SELL) or 1 (BUY)")
 
+    if _is_rl_model(model):
+        from market_timer.models import rl
+
+        model_direction = _direction_to_str(direction)
+        fitted = rl.fit(df.copy(), direction=model_direction)
+        return rl.predict(fitted, df.copy())
+
+
     label_builder, label_col = _get_label_builder(label)
     labeled = label_builder(df.copy(), direction)
     if label == 2 and "label_execute_final" in labeled.columns:
@@ -147,6 +164,41 @@ def execution_backtest(
 ):
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (SELL) or 1 (BUY)")
+
+    if _is_rl_model(model):
+        from market_timer.models import rl
+
+        model_direction = _direction_to_str(direction)
+        fitted = rl.fit(df.copy(), direction=model_direction)
+        runner = rl.TimingRunner(fitted)
+        start_idx = max(0, fitted.window - 1)
+
+        execute_count = 0
+        wait_count = 0
+        total = 0
+
+        for idx in range(start_idx, len(df)):
+            action = runner.step(df.iloc[: idx + 1])
+            total += 1
+            if action == "EXECUTE":
+                execute_count += 1
+            else:
+                wait_count += 1
+
+        logging.info(
+            "RL backtest completed. Samples=%s EXECUTE=%s WAIT=%s",
+            total,
+            execute_count,
+            wait_count,
+        )
+        return {
+            "ticker": ticker,
+            "samples": total,
+            "correct": None,
+            "accuracy": None,
+            "execute": execute_count,
+            "wait": wait_count,
+        }
 
     # tqdm progress bar (safe fallback if tqdm isn't installed)
     try:

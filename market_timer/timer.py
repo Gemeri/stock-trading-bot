@@ -154,7 +154,6 @@ def get_execution_decision(
 
     return "EXECUTE" if prob_execute >= threshold else "WAIT"
 
-
 def execution_backtest(
     df: pd.DataFrame,
     ticker: str,
@@ -168,37 +167,149 @@ def execution_backtest(
     if _is_rl_model(model):
         from market_timer.models import rl
 
+        # tqdm progress bar (safe fallback if tqdm isn't installed)
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            def tqdm(iterable, **kwargs):
+                return iterable
+
         model_direction = _direction_to_str(direction)
-        fitted = rl.fit(df.copy(), direction=model_direction)
-        runner = rl.TimingRunner(fitted)
-        start_idx = max(0, fitted.window - 1)
+
+        # ---- Holdout split to avoid leakage (train on early data, eval on later data)
+        n = len(df)
+        split = int(n * 0.8)
+        train_df = df.iloc[:split].copy()
+
+        # Optional: show a small spinner-style tqdm for training (fit can be slow)
+        # If you don't want any output during training, remove this "logging" line.
+        fitted = rl.fit(train_df, direction=model_direction)
+
+        # Execution prices must match RL's training assumption: "next candle open"
+        exec_price_col = fitted.exec_price_col
+        if exec_price_col not in df.columns:
+            raise ValueError(f"df missing exec_price_col={exec_price_col!r} for RL evaluation")
+
+        exec_prices = df[exec_price_col].shift(-1).to_numpy(dtype=np.float32)
+        exec_prices[-1] = np.float32(df[exec_price_col].iloc[-1])
+
+        # We evaluate only on the test segment, but the state can use earlier history.
+        start_idx = max(split, fitted.window - 1)
+        end_idx = n - 2  # need idx+1 to exist for "next open" assumption
+        if start_idx > end_idx:
+            raise ValueError("Not enough rows in test segment for RL backtest.")
+
+        # ---- Episode-based evaluation
+        wait_steps = 0
+        t0 = start_idx
+
+        episodes = 0
+        regrets: list[float] = []
+
+        hit0 = 0
+        hit1 = 0
+        hit2 = 0
 
         execute_count = 0
         wait_count = 0
-        total = 0
 
-        for idx in range(start_idx, len(df)):
-            action = runner.step(df.iloc[: idx + 1])
-            total += 1
-            if action == "EXECUTE":
-                execute_count += 1
+        it = tqdm(
+            range(start_idx, end_idx + 1),
+            total=(end_idx - start_idx + 1),
+            desc=f"RL Backtest {ticker} ({model_direction})",
+            unit="step",
+        )
+
+        for idx in it:
+            # New episode starts whenever we just executed (wait_steps reset to 0)
+            if wait_steps == 0:
+                t0 = idx
+
+            # Force EXECUTE at horizon to match training environment behavior
+            if wait_steps >= fitted.horizon:
+                action = "EXECUTE"
             else:
+                action = rl.predict(fitted, df.iloc[: idx + 1], wait_steps=wait_steps)
+
+            if action == "WAIT":
                 wait_count += 1
+                wait_steps = min(wait_steps + 1, fitted.horizon)
+            else:
+                # EXECUTE
+                execute_count += 1
+                te = idx
+
+                end = min(t0 + fitted.horizon, len(exec_prices) - 1)
+                window = exec_prices[t0 : end + 1]
+                exec_price = float(exec_prices[te])
+
+                if model_direction == "BUY":
+                    best_pos = int(np.argmin(window))
+                    best_price = float(window[best_pos])
+                    best_t = t0 + best_pos
+                    regret = max(exec_price - best_price, 0.0)
+                else:
+                    best_pos = int(np.argmax(window))
+                    best_price = float(window[best_pos])
+                    best_t = t0 + best_pos
+                    regret = max(best_price - exec_price, 0.0)
+
+                percent_regret = regret / max(best_price, 1e-12)
+                regrets.append(float(percent_regret))
+
+                dist = abs(te - best_t)
+                if dist == 0:
+                    hit0 += 1
+                if dist <= 1:
+                    hit1 += 1
+                if dist <= 2:
+                    hit2 += 1
+
+                episodes += 1
+                wait_steps = 0  # reset episode
+
+            # Update bar info occasionally to avoid slowing the loop
+            if (idx - start_idx) % 25 == 0:
+                avg_regret_running = float(np.mean(regrets)) if regrets else 0.0
+                hit1_running = (hit1 / episodes) if episodes else 0.0
+                it.set_postfix(
+                    episodes=episodes,
+                    hit1=f"{hit1_running:.4f}",
+                    avg_regret=f"{avg_regret_running:.6f}",
+                    exec=execute_count,
+                    wait=wait_count,
+                )
+
+        avg_regret = float(np.mean(regrets)) if regrets else None
+        med_regret = float(np.median(regrets)) if regrets else None
+
+        hit0_rate = (hit0 / episodes) if episodes else None
+        hit1_rate = (hit1 / episodes) if episodes else None
+        hit2_rate = (hit2 / episodes) if episodes else None
 
         logging.info(
-            "RL backtest completed. Samples=%s EXECUTE=%s WAIT=%s",
-            total,
+            "RL eval done. episodes=%s avg_regret=%.6f hit@1=%.4f execute=%s wait=%s",
+            episodes,
+            avg_regret if avg_regret is not None else -1.0,
+            hit1_rate if hit1_rate is not None else 0.0,
             execute_count,
             wait_count,
         )
+
         return {
             "ticker": ticker,
-            "samples": total,
+            "samples": episodes,              # episodes, not candles
             "correct": None,
-            "accuracy": None,
+            "accuracy": hit1_rate,            # treat hit@1 as "accuracy-like"
+            "avg_percent_regret": avg_regret,
+            "median_percent_regret": med_regret,
+            "hit@0": hit0_rate,
+            "hit@1": hit1_rate,
+            "hit@2": hit2_rate,
             "execute": execute_count,
             "wait": wait_count,
         }
+
 
     # tqdm progress bar (safe fallback if tqdm isn't installed)
     try:

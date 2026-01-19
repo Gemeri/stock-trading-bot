@@ -59,6 +59,11 @@ def _fit_model(model_name: str, x_train: pd.DataFrame, y_train: pd.Series):
         from market_timer.models import cat
 
         return cat.fit(x_train, y_train)
+    if model_name in {"cat-multi", "cat_multi", "catmulti"}:
+        from market_timer.models import cat
+
+        y_flipped = 1 - y_train
+        return cat.fit(x_train, y_train), cat.fit(x_train, y_flipped)
     if model_name in {"lstm"}:
         from market_timer.models import lstm
 
@@ -73,6 +78,14 @@ def _predict_proba(model_name: str, model, x_pred: pd.DataFrame) -> float:
 
         proba = cat.predict(model, x_pred)
         return float(proba[-1])
+    if model_name in {"cat-multi", "cat_multi", "catmulti"}:
+        from market_timer.models import cat
+
+        execute_model, wait_model = model
+        execute_proba = float(cat.predict(execute_model, x_pred)[-1])
+        wait_proba = float(cat.predict(wait_model, x_pred)[-1])
+        inverted_wait_proba = 1.0 - wait_proba
+        return (execute_proba + inverted_wait_proba) / 2.0
     if model_name in {"lstm"}:
         from market_timer.models import lstm
 
@@ -86,6 +99,14 @@ def _predict_proba_series(model_name: str, model, x_pred: pd.DataFrame) -> np.nd
         from market_timer.models import cat
 
         return np.asarray(cat.predict(model, x_pred), dtype=float)
+    if model_name in {"cat-multi", "cat_multi", "catmulti"}:
+        from market_timer.models import cat
+
+        execute_model, wait_model = model
+        execute_proba = np.asarray(cat.predict(execute_model, x_pred), dtype=float)
+        wait_proba = np.asarray(cat.predict(wait_model, x_pred), dtype=float)
+        inverted_wait_proba = 1.0 - wait_proba
+        return (execute_proba + inverted_wait_proba) / 2.0
     if model_name in {"lstm"}:
         from market_timer.models import lstm
 

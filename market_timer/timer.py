@@ -110,50 +110,6 @@ def _best_threshold_from_grid(probas: np.ndarray, y_true: pd.Series) -> float:
 
 
 
-def get_execution_decision(
-    df: pd.DataFrame,
-    ticker: str,
-    label: int,
-    model: str,
-    direction: int,
-):
-    if direction not in (0, 1):
-        raise ValueError("direction must be 0 (SELL) or 1 (BUY)")
-
-    if _is_rl_model(model):
-        from market_timer.models import rl
-
-        model_direction = _direction_to_str(direction)
-        fitted = rl.fit(df.copy(), direction=model_direction)
-        return rl.predict(fitted, df.copy())
-
-
-    label_builder, label_col = _get_label_builder(label)
-    labeled = label_builder(df.copy(), direction)
-    if label == 2 and "label_execute_final" in labeled.columns:
-        label_col = "label_execute_final"
-
-    y = _normalize_labels(labeled[label_col])
-    X = _prepare_features(df)
-
-    mask = y.notna()
-    X_train = X.loc[mask]
-    y_train = y.loc[mask].astype(int)
-
-    if X_train.empty:
-        raise ValueError("No labeled rows available for training.")
-
-    fitted = _fit_model(model, X_train, y_train)
-    if USE_STATIC_THRESHOLDS:
-        threshold = 0.5
-    else:
-        probas_train = _predict_proba_series(model, fitted, X_train)
-        threshold = _best_threshold_from_grid(probas_train, y_train)
-    x_pred = X.tail(1)
-    prob_execute = _predict_proba(model, fitted, x_pred)
-
-    return "EXECUTE" if prob_execute >= threshold else "WAIT"
-
 def execution_backtest(
     df: pd.DataFrame,
     ticker: str,
@@ -164,6 +120,7 @@ def execution_backtest(
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (SELL) or 1 (BUY)")
 
+    # ---------------- RL PATH (unchanged behavior; label-count metrics not applicable) ----------------
     if _is_rl_model(model):
         from market_timer.models import rl
 
@@ -181,8 +138,6 @@ def execution_backtest(
         split = int(n * 0.8)
         train_df = df.iloc[:split].copy()
 
-        # Optional: show a small spinner-style tqdm for training (fit can be slow)
-        # If you don't want any output during training, remove this "logging" line.
         fitted = rl.fit(train_df, direction=model_direction)
 
         # Execution prices must match RL's training assumption: "next candle open"
@@ -221,11 +176,9 @@ def execution_backtest(
         )
 
         for idx in it:
-            # New episode starts whenever we just executed (wait_steps reset to 0)
             if wait_steps == 0:
                 t0 = idx
 
-            # Force EXECUTE at horizon to match training environment behavior
             if wait_steps >= fitted.horizon:
                 action = "EXECUTE"
             else:
@@ -235,7 +188,6 @@ def execution_backtest(
                 wait_count += 1
                 wait_steps = min(wait_steps + 1, fitted.horizon)
             else:
-                # EXECUTE
                 execute_count += 1
                 te = idx
 
@@ -266,9 +218,8 @@ def execution_backtest(
                     hit2 += 1
 
                 episodes += 1
-                wait_steps = 0  # reset episode
+                wait_steps = 0
 
-            # Update bar info occasionally to avoid slowing the loop
             if (idx - start_idx) % 25 == 0:
                 avg_regret_running = float(np.mean(regrets)) if regrets else 0.0
                 hit1_running = (hit1 / episodes) if episodes else 0.0
@@ -296,6 +247,9 @@ def execution_backtest(
             wait_count,
         )
 
+        # Label counts / FP% aren't meaningful for this RL metric; return None for those.
+        print(f"[RL] episodes={episodes} hit@1={hit1_rate} execute={execute_count} wait={wait_count}")
+
         return {
             "ticker": ticker,
             "samples": episodes,              # episodes, not candles
@@ -308,8 +262,15 @@ def execution_backtest(
             "hit@2": hit2_rate,
             "execute": execute_count,
             "wait": wait_count,
+            "true_1_count": None,
+            "true_0_count": None,
+            "pred_1_count": None,
+            "pred_0_count": None,
+            "false_positives": None,
+            "false_positive_pct": None,
         }
 
+    # ---------------- NON-RL PATH (UPDATED: counts + FP%) ----------------
 
     # tqdm progress bar (safe fallback if tqdm isn't installed)
     try:
@@ -331,6 +292,13 @@ def execution_backtest(
 
     total = 0
     correct = 0
+
+    # New counters
+    true_1_count = 0
+    true_0_count = 0
+    pred_1_count = 0
+    pred_0_count = 0
+    false_positives = 0  # predicted 1 when true is 0
 
     it = tqdm(
         range(start_idx, n),
@@ -376,26 +344,69 @@ def execution_backtest(
             prob_execute = _predict_proba(model, fitted, x_pred)
             predicted = 1 if prob_execute >= threshold else 0
         except Exception:
+            # fallback: predict majority class in training set (with 0.5 rule)
             fallback_threshold = 0.5
             predicted = int(y_train.mean() >= fallback_threshold)
 
+        y_true_int = int(y_true)
+
+        # Update totals
         total += 1
-        if int(y_true) == predicted:
+        if y_true_int == 1:
+            true_1_count += 1
+        else:
+            true_0_count += 1
+
+        if predicted == 1:
+            pred_1_count += 1
+        else:
+            pred_0_count += 1
+
+        if y_true_int == predicted:
             correct += 1
 
-        # Update bar info occasionally to avoid slowing the loop
+        if predicted == 1 and y_true_int == 0:
+            false_positives += 1
+
+        # Update bar info occasionally
         if total and (total % 25 == 0):
+            # False positive % as False Positive Rate (FPR) over actual negatives: FP / (FP + TN) = FP / true_0_count
+            fp_pct_running = (false_positives / true_0_count * 100.0) if true_0_count else 0.0
             it.set_postfix(
                 samples=total,
                 acc=f"{(correct / total):.4f}",
+                fp_pct=f"{fp_pct_running:.2f}%",
+                t1=true_1_count,
+                t0=true_0_count,
             )
 
     accuracy = (correct / total) if total else 0.0
+
+    # False positive % as False Positive Rate (FPR) over actual negatives
+    false_positive_pct = (false_positives / true_0_count * 100.0) if true_0_count else 0.0
+
     logging.info(f"Accuracy: {accuracy:.4f}")
     logging.info(f"{correct}/{total} Correct")
+    logging.info(f"True label counts: 1={true_1_count}, 0={true_0_count}")
+    logging.info(f"Pred label counts: 1={pred_1_count}, 0={pred_0_count}")
+    logging.info(f"False positives: {false_positives} (FPR={false_positive_pct:.2f}%)")
+
+    # Also print (as requested)
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"{correct}/{total} Correct")
+    print(f"True label counts: 1={true_1_count}, 0={true_0_count}")
+    print(f"Pred label counts: 1={pred_1_count}, 0={pred_0_count}")
+    print(f"False positives: {false_positives} (false positive % (FPR)={false_positive_pct:.2f}%)")
+
     return {
         "ticker": ticker,
         "samples": total,
         "correct": correct,
         "accuracy": accuracy,
+        "true_1_count": true_1_count,
+        "true_0_count": true_0_count,
+        "pred_1_count": pred_1_count,
+        "pred_0_count": pred_0_count,
+        "false_positives": false_positives,
+        "false_positive_pct": false_positive_pct,  # FPR = FP / actual_0 * 100
     }

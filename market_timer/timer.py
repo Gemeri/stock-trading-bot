@@ -130,6 +130,49 @@ def _best_threshold_from_grid(probas: np.ndarray, y_true: pd.Series) -> float:
     return best_threshold
 
 
+def get_execution_decision(
+    df: pd.DataFrame,
+    ticker: str,
+    label: int,
+    model: str,
+    direction: int,
+):
+    if direction not in (0, 1):
+        raise ValueError("direction must be 0 (SELL) or 1 (BUY)")
+
+    if _is_rl_model(model):
+        from market_timer.models import rl
+
+        model_direction = _direction_to_str(direction)
+        fitted = rl.fit(df.copy(), direction=model_direction)
+        return rl.predict(fitted, df.copy())
+
+
+    label_builder, label_col = _get_label_builder(label)
+    labeled = label_builder(df.copy(), direction)
+    if label == 2 and "label_execute_final" in labeled.columns:
+        label_col = "label_execute_final"
+
+    y = _normalize_labels(labeled[label_col])
+    X = _prepare_features(df)
+
+    mask = y.notna()
+    X_train = X.loc[mask]
+    y_train = y.loc[mask].astype(int)
+
+    if X_train.empty:
+        raise ValueError("No labeled rows available for training.")
+
+    fitted = _fit_model(model, X_train, y_train)
+    if USE_STATIC_THRESHOLDS:
+        threshold = 0.5
+    else:
+        probas_train = _predict_proba_series(model, fitted, X_train)
+        threshold = _best_threshold_from_grid(probas_train, y_train)
+    x_pred = X.tail(1)
+    prob_execute = _predict_proba(model, fitted, x_pred)
+
+    return "EXECUTE" if prob_execute >= threshold else "WAIT"
 
 def execution_backtest(
     df: pd.DataFrame,

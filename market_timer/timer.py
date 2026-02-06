@@ -753,6 +753,25 @@ def execution_backtest(
         exec_prices = df[exec_price_col].shift(-1).to_numpy(dtype=np.float32)
         exec_prices[-1] = np.float32(df[exec_price_col].iloc[-1])
 
+        tp_dyn, sl_dyn = rl._tb_precompute_dynamic_barriers(
+            prices=exec_prices.astype(np.float64),
+            horizon=fitted.tb_horizon,
+            q_window=fitted.tb_q_window,
+            q_tp=fitted.tb_q_tp,
+            q_sl=fitted.tb_q_sl,
+            min_tp=fitted.tb_min_tp,
+            max_tp=fitted.tb_max_tp,
+            min_sl=fitted.tb_min_sl,
+            max_sl=fitted.tb_max_sl,
+        )
+        _, tb_score = rl._tb_precompute_scores(
+            prices=exec_prices.astype(np.float64),
+            direction=model_direction,
+            horizon=fitted.tb_horizon,
+            tp_dyn=tp_dyn,
+            sl_dyn=sl_dyn,
+        )
+
         start_idx = max(split, fitted.window - 1)
         end_idx = n - 2
         if start_idx > end_idx:
@@ -762,11 +781,8 @@ def execution_backtest(
         t0 = start_idx
 
         episodes = 0
-        regrets: list[float] = []
-
-        hit0 = 0
-        hit1 = 0
-        hit2 = 0
+        exec_scores: list[float] = []
+        exec_positive = 0
 
         execute_count = 0
         wait_count = 0
@@ -774,7 +790,6 @@ def execution_backtest(
         # For graphs + savings
         episode_start_idxs: list[int] = []
         episode_exec_idxs: list[int] = []
-        episode_best_idxs: list[int] = []
         episode_savings: list[float] = []
 
         it = tqdm(
@@ -800,31 +815,12 @@ def execution_backtest(
                 execute_count += 1
                 te = idx
 
-                end = min(t0 + fitted.horizon, len(exec_prices) - 1)
-                window = exec_prices[t0 : end + 1]
                 exec_price = float(exec_prices[te])
 
-                if model_direction == "BUY":
-                    best_pos = int(np.argmin(window))
-                    best_price = float(window[best_pos])
-                    best_t = t0 + best_pos
-                    regret = max(exec_price - best_price, 0.0)
-                else:
-                    best_pos = int(np.argmax(window))
-                    best_price = float(window[best_pos])
-                    best_t = t0 + best_pos
-                    regret = max(best_price - exec_price, 0.0)
-
-                percent_regret = regret / max(best_price, 1e-12)
-                regrets.append(float(percent_regret))
-
-                dist = abs(te - best_t)
-                if dist == 0:
-                    hit0 += 1
-                if dist <= 1:
-                    hit1 += 1
-                if dist <= 2:
-                    hit2 += 1
+                score = float(tb_score[te]) if np.isfinite(tb_score[te]) else float(-fitted.tb_max_sl)
+                exec_scores.append(score)
+                if score > 0.0:
+                    exec_positive += 1
 
                 # Savings vs "execute immediately at t0" (per 1 unit)
                 baseline_price = float(exec_prices[t0])
@@ -835,45 +831,41 @@ def execution_backtest(
 
                 episode_start_idxs.append(int(t0))
                 episode_exec_idxs.append(int(te))
-                episode_best_idxs.append(int(best_t))
                 episode_savings.append(savings)
 
                 episodes += 1
                 wait_steps = 0
 
             if (idx - start_idx) % 25 == 0:
-                avg_regret_running = float(np.mean(regrets)) if regrets else 0.0
-                hit1_running = (hit1 / episodes) if episodes else 0.0
+                avg_score_running = float(np.mean(exec_scores)) if exec_scores else 0.0
+                positive_rate = (exec_positive / episodes) if episodes else 0.0
                 it.set_postfix(
                     episodes=episodes,
-                    hit1=f"{hit1_running:.4f}",
-                    avg_regret=f"{avg_regret_running:.6f}",
+                    hit_pos=f"{positive_rate:.4f}",
+                    avg_score=f"{avg_score_running:.6f}",
                     exec=execute_count,
                     wait=wait_count,
                 )
 
-        avg_regret = float(np.mean(regrets)) if regrets else None
-        med_regret = float(np.median(regrets)) if regrets else None
-
-        hit0_rate = (hit0 / episodes) if episodes else None
-        hit1_rate = (hit1 / episodes) if episodes else None
-        hit2_rate = (hit2 / episodes) if episodes else None
+        avg_score = float(np.mean(exec_scores)) if exec_scores else None
+        med_score = float(np.median(exec_scores)) if exec_scores else None
+        hit_pos_rate = (exec_positive / episodes) if episodes else None
 
         money_saved = float(np.sum(episode_savings)) if episode_savings else 0.0
         avg_saved = float(np.mean(episode_savings)) if episode_savings else 0.0
 
         logging.info(
-            "RL eval done. episodes=%s avg_regret=%.6f hit@1=%.4f execute=%s wait=%s money_saved=%.6f",
+            "RL eval done. episodes=%s avg_score=%.6f hit_pos=%.4f execute=%s wait=%s money_saved=%.6f",
             episodes,
-            avg_regret if avg_regret is not None else -1.0,
-            hit1_rate if hit1_rate is not None else 0.0,
+            avg_score if avg_score is not None else -1.0,
+            hit_pos_rate if hit_pos_rate is not None else 0.0,
             execute_count,
             wait_count,
             money_saved,
         )
 
         print(
-            f"[RL] episodes={episodes} hit@1={hit1_rate} execute={execute_count} wait={wait_count} money_saved={money_saved:.6f}"
+            f"[RL] episodes={episodes} hit_pos={hit_pos_rate} execute={execute_count} wait={wait_count} money_saved={money_saved:.6f}"
         )
 
         # --------- RL graphs (ONLY) ----------
@@ -906,38 +898,13 @@ def execution_backtest(
                 ys = pd.to_numeric(df[exec_price_col], errors="coerce").iloc[episode_exec_idxs].to_numpy()
                 plt.scatter(xs, ys, marker="^", label="execute")
 
-            if episode_best_idxs:
-                xs = df.index[episode_best_idxs]
-                ys = pd.to_numeric(df[exec_price_col], errors="coerce").iloc[episode_best_idxs].to_numpy()
-                plt.scatter(xs, ys, marker="x", label="best_in_horizon")
-
             plt.title(f"{ticker} RL Price + Episode Markers ({model_direction})")
             plt.legend()
             plt.tight_layout()
             fig.savefig(graphs_dir / f"{prefix}_rl_price_markers.png", dpi=160)
             plt.close(fig)
 
-            # (NEW #1) Price + BEST execute-time markers (what RL *should* have executed at)
-            fig = plt.figure()
-            plt.plot(x, y)
-
-            if episode_start_idxs:
-                xs = df.index[episode_start_idxs]
-                ys = pd.to_numeric(df[exec_price_col], errors="coerce").iloc[episode_start_idxs].to_numpy()
-                plt.scatter(xs, ys, marker="o", label="episode_start")
-
-            if episode_best_idxs:
-                xs = df.index[episode_best_idxs]
-                ys = pd.to_numeric(df[exec_price_col], errors="coerce").iloc[episode_best_idxs].to_numpy()
-                plt.scatter(xs, ys, marker="x", label="best_in_horizon")
-
-            plt.title(f"{ticker} RL Price + BEST Execute Markers ({model_direction})")
-            plt.legend()
-            plt.tight_layout()
-            fig.savefig(graphs_dir / f"{prefix}_rl_price_best_execute_markers.png", dpi=160)
-            plt.close(fig)
-
-            # (NEW #2) Price + ACTUAL model executions
+            # (NEW #1) Price + EXECUTE markers only
             fig = plt.figure()
             plt.plot(x, y)
 
@@ -951,18 +918,18 @@ def execution_backtest(
                 ys = pd.to_numeric(df[exec_price_col], errors="coerce").iloc[episode_exec_idxs].to_numpy()
                 plt.scatter(xs, ys, marker="^", label="model_execute")
 
-            plt.title(f"{ticker} RL Price + MODEL Execute Markers ({model_direction})")
+            plt.title(f"{ticker} RL Price + Model Execute Markers ({model_direction})")
             plt.legend()
             plt.tight_layout()
-            fig.savefig(graphs_dir / f"{prefix}_rl_price_model_execute_markers.png", dpi=160)
+            fig.savefig(graphs_dir / f"{prefix}_rl_price_best_execute_markers.png", dpi=160)
             plt.close(fig)
 
-            # Regret histogram
-            if regrets:
+            # Execute score histogram
+            if exec_scores:
                 fig = plt.figure()
-                plt.hist(np.asarray(regrets, dtype=float), bins=40)
-                plt.title(f"{ticker} RL Percent Regret Histogram ({model_direction})")
-                plt.xlabel("percent_regret")
+                plt.hist(np.asarray(exec_scores, dtype=float), bins=40)
+                plt.title(f"{ticker} RL Execute Score Histogram ({model_direction})")
+                plt.xlabel("tb_score")
                 plt.ylabel("count")
                 plt.tight_layout()
                 fig.savefig(graphs_dir / f"{prefix}_rl_regret_hist.png", dpi=160)
@@ -987,12 +954,12 @@ def execution_backtest(
             "ticker": ticker,
             "samples": episodes,              # episodes, not candles
             "correct": None,
-            "accuracy": hit1_rate,            # treat hit@1 as "accuracy-like"
-            "avg_percent_regret": avg_regret,
-            "median_percent_regret": med_regret,
-            "hit@0": hit0_rate,
-            "hit@1": hit1_rate,
-            "hit@2": hit2_rate,
+            "accuracy": hit_pos_rate,         # percent of execute actions with positive TB score
+            "avg_percent_regret": None,
+            "median_percent_regret": None,
+            "hit@0": None,
+            "hit@1": None,
+            "hit@2": None,
             "execute": execute_count,
             "wait": wait_count,
             "true_1_count": None,
@@ -1001,6 +968,8 @@ def execution_backtest(
             "pred_0_count": None,
             "false_positives": None,
             "false_positive_pct": None,
+            "avg_execute_score": avg_score,
+            "median_execute_score": med_score,
             "money_saved": money_saved,                     # NEW
             "avg_savings_per_episode": avg_saved,           # NEW
             "graphs_dir": str(graphs_dir),                  # handy

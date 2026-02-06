@@ -252,31 +252,6 @@ def _tb_precompute_scores(
     return label, score
 
 
-def _best_net_in_window(
-    score: np.ndarray,
-    *,
-    t0: int,
-    horizon_wait: int,
-    per_step_wait_cost: float,
-) -> Tuple[int, float]:
-    """
-    best_net = max_k score[k] - (k-t0)*per_step_wait_cost over k in [t0..t0+horizon_wait]
-    returns (best_t, best_net)
-    """
-    k_end = t0 + horizon_wait
-    cand = score[t0:k_end + 1].astype(np.float32)
-
-    steps = np.arange(0, cand.shape[0], dtype=np.float32)
-    net = cand - steps * np.float32(per_step_wait_cost)
-
-    net = np.where(np.isfinite(net), net, -np.inf)
-
-    best_off = int(np.argmax(net))
-    best_t = t0 + best_off
-    best_net = float(net[best_off])
-    return best_t, best_net
-
-
 # =========================
 # Replay Buffer (now supports n-step)
 # =========================
@@ -425,7 +400,7 @@ def fit(
 ) -> TimingModel:
     """
     Full upgrade:
-    1) Symmetric execute reward (+1/-1) component (weighted) + regret-vs-best-in-window
+    1) Execute-now reward based on current TB outcome (sign + magnitude)
     2) Dueling DQN network
     3) n-step returns (default 3)
     4) Action imbalance control via explore_execute_prob
@@ -496,7 +471,7 @@ def fit(
     _ = tb_label  # optional debug use
 
     per_step_wait_cost = float(wait_penalty + time_penalty)
-    denom = float(max(tb_max_tp, tb_max_sl, 1e-6))  # normalize regret to ~[-1,0]
+    denom = float(max(tb_max_tp, tb_max_sl, 1e-6))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     q = QNet(state_dim=state_dim, action_dim=2).to(device)
@@ -596,16 +571,7 @@ def fit(
     update_step = 0
 
     while env_step < total_env_steps:
-        # sample a usable episode start (must have at least one finite score in the window)
-        for _tries in range(50):
-            t0 = int(np.random.randint(min_start, max_start + 1))
-            best_t, best_net = _best_net_in_window(
-                tb_score, t0=t0, horizon_wait=horizon, per_step_wait_cost=per_step_wait_cost
-            )
-            if np.isfinite(best_net):
-                break
-        else:
-            break
+        t0 = int(np.random.randint(min_start, max_start + 1))
 
         t = t0
         wait_steps = 0
@@ -633,9 +599,7 @@ def fit(
 
             if action == 0 and not forced:
                 # WAIT reward
-                r = float(wait_shaping_reward)
-                if t == best_t:
-                    r -= float(miss_best_penalty)
+                r = float(wait_shaping_reward) - float(per_step_wait_cost)
 
                 t_next = t + 1
                 wait_next = wait_steps + 1
@@ -655,15 +619,13 @@ def fit(
             else:
                 # EXECUTE reward:
                 # - symmetric component: +1 if TB score positive else -1
-                # - plus regret-vs-best (normalized) to enforce timing
+                # - magnitude component: scaled TB score for execute-now quality
                 base = float(tb_score[t]) if np.isfinite(tb_score[t]) else float(-0.5 * tb_max_sl)
                 sign = 1.0 if base > 0.0 else -1.0
 
-                net = base - float(wait_steps) * per_step_wait_cost
-                regret_raw = net - float(best_net)          # <= 0
-                regret_norm = float(regret_raw / denom)     # roughly in [-1,0]
+                magnitude = float(base / denom)
 
-                r = (execute_sign_weight * sign) + (regret_weight * regret_norm)
+                r = (execute_sign_weight * sign) + (regret_weight * magnitude)
                 r -= float(cost)
 
                 # terminal transition

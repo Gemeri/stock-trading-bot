@@ -10,3 +10,5 @@
 *.pyo
 /catboost-multi
 /models
+__pycache__/
+

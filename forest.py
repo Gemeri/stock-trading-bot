@@ -171,12 +171,12 @@ def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
                 continue
         raw_pred = stacking.train_and_predict(df, ticker=ticker)
         if isinstance(raw_pred, str) and raw_pred.upper() in {"BUY", "SELL", "HOLD", "NONE"}:
-            action_str    = raw_pred.upper()
-            live_price    = logicScript.get_current_price(ticker)
+            action_str = raw_pred.upper()
+            live_price = logicScript.get_current_price(ticker)
 
             if action_str == "BUY":
-                account  = api.get_account()
-                max_qty  = int(float(account.cash) // live_price)
+                account = api.get_account()
+                max_qty = int(float(account.cash) // live_price)
                 if max_qty > 0:
                     orders.buy_shares(ticker, max_qty, live_price, live_price)
                 else:

@@ -1,4 +1,6 @@
 import importlib
+import json
+from pathlib import Path
 from typing import Callable, Tuple, Optional
 import numpy as np
 import pandas as pd
@@ -58,6 +60,8 @@ EXCLUDE_EXACT = {
     "label_execute",
     "label_execute_final",
 }
+
+TCN_RETRAIN = 10
 
 # ------------------------------------------------
 
@@ -381,6 +385,11 @@ def _fit_model(
         from market_timer.models import lstm
         return lstm.fit(x_fit, y_fit)
 
+    if model_name in {"tcn"}:
+        from market_timer.models import tcn
+        hl = max(50, len(x_fit) // 3)
+        return tcn.fit(x_fit, y_fit, half_life=hl)
+
     raise ValueError(f"Unsupported model: {model_name!r}")
 
 
@@ -405,6 +414,11 @@ def _predict_proba(model_name: str, model, x_pred: pd.DataFrame) -> float:
         proba = lstm.predict(model, x_pred)
         return float(proba[-1])
 
+    if model_name in {"tcn"}:
+        from market_timer.models import tcn
+        proba = tcn.predict(model, x_pred)
+        return float(proba[-1])
+
     raise ValueError(f"Unsupported model: {model_name!r}")
 
 
@@ -427,7 +441,53 @@ def _predict_proba_series(model_name: str, model, x_pred: pd.DataFrame) -> np.nd
         from market_timer.models import lstm
         return np.asarray(lstm.predict(model, x_pred), dtype=float)
 
+    if model_name in {"tcn"}:
+        from market_timer.models import tcn
+        return np.asarray(tcn.predict(model, x_pred), dtype=float)
+
     raise ValueError(f"Unsupported model: {model_name!r}")
+
+
+def _align_tcn_calibration(
+    probas: np.ndarray,
+    y_cal: pd.Series,
+) -> Tuple[np.ndarray, pd.Series]:
+    if len(probas) == len(y_cal):
+        return probas, y_cal
+    if len(probas) == 0:
+        return probas, y_cal.iloc[0:0]
+    if len(probas) > len(y_cal):
+        return probas[-len(y_cal) :], y_cal
+    return probas, y_cal.iloc[-len(probas) :]
+
+
+def _tcn_paths() -> Tuple[Path, Path, Path]:
+    try:
+        base_dir = Path(__file__).resolve().parent
+    except Exception:
+        base_dir = Path.cwd()
+    tcn_dir = base_dir / "TCN"
+    tcn_dir.mkdir(parents=True, exist_ok=True)
+    model_path = tcn_dir / "model.pt"
+    cache_path = tcn_dir / "cache.json"
+    return tcn_dir, model_path, cache_path
+
+
+def _load_tcn_cache(cache_path: Path) -> dict:
+    if not cache_path.exists():
+        return {"remaining": 0}
+    try:
+        payload = json.loads(cache_path.read_text())
+    except json.JSONDecodeError:
+        return {"remaining": 0}
+    remaining = payload.get("remaining")
+    if not isinstance(remaining, int):
+        remaining = 0
+    return {"remaining": max(0, remaining)}
+
+
+def _save_tcn_cache(cache_path: Path, remaining: int) -> None:
+    cache_path.write_text(json.dumps({"remaining": max(0, int(remaining))}))
 
 
 def _best_threshold_weighted(
@@ -601,12 +661,28 @@ def get_execution_decision(
         raise ValueError("No labeled rows available for training.")
 
     X_fit, y_fit, X_eval, y_eval, X_cal, y_cal = _time_split_fit_eval_cal(X_train, y_train)
-    fitted = _fit_model(model, X_fit, y_fit, eval_set=(X_eval, y_eval) if len(X_eval) >= 50 else None)
+    model_key = model.lower()
+    if model_key == "tcn":
+        _, model_path, cache_path = _tcn_paths()
+        cache = _load_tcn_cache(cache_path)
+        remaining = cache["remaining"]
+        if remaining <= 0 or not model_path.exists():
+            fitted = _fit_model(model, X_fit, y_fit, eval_set=(X_eval, y_eval) if len(X_eval) >= 50 else None)
+            from market_timer.models import tcn
+            tcn.save(fitted, model_path)
+            remaining = TCN_RETRAIN
+        else:
+            from market_timer.models import tcn
+            fitted = tcn.load(model_path)
+    else:
+        fitted = _fit_model(model, X_fit, y_fit, eval_set=(X_eval, y_eval) if len(X_eval) >= 50 else None)
 
     if USE_STATIC_THRESHOLDS:
         threshold = 0.5
     else:
         probas_cal = _predict_proba_series(model, fitted, X_cal)
+        if model_key == "tcn":
+            probas_cal, y_cal = _align_tcn_calibration(probas_cal, y_cal)
         if THRESH_OBJECTIVE == "accuracy":
             threshold = _best_threshold_accuracy(probas_cal, y_cal)
         elif THRESH_OBJECTIVE == "recall_fpr":
@@ -620,6 +696,9 @@ def get_execution_decision(
 
     x_pred = X_full.tail(1)
     prob_execute = _predict_proba(model, fitted, x_pred)
+    if model_key == "tcn":
+        remaining = max(remaining - 1, 0)
+        _save_tcn_cache(cache_path, remaining)
     return "EXECUTE" if prob_execute >= threshold else "WAIT"
 
 
@@ -635,6 +714,8 @@ def execution_backtest(
 
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (SELL) or 1 (BUY)")
+
+    model_key = model.lower()
 
     try:
         base_dir = Path(__file__).resolve().parent  # type: ignore[name-defined]
@@ -1066,6 +1147,8 @@ def execution_backtest(
                 thr_new = 0.5
             else:
                 probas_cal = _predict_proba_series(model, fitted, X_cal)
+                if model_key == "tcn":
+                    probas_cal, y_cal = _align_tcn_calibration(probas_cal, y_cal)
                 if THRESH_OBJECTIVE == "accuracy":
                     thr_new = _best_threshold_accuracy(probas_cal, y_cal)
                 elif THRESH_OBJECTIVE == "recall_fpr":

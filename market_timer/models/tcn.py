@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Union, Tuple, List
 
 import numpy as np
@@ -550,3 +551,46 @@ def predict(model, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
 
     proba = np.concatenate(probs, axis=0) if probs else np.zeros((0,), dtype=np.float64)
     return np.asarray(proba, dtype=float)
+
+
+def save(model: TCNBundle, path: Union[str, Path]) -> None:
+    data = {
+        "state_dict": model.net.state_dict(),
+        "mean": model.mean,
+        "std": model.std,
+        "lookback": model.lookback,
+        "feature_names": model.feature_names,
+        "channels": TCN_CHANNELS,
+        "kernel_size": KERNEL_SIZE,
+        "dropout": DROPOUT,
+    }
+    torch.save(data, path)
+
+
+def load(path: Union[str, Path]) -> TCNBundle:
+    data = torch.load(path, map_location="cpu")
+    mean = np.asarray(data["mean"], dtype=np.float32)
+    std = np.asarray(data["std"], dtype=np.float32)
+    num_features = int(mean.shape[0])
+    channels = tuple(data.get("channels", TCN_CHANNELS))
+    kernel_size = int(data.get("kernel_size", KERNEL_SIZE))
+    dropout = float(data.get("dropout", DROPOUT))
+
+    net = TCNClassifier(
+        num_features=num_features,
+        channels=channels,
+        kernel_size=kernel_size,
+        dropout=dropout,
+    )
+    net.load_state_dict(data["state_dict"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    net = net.to(device)
+
+    return TCNBundle(
+        net=net,
+        mean=mean,
+        std=std,
+        lookback=int(data["lookback"]),
+        feature_names=data.get("feature_names"),
+        device=device,
+    )

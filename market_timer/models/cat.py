@@ -115,8 +115,17 @@ def fit(
                     w_val = weights_all[-eval_n:]
 
     # ---- Class weights (imbalance-aware like test.py) ----
-    pos_weight = _compute_pos_weight(y_fit, cap=20.0)
-    class_weights = [1.0, pos_weight]
+    pos = float(np.sum(y_fit == 1))
+    neg = float(np.sum(y_fit == 0))
+
+    if pos >= neg:
+        # 1 is majority, 0 is minority -> upweight class 0
+        neg_weight = float(np.clip(pos / max(neg, 1.0), 1.0, 20.0))
+        class_weights = [neg_weight, 1.0]
+    else:
+        # 0 is majority, 1 is minority -> upweight class 
+        pos_weight = _compute_pos_weight(y_fit, cap=20.0)
+        class_weights = [1.0, pos_weight]
 
     # ---- Pools ----
     train_pool = Pool(X_fit, y_fit, weight=w_fit)

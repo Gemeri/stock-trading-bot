@@ -24,7 +24,7 @@ THRESH_SMOOTH_ALPHA = 0.15   # EWMA smoothing factor (0.10–0.25 typical)
 # Threshold tuning objective:
 #   "trade"   -> your current weighted Fbeta - lambda*FPR
 #   "accuracy"-> pure accuracy on calibration set
-THRESH_OBJECTIVE = "recall_fpr"   # <-- new option
+THRESH_OBJECTIVE = "recall_fpr"
 
 TARGET_FPR = 0.20        # start 0.15–0.25
 MIN_PRECISION = 0.35     # prevents degenerate spam
@@ -984,8 +984,6 @@ def execution_backtest(
             plt.tight_layout()
             fig.savefig(graphs_dir / f"{prefix}_rl_price_markers.png", dpi=160)
             plt.close(fig)
-
-            # (NEW #1) Price + EXECUTE markers only
             fig = plt.figure()
             plt.plot(x, y)
 
@@ -1051,9 +1049,9 @@ def execution_backtest(
             "false_positive_pct": None,
             "avg_execute_score": avg_score,
             "median_execute_score": med_score,
-            "money_saved": money_saved,                     # NEW
-            "avg_savings_per_episode": avg_saved,           # NEW
-            "graphs_dir": str(graphs_dir),                  # handy
+            "money_saved": money_saved,
+            "avg_savings_per_episode": avg_saved,
+            "graphs_dir": str(graphs_dir),
         }
 
     # ============================================================

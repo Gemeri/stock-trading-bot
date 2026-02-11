@@ -120,99 +120,122 @@ import bot.selection.ranking as ranking
 import bot.selection.loader as loader
 import bot.stuffs.candles as candles
 import bot.trading.logic as logicScript
-import bot.trading.orders as orders
 import bot.ml.stacking as stacking
 
 
 def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
-    selected, check = ranking.load_best_ticker_cache()
-    if check == None and USE_TICKER_SELECTION == True:
-        selected = ranking.select_best_tickers(top_n=TICKERLIST_TOP_N,
-                                    skip_data=skip_data)
+    import bot.trading.orders as orders
+    # Pick tickers based on selection mode
+    if USE_TICKER_SELECTION:
+        selected, check = ranking.load_best_ticker_cache()
+        if check is None:
+            selected = ranking.select_best_tickers(
+                top_n=TICKERLIST_TOP_N,
+                skip_data=skip_data
+            )
+    else:
+        selected = loader.load_tickerlist()
+
     loader._ensure_ai_tickers()
     owned = list(ranking.get_owned_tickers())
     tickers_run = sorted(set(selected + AI_TICKERS + owned))
+
     global TICKERS
-    TICKERS = tickers_run    
-    for ticker in tickers_run:
-        tf_code = candles.timeframe_to_code(BAR_TIMEFRAME)
-        ticker_fs = candles.fs_safe_ticker(ticker)
-        csv_filename = candles.candle_csv_path(ticker_fs, tf_code)
+    TICKERS = tickers_run
 
-        if not skip_data:
-            df = candles.fetch_candles_plus_features(
-                ticker,
-                bars=N_BARS,
-                timeframe=BAR_TIMEFRAME,
-                rewrite_mode=REWRITE
-            )
-            try:
-                df.to_csv(csv_filename, index=False)
-                logging.info(f"[{ticker}] Saved candle data (w/out disabled) to {csv_filename}")
-            except Exception as e:
-                logging.error(f"[{ticker}] Error saving CSV: {e}")
-                continue
-        else:
-            logging.info(f"[{ticker}] skip_data=True. Using existing CSV {csv_filename} for trade job.")
-            if not os.path.exists(csv_filename):
-                logging.error(f"[{ticker}] CSV file {csv_filename} does not exist. Cannot trade.")
-                continue
-            df = candles.read_csv_limited(csv_filename)
-            if df.empty:
-                logging.error(f"[{ticker}] Existing CSV is empty. Skipping.")
-                continue
+    batching = (USE_TICKER_SELECTION is False)
+    if batching:
+        orders.begin_trade_batch()
 
-        allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
-        df = df.loc[:, [c for c in df.columns if c in allowed]]
+    try:
+        for ticker in tickers_run:
+            tf_code = candles.timeframe_to_code(BAR_TIMEFRAME)
+            ticker_fs = candles.fs_safe_ticker(ticker)
+            csv_filename = candles.candle_csv_path(ticker_fs, tf_code)
 
-        if scheduled_time_ny is not None:
-            if not logicScript.check_latest_candle_condition(df, BAR_TIMEFRAME, scheduled_time_ny):
-                logging.info(f"[{ticker}] Latest candle condition not met for timeframe {BAR_TIMEFRAME} at scheduled time {scheduled_time_ny}. Skipping trade.")
-                continue
-        raw_pred = stacking.train_and_predict(df, ticker=ticker)
-        if isinstance(raw_pred, str) and raw_pred.upper() in {"BUY", "SELL", "HOLD", "NONE"}:
-            action_str = raw_pred.upper()
-            live_price = logicScript.get_current_price(ticker)
-
-            if action_str == "BUY":
-                account = api.get_account()
-                max_qty = int(float(account.cash) // live_price)
-                if max_qty > 0:
-                    orders.buy_shares(ticker, max_qty, live_price, live_price)
-                else:
-                    logging.info(f"[{ticker}] No cash available for BUY.")
-
-            elif action_str == "SELL":
+            if not skip_data:
+                df = candles.fetch_candles_plus_features(
+                    ticker,
+                    bars=N_BARS,
+                    timeframe=BAR_TIMEFRAME,
+                    rewrite_mode=REWRITE
+                )
                 try:
-                    pos_qty = int(float(api.get_position(ticker).qty))
-                except Exception:
-                    pos_qty = 0
-                if pos_qty > 0:
-                    orders.sell_shares(ticker, pos_qty, live_price, live_price)
-                else:
-                    logging.info(f"[{ticker}] Nothing to SELL for {ticker}.")
-
+                    df.to_csv(csv_filename, index=False)
+                    logging.info(f"[{ticker}] Saved candle data (w/out disabled) to {csv_filename}")
+                except Exception as e:
+                    logging.error(f"[{ticker}] Error saving CSV: {e}")
+                    continue
             else:
-                logging.info(f"[{ticker}] Action={action_str}. No trade executed.")
+                logging.info(f"[{ticker}] skip_data=True. Using existing CSV {csv_filename} for trade job.")
+                if not os.path.exists(csv_filename):
+                    logging.error(f"[{ticker}] CSV file {csv_filename} does not exist. Cannot trade.")
+                    continue
+                df = candles.read_csv_limited(csv_filename)
+                if df.empty:
+                    logging.error(f"[{ticker}] Existing CSV is empty. Skipping.")
+                    continue
 
-            continue
+            allowed = set(POSSIBLE_FEATURE_COLS) | {"timestamp"}
+            df = df.loc[:, [c for c in df.columns if c in allowed]]
 
-        if isinstance(raw_pred, tuple) and len(raw_pred) == 2:
-            raw_pred = raw_pred[0]
-        if raw_pred is None:
-            logging.error(f"[{ticker}] Model failed – skipping.")
-            continue
+            if scheduled_time_ny is not None:
+                if not logicScript.check_latest_candle_condition(df, BAR_TIMEFRAME, scheduled_time_ny):
+                    logging.info(
+                        f"[{ticker}] Latest candle condition not met for timeframe {BAR_TIMEFRAME} "
+                        f"at scheduled time {scheduled_time_ny}. Skipping trade."
+                    )
+                    continue
 
-        try:
-            pred_close = float(raw_pred)
-        except (TypeError, ValueError):
-            logging.error(f"[{ticker}] Prediction not numeric ({raw_pred!r}). Skipping.")
-            continue
+            raw_pred = stacking.train_and_predict(df, ticker=ticker)
 
-        current_price = float(df.iloc[-1]["close"])
-        logging.info(f"[{ticker}] Current = {current_price:.2f}  •  Predicted = {pred_close:.2f}")
-        logicScript.trade_logic(current_price, pred_close, ticker)
+            if isinstance(raw_pred, str) and raw_pred.upper() in {"BUY", "SELL", "HOLD", "NONE"}:
+                action_str = raw_pred.upper()
+                live_price = logicScript.get_current_price(ticker)
 
+                if action_str == "BUY":
+                    account = api.get_account()
+                    max_qty = int(float(account.cash) // live_price)
+                    if max_qty > 0:
+                        orders.buy_shares(ticker, max_qty, live_price, live_price)
+                    else:
+                        logging.info(f"[{ticker}] No cash available for BUY.")
+
+                elif action_str == "SELL":
+                    try:
+                        pos_qty = int(float(api.get_position(ticker).qty))
+                    except Exception:
+                        pos_qty = 0
+                    if pos_qty > 0:
+                        orders.sell_shares(ticker, pos_qty, live_price, live_price)
+                    else:
+                        logging.info(f"[{ticker}] Nothing to SELL for {ticker}.")
+
+                else:
+                    logging.info(f"[{ticker}] Action={action_str}. No trade executed.")
+
+                continue
+
+            if isinstance(raw_pred, tuple) and len(raw_pred) == 2:
+                raw_pred = raw_pred[0]
+
+            if raw_pred is None:
+                logging.error(f"[{ticker}] Model failed – skipping.")
+                continue
+
+            try:
+                pred_close = float(raw_pred)
+            except (TypeError, ValueError):
+                logging.error(f"[{ticker}] Prediction not numeric ({raw_pred!r}). Skipping.")
+                continue
+
+            current_price = float(df.iloc[-1]["close"])
+            logging.info(f"[{ticker}] Current = {current_price:.2f}  •  Predicted = {pred_close:.2f}")
+            logicScript.trade_logic(current_price, pred_close, ticker)
+
+    finally:
+        if batching:
+            orders.end_trade_batch_and_flush()
 
 
 def setup_schedule_for_timeframe(timeframe: str) -> None:
@@ -269,7 +292,7 @@ def run_job(scheduled_time_ny: str):
                 return
 
     global TICKERS
-    if USE_TICKER_SELECTION == True:
+    if USE_TICKER_SELECTION:
         cached, _ = ranking.load_best_ticker_cache()
         if cached:
             TICKERS = cached

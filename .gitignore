@@ -13,3 +13,4 @@
 /market_timer/TCN/*.pt
 /market_timer/TCN/*.json
 __pycache__/
+/market_timer/graphs

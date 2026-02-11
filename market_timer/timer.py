@@ -24,7 +24,7 @@ THRESH_SMOOTH_ALPHA = 0.15   # EWMA smoothing factor (0.10–0.25 typical)
 # Threshold tuning objective:
 #   "trade"   -> your current weighted Fbeta - lambda*FPR
 #   "accuracy"-> pure accuracy on calibration set
-THRESH_OBJECTIVE = "recall_fpr"
+THRESH_OBJECTIVE = "accuracy"
 
 TARGET_FPR = 0.20        # start 0.15–0.25
 MIN_PRECISION = 0.35     # prevents degenerate spam

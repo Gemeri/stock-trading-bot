@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 # -------------------- CONFIG --------------------
 
 USE_STATIC_THRESHOLDS = False
+USE_CONFIDENCE_PROBA = False
 
 # Fix #2: rolling window
 USE_ROLLING_WINDOW = True
@@ -398,14 +399,14 @@ def _predict_proba(model_name: str, model, x_pred: pd.DataFrame) -> float:
 
     if model_name in {"cat", "catboost", "cb"}:
         from market_timer.models import cat
-        proba = cat.predict(model, x_pred)
+        proba = cat.predict(model, x_pred, USE_CONFIDENCE_PROBA)
         return float(proba[-1])
 
     if model_name in {"cat-multi", "cat_multi", "catmulti"}:
         from market_timer.models import cat
         execute_model, wait_model = model
-        execute_proba = float(cat.predict(execute_model, x_pred)[-1])
-        wait_proba = float(cat.predict(wait_model, x_pred)[-1])
+        execute_proba = float(cat.predict(execute_model, x_pred, USE_CONFIDENCE_PROBA)[-1])
+        wait_proba = float(cat.predict(wait_model, x_pred, USE_CONFIDENCE_PROBA)[-1])
         inverted_wait_proba = 1.0 - wait_proba
         return (execute_proba + inverted_wait_proba) / 2.0
 
@@ -427,13 +428,13 @@ def _predict_proba_series(model_name: str, model, x_pred: pd.DataFrame) -> np.nd
 
     if model_name in {"cat", "catboost", "cb"}:
         from market_timer.models import cat
-        return np.asarray(cat.predict(model, x_pred), dtype=float)
+        return np.asarray(cat.predict(model, x_pred, USE_CONFIDENCE_PROBA), dtype=float)
 
     if model_name in {"cat-multi", "cat_multi", "catmulti"}:
         from market_timer.models import cat
         execute_model, wait_model = model
-        execute_proba = np.asarray(cat.predict(execute_model, x_pred), dtype=float)
-        wait_proba = np.asarray(cat.predict(wait_model, x_pred), dtype=float)
+        execute_proba = np.asarray(cat.predict(execute_model, x_pred, USE_CONFIDENCE_PROBA), dtype=float)
+        wait_proba = np.asarray(cat.predict(wait_model, x_pred, USE_CONFIDENCE_PROBA), dtype=float)
         inverted_wait_proba = 1.0 - wait_proba
         return (execute_proba + inverted_wait_proba) / 2.0
 

@@ -38,6 +38,57 @@ def _compute_pos_weight(y: np.ndarray, cap: float = 20.0) -> float:
     return float(np.clip(ratio, 1.0, cap))
 
 
+def _confidence_from_p(
+    p: np.ndarray,
+    model: Optional[CatBoostClassifier] = None,
+    X: Optional[Union[pd.DataFrame, np.ndarray]] = None,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    p = np.asarray(p, dtype=float)
+    p_c = np.clip(p, eps, 1.0 - eps)
+
+    # 1) Class confidence
+    class_score = p
+
+    if model is not None and X is not None:
+        # Get cumulative per-tree predictions via staged_predict_proba
+        # Use eval_period to sample ~100 checkpoints evenly across all trees
+        n_trees = model.tree_count_
+        eval_period = max(1, n_trees // 100)
+        tree_probas = np.array(
+            [s[:, 1] for s in model.staged_predict_proba(X, eval_period=eval_period)]
+        )  # shape: (n_checkpoints, n_samples)
+        tree_probas = np.clip(tree_probas, eps, 1.0 - eps)
+
+        # 2) Gini: variance of tree predictions, normalized to [0,1]
+        #    Var=0 (all trees agree) -> cert=1 | Var=0.25 (max) -> cert=0
+        tree_var = np.var(tree_probas, axis=0)           # (n_samples,)
+        gini_cert = np.clip(1.0 - 4.0 * tree_var, 0.0, 1.0)
+
+        # 3) Entropy: mean binary entropy of individual tree predictions
+        #    If trees are individually uncertain (p_i ≈ 0.5), mean H is high -> cert low
+        #    If trees are individually decisive (p_i near 0 or 1), mean H is low -> cert high
+        tree_H = -(
+            tree_probas * np.log2(tree_probas)
+            + (1.0 - tree_probas) * np.log2(1.0 - tree_probas)
+        )  # (n_checkpoints, n_samples), each value in [0,1]
+        mean_tree_H = np.mean(tree_H, axis=0)            # (n_samples,)
+        entropy_cert = np.clip(1.0 - mean_tree_H, 0.0, 1.0)
+
+    else:
+        # Fallback: p-only path (no model available)
+        gini_cert = np.abs(2.0 * p - 1.0)
+        H = -(p_c * np.log2(p_c) + (1.0 - p_c) * np.log2(1.0 - p_c))
+        entropy_cert = np.clip(1.0 - H, 0.0, 1.0)
+
+    # Make both directional: 0 -> 0, 0.5 -> 0.5, 1 -> 1
+    gini_score    = 0.5 + (p - 0.5) * gini_cert
+    entropy_score = 0.5 + (p - 0.5) * entropy_cert
+
+    score = (class_score + gini_score + entropy_score) / 3.0
+    return np.clip(score, 0.0, 1.0)
+
+
 def fit(
     x_train: Union[pd.DataFrame, np.ndarray],
     y_train: Union[pd.Series, np.ndarray, list],
@@ -119,15 +170,15 @@ def fit(
     neg = float(np.sum(y_fit == 0))
 
     if pos >= neg:
-        eval_metric="AUC"
-        custom_metric=["AUC", "Logloss", "PRAUC"]
+        eval_metric = "AUC"
+        custom_metric = ["AUC", "Logloss", "PRAUC"]
         # 1 is majority, 0 is minority -> upweight class 0
         neg_weight = float(np.clip(pos / max(neg, 1.0), 1.0, 20.0))
         class_weights = [neg_weight, 1.0]
     else:
-        # 0 is majority, 1 is minority -> upweight class 
-        eval_metric="PRAUC"
-        custom_metric=["AUC", "Logloss"]
+        eval_metric = "PRAUC"
+        custom_metric = ["AUC", "Logloss"]
+        # 0 is majority, 1 is minority -> upweight class 1
         pos_weight = _compute_pos_weight(y_fit, cap=20.0)
         class_weights = [1.0, pos_weight]
 
@@ -168,10 +219,22 @@ def fit(
     else:
         model.fit(train_pool)
 
+    # Store training balance for confidence_score inversion logic
+    model._train_pos = float(pos)
+    model._train_neg = float(neg)
+
     return model
 
 
-def predict(model, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+def predict(
+    model: CatBoostClassifier,
+    X: Union[pd.DataFrame, np.ndarray],
+    confidence_score: bool = False,
+) -> np.ndarray:
     _validate_X(X, "X")
-    proba = model.predict_proba(X)[:, 1]  # P(class=1)
-    return np.asarray(proba, dtype=float)
+    proba_1 = np.asarray(model.predict_proba(X)[:, 1], dtype=float)  # P(class=1)
+
+    if not confidence_score:
+        return proba_1
+    else:
+        return _confidence_from_p(proba_1, model, X)

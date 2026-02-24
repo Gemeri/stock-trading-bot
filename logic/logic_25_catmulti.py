@@ -60,19 +60,19 @@ def get_csv_filename(ticker):
 
 
 def _get_model_meta_path(ticker: str) -> str:
-    return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_meta.json")
+    return os.path.join(CATBOOST_DIR, f"{tools.fs_safe_ticker(ticker)}_meta.json")
 
 
 def _get_model_path(ticker: str, offset: int) -> str:
-    return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_target_{offset}.cbm")
+    return os.path.join(CATBOOST_DIR, f"{tools.fs_safe_ticker(ticker)}_target_{offset}.cbm")
 
 
 def _get_risk_state_path(ticker: str) -> str:
-    return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_risk_state.json")
+    return os.path.join(CATBOOST_DIR, f"{tools.fs_safe_ticker(ticker)}_risk_state.json")
 
 
 def _get_half_life_cache_path(ticker: str) -> str:
-    return os.path.join(CATBOOST_DIR, f"{forest.fs_safe_ticker(ticker)}_half_life.json")
+    return os.path.join(CATBOOST_DIR, f"{tools.fs_safe_ticker(ticker)}_half_life.json")
 
 
 # =====================================================
@@ -713,49 +713,124 @@ def _grid_search_execution_params(
 
     return best_tuple
 
+def _catboost_row_shap_all_classes(model: CatBoostClassifier, X_row: pd.DataFrame) -> np.ndarray:
+    """
+    Compute SHAP values for a *single row* for *all classes*.
+
+    Returns:
+        np.ndarray with shape (n_classes, n_features + 1)
+        The last column is the base/bias term for each class.
+    """
+    pool = Pool(X_row)
+    sv = model.get_feature_importance(pool, type="ShapValues")
+    sv0 = np.asarray(sv[0])  # single row
+
+    if sv0.ndim != 2:
+        raise ValueError(f"Unexpected SHAP shape from CatBoost: {sv0.shape}")
+
+    # Normalize to (classes, feat+1)
+    # Some CatBoost versions may return (feat+1, classes).
+    if sv0.shape[0] <= sv0.shape[1]:
+        return sv0
+    return sv0.T
+
+
+def _aggregate_shap_3_perspectives(
+    strong_models: List[Dict[str, Any]],
+    X_row: pd.DataFrame,
+    feature_cols: List[str],
+    label_mapping: Dict[int, int],
+    use_weights: bool = False,
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+    
+    if not strong_models:
+        # Return full dicts with zeros so downstream is stable
+        buy = {f: 0.0 for f in feature_cols}
+        sell = {f: 0.0 for f in feature_cols}
+        none = {f: 0.0 for f in feature_cols}
+        return buy, sell, none
+
+    n_feat = len(feature_cols)
+    n_classes = 3
+
+    contrib_sum = np.zeros((n_classes, n_feat), dtype=float)
+    w_sum = 0.0
+
+    for item in strong_models:
+        model = item["model"]
+        g = float(item.get("g", 0.0))
+        e = float(item.get("e", 1.0))
+
+        w = 1.0
+        if use_weights:
+            # Sharpness weight in [0,1] roughly; clamp just in case.
+            w = max(0.0, min(1.0, 0.5 * g + 0.5 * (1.0 - e)))
+
+        sv = _catboost_row_shap_all_classes(model, X_row)  # (classes, feat+1)
+        contrib_sum += w * sv[:, :-1]
+        w_sum += w
+
+    if w_sum <= 1e-12:
+        w_sum = 1.0
+
+    contrib_avg = contrib_sum / w_sum
+
+    idx_buy = int(label_mapping[1])
+    idx_none = int(label_mapping[0])
+    idx_sell = int(label_mapping[-1])
+
+    buy = {feature_cols[i]: float(contrib_avg[idx_buy, i]) for i in range(n_feat)}
+    sell = {feature_cols[i]: float(contrib_avg[idx_sell, i]) for i in range(n_feat)}
+    none = {feature_cols[i]: float(contrib_avg[idx_none, i]) for i in range(n_feat)}
+
+    return buy, sell, none
 
 def _get_pred_target_for_timestamp(
     df: pd.DataFrame,
     current_time: datetime,
     ticker: str,
     is_backtest: bool = False,
-) -> Tuple[int, int, int, int, Dict[str, Any]]:
+    return_shap: bool = False,
+) -> Tuple[int, int, int, int, Dict[str, Any], Optional[Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]]]:
+    """
+    If return_shap=True, also returns (buy_reasoning, sell_reasoning, none_reasoning),
+    where each is a FULL dict of feature -> SHAP impact for that class perspective.
+    """
     if df.empty:
-        return 0, 0, 0, 0, {
+        base_stats = {
             "total_models": 0,
             "total_strong": 0,
             "vote_counts": {"up": 0, "down": 0, "flat": 0},
             "avg_gini": {"up": None, "down": None, "flat": None},
             "avg_entropy": {"up": None, "down": None, "flat": None},
         }
+        return 0, 0, 0, 0, base_stats, (None if return_shap else None)
 
-    # Filter data up to current_time (inclusive)
     df_cut = df[df["time"] <= current_time].copy()
     if df_cut.empty:
-        return 0, 0, 0, 0, {
+        base_stats = {
             "total_models": 0,
             "total_strong": 0,
             "vote_counts": {"up": 0, "down": 0, "flat": 0},
             "avg_gini": {"up": None, "down": None, "flat": None},
             "avg_entropy": {"up": None, "down": None, "flat": None},
         }
+        return 0, 0, 0, 0, base_stats, (None if return_shap else None)
 
-    # Ensure features + targets exist
     feature_cols, target_cols = _get_feature_and_target_columns(df_cut)
     if not target_cols:
         logger.warning(f"No target_* columns could be generated for {ticker}; returning neutral signal.")
-        return 0, 0, 0, 0, {
+        base_stats = {
             "total_models": 0,
             "total_strong": 0,
             "vote_counts": {"up": 0, "down": 0, "flat": 0},
             "avg_gini": {"up": None, "down": None, "flat": None},
             "avg_entropy": {"up": None, "down": None, "flat": None},
         }
+        return 0, 0, 0, 0, base_stats, (None if return_shap else None)
 
-    # Load cached models and meta
     models_cache, meta = _load_models_from_disk(ticker)
 
-    # Desired (per-ticker) half-life from cache/override
     desired_half_life = get_desired_half_life(ticker, default=HALF_LIFE_OPTIONS[0])
 
     trained_half_life: Optional[int] = None
@@ -765,7 +840,6 @@ def _get_pred_target_for_timestamp(
         except Exception:
             trained_half_life = None
 
-    # Parse trained_until
     trained_until_str = meta.get("trained_until") if meta else None
     trained_until: Optional[datetime] = None
     if trained_until_str:
@@ -785,27 +859,19 @@ def _get_pred_target_for_timestamp(
         need_retrain = True
         logger.info(f"No trained_until in meta for {ticker}, training.")
     elif current_time < trained_until:
-        # Backtest earlier than last training -> retrain to avoid look-ahead
         need_retrain = True
-        logger.info(
-            f"Current timestamp {current_time} earlier than trained_until={trained_until}, retraining."
-        )
+        logger.info(f"Current timestamp {current_time} earlier than trained_until={trained_until}, retraining.")
     elif runs_since_retrain >= retrain_every:
         need_retrain = True
-        logger.info(
-            f"runs_since_retrain={runs_since_retrain} ≥ retrain_every={retrain_every}, retraining."
-        )
+        logger.info(f"runs_since_retrain={runs_since_retrain} ≥ retrain_every={retrain_every}, retraining.")
     elif trained_half_life is None:
         need_retrain = True
         logger.info(f"No half_life in meta for {ticker}, retraining.")
     elif trained_half_life != desired_half_life:
         need_retrain = True
-        logger.info(
-            f"{ticker} half_life changed: trained={trained_half_life}, desired={desired_half_life}; retraining."
-        )
+        logger.info(f"{ticker} half_life changed: trained={trained_half_life}, desired={desired_half_life}; retraining.")
 
     if need_retrain:
-        # 1) Train models with the per-ticker desired half-life
         train_result = _train_models_for_timestamp(
             df=df_cut,
             current_time=current_time,
@@ -816,7 +882,6 @@ def _get_pred_target_for_timestamp(
         )
         _save_models_to_disk(ticker, train_result)
 
-        # 2) Optional grid search for execution hyperparameters
         if GRID_SEARCH_ENABLED:
             best_sl, best_tp, best_cool = _grid_search_execution_params(
                 df_hist=df_cut,
@@ -829,38 +894,43 @@ def _get_pred_target_for_timestamp(
             risk_state["cooloff_after_close_trade"] = int(best_cool)
             _save_risk_state(ticker, risk_state)
 
-        # 3) Reload models & meta after saving
         models_cache, meta = _load_models_from_disk(ticker)
 
-    # At this point, we (should) have models on disk; if not, neutral
     if not models_cache:
         logger.info(f"No viable models available for {ticker} at {current_time}; neutral signal.")
         _update_meta_retrain_counter(ticker, meta, reset=need_retrain)
-        return 0, 0, 0, 0, {
+        base_stats = {
             "total_models": 0,
             "total_strong": 0,
             "vote_counts": {"up": 0, "down": 0, "flat": 0},
             "avg_gini": {"up": None, "down": None, "flat": None},
             "avg_entropy": {"up": None, "down": None, "flat": None},
         }
+        return 0, 0, 0, 0, base_stats, (None if return_shap else None)
 
-    # Use last row (current_time or latest <= current_time)
     df_cut = df_cut.sort_values("time")
     current_row = df_cut.iloc[-1]
     X_current = current_row[feature_cols].to_frame().T
+    print(X_current.to_string())
+    print(X_current.isnull().sum())
 
-    # Reverse mapping from meta (ensure proper types)
     reverse_mapping = meta.get("reverse_mapping", {0: -1, 1: 0, 2: 1})
+    label_mapping = meta.get("label_mapping", {-1: 0, 0: 1, 1: 2})
 
     votes: Dict[int, List[int]] = {1: [], 0: [], -1: []}
     gini_list: Dict[int, List[float]] = {1: [], 0: [], -1: []}
     entropy_list: Dict[int, List[float]] = {1: [], 0: [], -1: []}
+
+    strong_models: List[Dict[str, Any]] = []
 
     for m in models_cache:
         model = m["model"]
         offset = m.get("offset")
         probs = model.predict_proba(X_current).flatten()
         g, e = calibrate_scores(probs)
+        is_strong = (g >= GINI_THRESHOLD) or (e <= ENTROPY_THRESHOLD)
+        print("offset", offset, "probs", probs, "g", g, "e", e, "strong", is_strong)
+
 
         if g >= GINI_THRESHOLD or e <= ENTROPY_THRESHOLD:
             pred_class = int(model.predict(X_current)[0])
@@ -871,10 +941,11 @@ def _get_pred_target_for_timestamp(
             votes[pred_label].append(1)
             gini_list[pred_label].append(g)
             entropy_list[pred_label].append(e)
+
+            # capture for SHAP aggregation
+            strong_models.append({"model": model, "g": g, "e": e})
         else:
-            logger.debug(
-                f"WEAK pred offset={offset} g={g:.3f} e={e:.3f} -> {probs}"
-            )
+            logger.debug(f"WEAK pred offset={offset} g={g:.3f} e={e:.3f} -> {probs}")
 
     total_votes = sum(len(v) for v in votes.values())
     if total_votes < 1:
@@ -906,26 +977,25 @@ def _get_pred_target_for_timestamp(
     model_stats: Dict[str, Any] = {
         "total_models": total_models,
         "total_strong": total_strong,
-        "vote_counts": {
-            "up": models_up,
-            "down": models_down,
-            "flat": models_stable,
-        },
-        "avg_gini": {
-            "up": avg_gini_raw[1],
-            "down": avg_gini_raw[-1],
-            "flat": avg_gini_raw[0],
-        },
-        "avg_entropy": {
-            "up": avg_entropy_raw[1],
-            "down": avg_entropy_raw[-1],
-            "flat": avg_entropy_raw[0],
-        },
+        "vote_counts": {"up": models_up, "down": models_down, "flat": models_stable},
+        "avg_gini": {"up": avg_gini_raw[1], "down": avg_gini_raw[-1], "flat": avg_gini_raw[0]},
+        "avg_entropy": {"up": avg_entropy_raw[1], "down": avg_entropy_raw[-1], "flat": avg_entropy_raw[0]},
     }
+
+    shap_triplet: Optional[Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]] = None
+    if return_shap:
+        buy_reasoning, sell_reasoning, none_reasoning = _aggregate_shap_3_perspectives(
+            strong_models=strong_models,
+            X_row=X_current,
+            feature_cols=feature_cols,
+            label_mapping=label_mapping,
+            use_weights=False,  # equal weighting matches voting
+        )
+        shap_triplet = (buy_reasoning, sell_reasoning, none_reasoning)
 
     _update_meta_retrain_counter(ticker, meta, reset=need_retrain)
 
-    return pred_target, models_up, models_down, models_stable, model_stats
+    return pred_target, models_up, models_down, models_stable, model_stats, shap_triplet
 
 
 def _compute_action_confidence(
@@ -1010,6 +1080,7 @@ def _gap_in_4h_bars(start: datetime, end: datetime) -> int:
     return int(diff_hours // 4)
 
 
+
 def _decide_trade_action(
     current_price: float,
     current_timestamp: datetime,
@@ -1017,40 +1088,36 @@ def _decide_trade_action(
     ticker: str,
     df: pd.DataFrame,
     is_backtest: bool = False,
-) -> Tuple[str, Dict[str, Any]]:
+    return_shap: bool = False,
+    direction: int = None
+) -> Tuple[str, Dict[str, Any], Optional[Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]]]:
     risk_state = _load_risk_state(ticker)
     entry_price = risk_state.get("last_entry_price")
     last_entry_ts_str = risk_state.get("last_entry_timestamp")
     last_direction = risk_state.get("last_direction")
     stop_loss_rate = float(risk_state.get("loss_close_rate", LOSS_CLOSE_RATE))
     take_profit_rate = float(risk_state.get("gain_close_rate", GAIN_CLOSE_RATE))
-    cooloff_after_close_trade = int(
-        risk_state.get("cooloff_after_close_trade", COOL_OFF_AFTER_CLOSE_TRADE)
-    )
+    cooloff_after_close_trade = int(risk_state.get("cooloff_after_close_trade", COOL_OFF_AFTER_CLOSE_TRADE))
     last_close_ts_str = risk_state.get("last_close_timestamp")
     last_action = risk_state.get("last_action")
 
-    last_entry_ts = (
-        datetime.fromisoformat(last_entry_ts_str)
-        if last_entry_ts_str else None
-    )
-    last_close_ts = (
-        datetime.fromisoformat(last_close_ts_str)
-        if last_close_ts_str else None
-    )
+    last_entry_ts = datetime.fromisoformat(last_entry_ts_str) if last_entry_ts_str else None
+    last_close_ts = datetime.fromisoformat(last_close_ts_str) if last_close_ts_str else None
 
-    # 1) Get model-based directional signal
+    # 1) Get model-based directional signal (+ optional SHAP)
     (
         pred_target,
         models_up,
         models_down,
         models_stable,
         model_stats,
+        shap_triplet,
     ) = _get_pred_target_for_timestamp(
         df=df,
         current_time=current_timestamp,
         ticker=ticker,
         is_backtest=is_backtest,
+        return_shap=return_shap,
     )
 
     # 2) Compute P&L and exit trigger
@@ -1061,12 +1128,10 @@ def _decide_trade_action(
 
     if q != 0 and entry_price is not None:
         entry_price = float(entry_price)
-        # PL = q * (p - entry)
         pl = q * (current_price - entry_price)
         trade_value = abs(q * entry_price)
         if trade_value > 0:
             pct_pl = pl / trade_value
-            # Stop-loss / Take-profit
             close_trade = (
                 (pl < 0 and abs(pct_pl) > stop_loss_rate) or
                 (pl > 0 and abs(pct_pl) > take_profit_rate)
@@ -1088,7 +1153,6 @@ def _decide_trade_action(
 
     # 4) Forced exit has highest priority
     if q < 0 and close_trade:
-        # Close short via BUY
         action = "BUY"
         reason = f"EXIT: close short after {pct_pl*100:.3f}% loss/gain"
         risk_state["last_close_timestamp"] = current_timestamp.isoformat()
@@ -1098,7 +1162,6 @@ def _decide_trade_action(
         risk_state["last_direction"] = None
 
     elif q > 0 and close_trade:
-        # Close long via SELL
         action = "SELL"
         reason = f"EXIT: close long after {pct_pl*100:.3f}% loss/gain"
         risk_state["last_close_timestamp"] = current_timestamp.isoformat()
@@ -1107,10 +1170,9 @@ def _decide_trade_action(
         risk_state["last_entry_timestamp"] = None
         risk_state["last_direction"] = None
 
-    # 5) Long entry logic (pred_target > 0) if not in buy cool-off
+    # 5) Long entry logic
     elif pred_target > 0 and not cooloff_buy:
         if q < 0:
-            # First step: close short via BUY
             action = "BUY"
             reason = "LONG: close short"
             risk_state["last_close_timestamp"] = current_timestamp.isoformat()
@@ -1118,22 +1180,18 @@ def _decide_trade_action(
             risk_state["last_entry_price"] = None
             risk_state["last_entry_timestamp"] = None
             risk_state["last_direction"] = None
-
         elif q == 0:
-            # Open long via BUY
             action = "BUY"
             reason = "LONG: open long"
             risk_state["last_entry_price"] = float(current_price)
             risk_state["last_entry_timestamp"] = current_timestamp.isoformat()
             risk_state["last_direction"] = "long"
-            # store the concrete stop-loss and take-profit price levels
             risk_state["stop_loss_price"] = current_price * (1.0 - stop_loss_rate)
             risk_state["take_profit_price"] = current_price * (1.0 + take_profit_rate)
 
-    # 6) Short entry logic (pred_target < 0) if not in sell cool-off
+    # 6) Short entry logic
     elif pred_target < 0 and not cooloff_sell:
         if q > 0:
-            # First step: close long via SELL
             action = "SELL"
             reason = "SHORT: close long"
             risk_state["last_close_timestamp"] = current_timestamp.isoformat()
@@ -1142,23 +1200,34 @@ def _decide_trade_action(
             risk_state["last_entry_timestamp"] = None
             risk_state["last_direction"] = None
         elif q == 0:
-            # Open short via SELL
             action = "SELL"
             reason = "SHORT: open short"
             risk_state["last_entry_price"] = float(current_price)
             risk_state["last_entry_timestamp"] = current_timestamp.isoformat()
             risk_state["last_direction"] = "short"
-            # store the concrete stop-loss and take-profit price levels for short
             risk_state["stop_loss_price"] = current_price * (1.0 + stop_loss_rate)
             risk_state["take_profit_price"] = current_price * (1.0 - take_profit_rate)
 
     # 7) Persist updated risk state
     _save_risk_state(ticker, risk_state)
 
-    # 8) Compute overall confidence score for this action
+    # 8) Compute overall confidence score
+    if direction is None or direction > 1 or direction < -1:
+        conf_action = action
+        conf_direction = pred_target
+    elif direction == 1:
+        conf_action = "BUY"
+        conf_direction = direction
+    elif direction == -1:
+        conf_action = "SELL"
+        conf_direction = direction
+    else:
+        conf_action = "NONE"
+        conf_direction = direction
+
     confidence_score = _compute_action_confidence(
-        action=action,
-        pred_target=pred_target,
+        action=conf_action,
+        pred_target=conf_direction,
         close_trade=close_trade,
         pct_pl=pct_pl,
         stop_loss_rate=stop_loss_rate,
@@ -1167,7 +1236,7 @@ def _decide_trade_action(
     )
 
     debug_info = {
-        "pred_target": pred_target,
+        "pred_target": pred_target, 
         "models_up": models_up,
         "models_down": models_down,
         "models_stable": models_stable,
@@ -1186,7 +1255,7 @@ def _decide_trade_action(
         "model_stats": model_stats,
     }
 
-    return action, debug_info
+    return action, debug_info, shap_triplet
 
 
 # =====================================================
@@ -1275,22 +1344,11 @@ def run_backtest(
     current_timestamp,
     candles,
     ticker,
-    confidence
+    confidence,
+    return_reasoning = None,
 ):
-    """
-    Backtest logic.
-
-    - Ignores predicted_price and candles for decision making to keep parity
-      with run_logic.
-    - Uses only data up to and including `current_timestamp` from the CSV.
-    - Uses the same CatBoost voting + trading engine as run_logic.
-    - Returns:
-        * if confidence=False: "BUY" | "SELL" | "NONE"
-        * if confidence=True: (action, confidence_score in [0,1])
-    """
     logger = logging.getLogger(__name__)
 
-    # Ensure current_timestamp is datetime
     if isinstance(current_timestamp, str):
         current_timestamp = datetime.fromisoformat(current_timestamp)
 
@@ -1298,27 +1356,55 @@ def run_backtest(
     df = df[df["time"] <= current_timestamp].copy()
     if df.empty:
         logger.info(f"[{ticker}] No data up to {current_timestamp}; return NONE.")
+        if confidence and return_reasoning is not None:
+            empty = {}
+            return "NONE", 0.0, empty, empty, empty
         if confidence:
             return "NONE", 0.0
+        if return_reasoning is not None:
+            empty = {}
+            return "NONE", empty, empty, empty
         return "NONE"
 
-    action, debug_info = _decide_trade_action(
+    if return_reasoning is None:
+        shap_return = False
+    else:
+        shap_return = True
+
+    action, debug_info, shap_triplet = _decide_trade_action(
         current_price=float(current_price),
         current_timestamp=current_timestamp,
         position_qty=float(position_qty),
         ticker=ticker,
         df=df,
-        is_backtest=True
+        is_backtest=True,
+        return_shap=shap_return,
+        direction=return_reasoning
     )
+    print("model_stats:", debug_info["model_stats"])
 
     logger.debug(
-        f"[{ticker}] Backtest Decision at {current_timestamp}: action={action}, "
-        f"debug={debug_info}"
+        f"[{ticker}] Backtest Decision at {current_timestamp}: action={action}, debug={debug_info}"
     )
 
+    conf_val = float(debug_info.get("confidence_score", 0.0))
+
+    if return_reasoning:
+        # shap_triplet can be None if no strong models; convert to empty dicts
+        if shap_triplet is None:
+            buy_reasoning, sell_reasoning, none_reasoning = {}, {}, {}
+        else:
+            buy_reasoning, sell_reasoning, none_reasoning = shap_triplet
+
+        if confidence:
+            print("Results:", action, conf_val)
+            return action, conf_val, buy_reasoning, sell_reasoning, none_reasoning
+
+        return action, buy_reasoning, sell_reasoning, none_reasoning
+
     if confidence:
-        print("Results: ", action, float(debug_info.get("confidence_score", 0.0)))
-        return action, float(debug_info.get("confidence_score", 0.0))
+        print("Results:", action, conf_val)
+        return action, conf_val
 
     return action
 
@@ -1348,15 +1434,6 @@ def _extract_score(result: Any) -> float:
 
 
 def get_best_half_life(force: bool = False) -> None:
-    """
-    Cycles through each ticker and each HALF_LIFE_OPTIONS value, runs your backtest,
-    and caches the best half-life per ticker to:
-        catboost-multi/<TICKER>_half_life.json
-
-    Tie-break rule:
-      - highest score wins
-      - if scores tie, the higher half-life wins
-    """
     tickers = loader.load_tickerlist()
 
     for ticker in tqdm(tickers, desc="Half-life tuning"):

@@ -1171,7 +1171,6 @@ def execution_backtest(
             exec_pred = exec_prices_all.iloc[start:idx + 1].reset_index(drop=True)
             X_pred_full = _add_episode_state_features(X_pred_base, exec_pred)
             x_pred = X_pred_full.tail(1)
-
             prob_execute = _predict_proba(model, fitted, x_pred)
 
             if not np.isfinite(prob_execute):

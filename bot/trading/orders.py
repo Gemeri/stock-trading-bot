@@ -2,21 +2,140 @@ from dataclasses import dataclass
 from typing import List
 from forest import (
     DISCORD_MODE, DISCORD_USER_ID, STATIC_TICKERS, MAX_TICKERS, USE_FULL_SHARES,
-    DISCORD_TOKEN, USE_SHORT, api
+    DISCORD_TOKEN, USE_SHORT, USE_TICKER_SELECTION, N_BARS, BAR_TIMEFRAME, REWRITE,
+    DATA_DIR, api
 )
 from alpaca.trading.enums import OrderSide, TimeInForce
 from forest import TRADE_LOG_FILENAME, TRADE_LOGIC
+import market_timer.timer as market_time
 import bot.selection.ranking as ranking
 import bot.selection.loader as loader
+import bot.stuffs.candles as candles
+from datetime import datetime
 import pandas as pd
 import threading
-from datetime import datetime
 import discord
 import logging
 import forest
 import os
 
 logger = logging.getLogger(__name__)
+WAIT_TICKERS = []
+WAITLIST_CSV = os.path.join(DATA_DIR, "waitlist.csv")
+
+# =========================
+# Waitlist CSV Management
+# =========================
+
+def initialize_waitlist_csv():
+    """Create waitlist CSV if it doesn't exist"""
+    if not os.path.exists(WAITLIST_CSV):
+        df = pd.DataFrame(columns=["ticker", "direction", "qty", "price", "predicted_price", "time"])
+        df.to_csv(WAITLIST_CSV, index=False)
+
+def add_to_waitlist(ticker: str, direction: str, qty: float, price: float, predicted_price: float):
+    """
+    Add or update a ticker in the waitlist CSV.
+    - If ticker exists with same direction: reset time to 0
+    - If ticker exists with different direction: update direction and reset time to 0
+    - If ticker doesn't exist: add new entry with time = 0
+    """
+    initialize_waitlist_csv()
+    
+    try:
+        df = pd.read_csv(WAITLIST_CSV)
+    except Exception:
+        df = pd.DataFrame(columns=["ticker", "direction", "qty", "price", "predicted_price", "time"])
+    
+    # Check if ticker already exists
+    existing_idx = df[df['ticker'] == ticker].index
+    
+    if len(existing_idx) > 0:
+        # Update existing entry
+        idx = existing_idx[0]
+        df.loc[idx, 'direction'] = direction
+        df.loc[idx, 'qty'] = qty
+        df.loc[idx, 'price'] = price
+        df.loc[idx, 'predicted_price'] = predicted_price
+        df.loc[idx, 'time'] = 0
+        logging.info(f"[{ticker}] Updated in waitlist CSV with direction {direction}, time reset to 0")
+    else:
+        # Add new entry
+        new_row = pd.DataFrame([{
+            "ticker": ticker,
+            "direction": direction,
+            "qty": qty,
+            "price": price,
+            "predicted_price": predicted_price,
+            "time": 0
+        }])
+        df = pd.concat([df, new_row], ignore_index=True)
+        logging.info(f"[{ticker}] Added to waitlist CSV with direction {direction}")
+    
+    df.to_csv(WAITLIST_CSV, index=False)
+
+def remove_from_waitlist(ticker: str):
+    """Remove a ticker from the waitlist CSV"""
+    if not os.path.exists(WAITLIST_CSV):
+        return
+    
+    try:
+        df = pd.read_csv(WAITLIST_CSV)
+        df = df[df['ticker'] != ticker]
+        df.to_csv(WAITLIST_CSV, index=False)
+        logging.info(f"[{ticker}] Removed from waitlist CSV")
+    except Exception as e:
+        logging.error(f"Error removing {ticker} from waitlist: {e}")
+
+def increment_waitlist_time(ticker: str):
+    """Increment the time counter for a ticker in the waitlist"""
+    if not os.path.exists(WAITLIST_CSV):
+        return
+    
+    try:
+        df = pd.read_csv(WAITLIST_CSV)
+        idx = df[df['ticker'] == ticker].index
+        if len(idx) > 0:
+            df.loc[idx[0], 'time'] = df.loc[idx[0], 'time'] + 1
+            df.to_csv(WAITLIST_CSV, index=False)
+    except Exception as e:
+        logging.error(f"Error incrementing time for {ticker}: {e}")
+
+def should_add_to_waitlist(ticker: str, action: str) -> bool:
+    """
+    Check if a ticker should be added to the waitlist based on current positions.
+    Returns True if should add, False if should skip.
+    """
+    try:
+        pos = api.get_position(ticker)
+        pos_qty = float(pos.qty)
+    except Exception:
+        pos_qty = 0.0
+    
+    is_owned = pos_qty > 0
+    is_shorted = pos_qty < 0
+    
+    # Don't add BUY if already owned
+    if action == "BUY" and is_owned:
+        logging.info(f"[{ticker}] Already owned, skipping BUY waitlist entry")
+        return False
+    
+    # Don't add SELL if not owned
+    if action == "SELL" and not is_owned:
+        logging.info(f"[{ticker}] Not owned, skipping SELL waitlist entry")
+        return False
+    
+    # Don't add SHORT if already shorted
+    if action == "SHORT" and is_shorted:
+        logging.info(f"[{ticker}] Already shorted, skipping SHORT waitlist entry")
+        return False
+    
+    # Don't add COVER if not shorted
+    if action == "COVER" and not is_shorted:
+        logging.info(f"[{ticker}] Not shorted, skipping COVER waitlist entry")
+        return False
+    
+    return True
 
 # =========================
 # Batch trading (defer orders)
@@ -25,29 +144,38 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PendingBuy:
     ticker: str
+    direction: str
     qty: float
-    buy_price: float
+    price: float
     predicted_price: float
+    time: int
 
 @dataclass
 class PendingSell:
     ticker: str
+    direction: str
     qty: float
-    sell_price: float
+    price: float
     predicted_price: float
+    time: int
 
 @dataclass
 class PendingShort:
     ticker: str
+    direction: str
     qty: float
-    short_price: float
+    price: float
     predicted_price: float
+    time: int
 
 @dataclass
 class PendingCover:
     ticker: str
+    direction: str
     qty: float
-    cover_price: float
+    price: float
+    predicted_price: float
+    time: int
 
 class TradeBatch:
     """
@@ -85,39 +213,139 @@ def end_trade_batch_and_flush():
     TRADE_BATCH.end()
     flush_trade_batch()
 
+def check_for_wait(ticker: str, direction: int) -> bool:
+    """
+    Check if we should execute or wait for a ticker.
+    Returns True if should EXECUTE, False if should WAIT.
+    """
+    try:
+        df = candles.fetch_candles_plus_features(
+            ticker,
+            bars=N_BARS,
+            timeframe=BAR_TIMEFRAME,
+            rewrite_mode=REWRITE
+        )
+        decision = market_time.get_execution_decision(df, ticker, 3, "cat", direction)
+        if decision == "EXECUTE":
+            return True
+        else:
+            return False
+    except Exception as e:
+        logging.error(f"[{ticker}] Error in check_for_wait: {e}")
+        return True  # Default to execute on error
+
 def flush_trade_batch():
-    # Covers first
-    for c in list(TRADE_BATCH.pending_covers):
+    """
+    Process the waitlist CSV or pending lists based on USE_TICKER_SELECTION.
+    If USE_TICKER_SELECTION == 2: Process waitlist CSV with market timer
+    Otherwise: Process pending lists directly
+    """
+    if USE_TICKER_SELECTION == 2:
+        # Process waitlist CSV
+        if not os.path.exists(WAITLIST_CSV):
+            logging.info("Waitlist CSV does not exist, nothing to flush")
+            return
+        
         try:
-            close_short(c.ticker, c.qty, c.cover_price)
+            df = pd.read_csv(WAITLIST_CSV)
         except Exception as e:
-            logging.error("[%s] Batch COVER failed: %s", c.ticker, e)
+            logging.error(f"Error reading waitlist CSV: {e}")
+            return
+        
+        if df.empty:
+            logging.info("Waitlist CSV is empty, nothing to flush")
+            return
+        
+        tickers_to_remove = []
+        
+        for idx, row in df.iterrows():
+            ticker = row['ticker']
+            direction_str = row['direction']
+            qty = float(row['qty'])
+            price = float(row['price'])
+            predicted_price = float(row['predicted_price'])
+            time = int(row['time'])
+            
+            # Map direction string to int for market timer
+            # BUY and COVER use direction=1, SELL and SHORT use direction=0
+            if direction_str in ["BUY", "COVER"]:
+                direction_int = 1
+            else:  # SELL or SHORT
+                direction_int = 0
+            
+            logging.info(f"[{ticker}] Processing waitlist entry: {direction_str}, time={time}")
+            
+            # Check if time has reached 7 (timeout)
+            if time >= 7:
+                logging.info(f"[{ticker}] Timeout reached (time={time}), removing from waitlist")
+                tickers_to_remove.append(ticker)
+                continue
+            
+            # Check market timer decision
+            should_execute = check_for_wait(ticker, direction_int)
+            
+            if should_execute:
+                logging.info(f"[{ticker}] Market timer says EXECUTE, processing {direction_str}")
+                
+                # Execute the appropriate action
+                try:
+                    if direction_str == "BUY":
+                        buy_shares(ticker, qty, price, predicted_price)
+                    elif direction_str == "SELL":
+                        sell_shares(ticker, qty, price, predicted_price)
+                    elif direction_str == "SHORT":
+                        short_shares(ticker, qty, price, predicted_price)
+                    elif direction_str == "COVER":
+                        close_short(ticker, qty, price, predicted_price)
+                    
+                    # Remove from waitlist after successful execution
+                    tickers_to_remove.append(ticker)
+                except Exception as e:
+                    logging.error(f"[{ticker}] Failed to execute {direction_str}: {e}")
+                    # Increment time on failure
+                    increment_waitlist_time(ticker)
+            else:
+                logging.info(f"[{ticker}] Market timer says WAIT, incrementing time")
+                increment_waitlist_time(ticker)
+        
+        # Remove executed or timed-out tickers
+        for ticker in tickers_to_remove:
+            remove_from_waitlist(ticker)
+    
+    else:
+        # Original behavior: process pending lists directly
+        # Covers first
+        for c in list(TRADE_BATCH.pending_covers):
+            try:
+                close_short(c.ticker, c.qty, c.price, c.predicted_price)
+            except Exception as e:
+                logging.error("[%s] Batch COVER failed: %s", c.ticker, e)
 
-    # Then sells
-    for s in list(TRADE_BATCH.pending_sells):
-        try:
-            sell_shares(s.ticker, s.qty, s.sell_price, s.predicted_price)
-        except Exception as e:
-            logging.error("[%s] Batch SELL failed: %s", s.ticker, e)
+        # Then sells
+        for s in list(TRADE_BATCH.pending_sells):
+            try:
+                sell_shares(s.ticker, s.qty, s.price, s.predicted_price)
+            except Exception as e:
+                logging.error("[%s] Batch SELL failed: %s", s.ticker, e)
 
-    # Then shorts
-    for sh in list(TRADE_BATCH.pending_shorts):
-        try:
-            short_shares(sh.ticker, sh.qty, sh.short_price, sh.predicted_price)
-        except Exception as e:
-            logging.error("[%s] Batch SHORT failed: %s", sh.ticker, e)
+        # Then shorts
+        for sh in list(TRADE_BATCH.pending_shorts):
+            try:
+                short_shares(sh.ticker, sh.qty, sh.price, sh.predicted_price)
+            except Exception as e:
+                logging.error("[%s] Batch SHORT failed: %s", sh.ticker, e)
 
-    # Then buys
-    for b in list(TRADE_BATCH.pending_buys):
-        try:
-            buy_shares(b.ticker, b.qty, b.buy_price, b.predicted_price)
-        except Exception as e:
-            logging.error("[%s] Batch BUY failed: %s", b.ticker, e)
+        # Then buys
+        for b in list(TRADE_BATCH.pending_buys):
+            try:
+                buy_shares(b.ticker, b.qty, b.price, b.predicted_price)
+            except Exception as e:
+                logging.error("[%s] Batch BUY failed: %s", b.ticker, e)
 
-    TRADE_BATCH.pending_covers.clear()
-    TRADE_BATCH.pending_sells.clear()
-    TRADE_BATCH.pending_shorts.clear()
-    TRADE_BATCH.pending_buys.clear()
+        TRADE_BATCH.pending_covers.clear()
+        TRADE_BATCH.pending_sells.clear()
+        TRADE_BATCH.pending_shorts.clear()
+        TRADE_BATCH.pending_buys.clear()
 
 # =========================
 # Discord bot integration
@@ -169,9 +397,16 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
     if qty <= 0:
         return
 
-    # ✅ Batch mode: enqueue instead of executing
+    # ✅ Batch mode with USE_TICKER_SELECTION == 2: add to waitlist CSV
+    if TRADE_BATCH.active and USE_TICKER_SELECTION == 2:
+        if should_add_to_waitlist(ticker, "BUY"):
+            add_to_waitlist(ticker, "BUY", qty, buy_price, predicted_price)
+            logging.info("[%s] Added to waitlist CSV for BUY", ticker)
+        return
+    
+    # ✅ Batch mode (other modes): enqueue instead of executing
     if TRADE_BATCH.active:
-        TRADE_BATCH.pending_buys.append(PendingBuy(ticker, qty, buy_price, predicted_price))
+        TRADE_BATCH.pending_buys.append(PendingBuy(ticker, "BUY", qty, buy_price, predicted_price, 0))
         logging.info("[%s] Queued BUY (batch mode).", ticker)
         return
 
@@ -215,7 +450,7 @@ def buy_shares(ticker, qty, buy_price, predicted_price):
                 "Calling close_short to fully COVER; no new BUY in this call.",
                 ticker, log_qty
             )
-            close_short(ticker, abs_short_qty, buy_price)
+            close_short(ticker, abs_short_qty, buy_price, predicted_price)
             return
 
         # 2) Flat: no long/short → proceed with normal BUY (position sizing unchanged)
@@ -294,9 +529,16 @@ def sell_shares(ticker, qty, sell_price, predicted_price):
     if qty <= 0:
         return
 
-    # ✅ Batch mode: enqueue instead of executing
+    # ✅ Batch mode with USE_TICKER_SELECTION == 2: add to waitlist CSV
+    if TRADE_BATCH.active and USE_TICKER_SELECTION == 2:
+        if should_add_to_waitlist(ticker, "SELL"):
+            add_to_waitlist(ticker, "SELL", qty, sell_price, predicted_price)
+            logging.info("[%s] Added to waitlist CSV for SELL", ticker)
+        return
+    
+    # ✅ Batch mode (other modes): enqueue instead of executing
     if TRADE_BATCH.active:
-        TRADE_BATCH.pending_sells.append(PendingSell(ticker, qty, sell_price, predicted_price))
+        TRADE_BATCH.pending_sells.append(PendingSell(ticker, "SELL", qty, sell_price, predicted_price, 0))
         logging.info("[%s] Queued SELL (batch mode).", ticker)
         return
 
@@ -404,9 +646,16 @@ def short_shares(ticker, qty, short_price, predicted_price):
     if qty <= 0:
         return
 
-    # ✅ Batch mode: enqueue instead of executing
+    # ✅ Batch mode with USE_TICKER_SELECTION == 2: add to waitlist CSV
+    if TRADE_BATCH.active and USE_TICKER_SELECTION == 2:
+        if should_add_to_waitlist(ticker, "SHORT"):
+            add_to_waitlist(ticker, "SHORT", qty, short_price, predicted_price)
+            logging.info("[%s] Added to waitlist CSV for SHORT", ticker)
+        return
+    
+    # ✅ Batch mode (other modes): enqueue instead of executing
     if TRADE_BATCH.active:
-        TRADE_BATCH.pending_shorts.append(PendingShort(ticker, qty, short_price, predicted_price))
+        TRADE_BATCH.pending_shorts.append(PendingShort(ticker, "SHORT", qty, short_price, predicted_price, 0))
         logging.info("[%s] Queued SHORT (batch mode).", ticker)
         return
 
@@ -478,7 +727,7 @@ def short_shares(ticker, qty, short_price, predicted_price):
         logging.error(f"[{ticker}] Short order failed: {e}")
 
 
-def close_short(ticker, qty, cover_price):
+def close_short(ticker, qty, cover_price, predicted_price):
     logging.info("COVER: %s", ticker)
 
     if qty <= 0:
@@ -488,9 +737,16 @@ def close_short(ticker, qty, cover_price):
         logging.info("Ticker %s is in STATIC_TICKERS. Skipping...", ticker)
         return
 
-    # ✅ Batch mode: enqueue instead of executing
+    # ✅ Batch mode with USE_TICKER_SELECTION == 2: add to waitlist CSV
+    if TRADE_BATCH.active and USE_TICKER_SELECTION == 2:
+        if should_add_to_waitlist(ticker, "COVER"):
+            add_to_waitlist(ticker, "COVER", qty, cover_price, predicted_price)
+            logging.info("[%s] Added to waitlist CSV for COVER", ticker)
+        return
+    
+    # ✅ Batch mode (other modes): enqueue instead of executing
     if TRADE_BATCH.active:
-        TRADE_BATCH.pending_covers.append(PendingCover(ticker, qty, cover_price))
+        TRADE_BATCH.pending_covers.append(PendingCover(ticker, "COVER", qty, cover_price, predicted_price, 0))
         logging.info("[%s] Queued COVER (batch mode).", ticker)
         return
 

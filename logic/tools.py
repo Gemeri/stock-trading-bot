@@ -1,6 +1,8 @@
+import bot.stuffs.candles as candles
 import config
-import os
 import forest
+import os
+
 BAR_TIMEFRAME = config.BAR_TIMEFRAME
 TIMEFRAME_MAP = {
     "4Hour": "H4", "2Hour": "H2", "1Hour": "H1",
@@ -17,6 +19,9 @@ def timeframe_subdir(tf_code: str) -> str:
     os.makedirs(path, exist_ok=True)
     return path
 
+def fs_safe_ticker(ticker):
+    return candles.fs_safe_ticker(ticker)
+
 def get_csv_filename(ticker):
-    ticker_fs = forest.fs_safe_ticker(ticker)
+    ticker_fs = candles.fs_safe_ticker(ticker)
     return os.path.join(timeframe_subdir(CONVERTED_TIMEFRAME), f"{ticker_fs}_{CONVERTED_TIMEFRAME}.csv")

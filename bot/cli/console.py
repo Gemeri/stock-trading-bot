@@ -406,6 +406,7 @@ def console_listener():
             logging.info("  ai-tickers")
             logging.info("  buy (ticker) <amount|$dollars>")
             logging.info("  sell (ticker) <amount|$dollars>")
+            logging.info("  execution-score (ticker) <direction>")
             logging.info("  commands")
 
         elif cmd == "backtest-execute":
@@ -428,6 +429,11 @@ def console_listener():
             csv_filename = candles.candle_csv_path(ticker_fs, tf_code)
             df = candles.read_csv_limited(csv_filename)
             timer.get_execution_decision(df, forest.BACKTEST_TICKER, parts[1], parts[2], parts[3])
+        elif cmd == "execution-score":
+            if len(parts) < 3:
+                logging.info("Usage: execution-score <ticker> <direction>")
+                continue
+            forest.get_execution_score(parts[1], int(parts[2]))
         elif cmd == "set-timeframe":
             if len(parts) < 2:
                 logging.info("Usage: set-timeframe 4Hour/1Day/etc.")

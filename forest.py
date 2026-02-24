@@ -9,6 +9,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from timeframe import TIMEFRAME_SCHEDULE
 import warnings
+import numpy as np
+from openai import OpenAI
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings(
     "ignore",
@@ -20,6 +22,7 @@ from alpaca.data.historical import CryptoHistoricalDataClient
 import config
 from bot.logging import setup_logging
 import logging
+import json
 
 setup_logging(logging.INFO)
 
@@ -115,6 +118,8 @@ REWRITE = config.REWRITE
 
 crypto_client = CryptoHistoricalDataClient()
 
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
 import bot.cli.console as console
 import bot.selection.ranking as ranking
 import bot.selection.loader as loader
@@ -122,6 +127,122 @@ import bot.stuffs.candles as candles
 import bot.trading.logic as logicScript
 import bot.ml.stacking as stacking
 
+SYSTEM_PROMPT = """
+You are a professional trading analyst translating a model's raw feature output into a concise, human-readable market read for the average retail investor.
+
+You will receive:
+- A ticker
+- An action (BUY / SELL / NONE) and its execution score (0–100)
+- A json of features and their signed impact values (positive = supports the action, negative = works against it)
+
+Your job is to synthesize this into a plain-English market read. Follow this structure exactly:
+
+---
+Market read: [A short, punchy one-liner describing the overall condition, e.g. "Weak momentum, not a clean setup" or "Strong trend with volume confirmation"]
+
+[2–4 sentences reading the market like a seasoned trader would. Talk about price action, trend, momentum, and volume in plain English. Do NOT mention feature names or numbers. Speak in terms an average investor understands — e.g. "price is extended", "sellers are in control", "momentum is fading", "volume isn't confirming the move".]
+
+[1–2 sentences on what to expect going forward given this environment — e.g. likely chop, a grind higher, a sharp reversal risk, etc.]
+
+---
+Additional context:
+[2–4 bullet points covering the most notable signals that informed the score — e.g. trend indicators, RSI condition, recent price structure, sentiment. Keep each bullet to one sentence. Still no raw numbers or feature names — translate everything into investor-friendly language.]
+
+---
+
+Rules:
+- Never mention feature names (e.g. don't say "ema_9" or "obv" — say "short-term trend" or "volume flow")
+- Never include raw numbers from the feature json
+- Focus more on the features with the largest absolute impact
+- Match the tone to the execution score: low score = skeptical/cautious, high score = confident/constructive, mid score = balanced/uncertain
+- Keep the entire response under 200 words
+- Do NOT invent news, fundamentals, price levels, earnings, or macro events.
+- Do not use jargon like "alpha" or "quant signal" — write like a smart, plain-speaking trader
+
+Also, if Action is NONE, interpret impacts as “reasons to stand aside / not take a trade”.
+
+"""
+
+MANDATORY_FEATURES = {
+    "ema_9", "ema_21", "ema_50", "ema_200",  # trend structure
+    "rsi",                                     # momentum
+    "macd_histogram",                          # momentum direction
+    "obv",                                     # volume participation
+    "adx",                                     # trend strength
+    "sentiment",                               # market sentiment
+    "atr",
+    "roc",
+    "bollinger_percB",
+    "greed_index",
+    "days_since_high",
+    "days_since_low",
+    'macd_histogram'
+}
+
+def filter_reasoning(reasoning_dict, percentile=70, mandatory=MANDATORY_FEATURES):
+    values = np.array([abs(v) for v in reasoning_dict.values()])
+    threshold = np.percentile(values, percentile)
+    
+    filtered = {
+        k: v for k, v in reasoning_dict.items()
+        if abs(v) >= threshold or k in mandatory
+    }
+    return json.dumps(filtered, indent=2)
+
+def get_execution_score(ticker, direction):
+    import logic.logic_25_catmulti as catmulti
+    df = candles.fetch_candles_plus_features(
+        ticker,
+        bars=N_BARS,
+        timeframe=BAR_TIMEFRAME,
+        rewrite_mode=REWRITE
+    )
+    (
+    _, 
+    conf_val,
+    buy_reasoning, 
+    sell_reasoning, 
+    none_reasoning
+    ) = catmulti.run_backtest(
+        current_price=logicScript.get_current_price(ticker), 
+        predicted_price=None, 
+        position_qty=0,
+        current_timestamp=df.iloc[-1]["timestamp"],
+        candles=None,
+        ticker=ticker,
+        confidence=True,
+        return_reasoning=direction
+    )
+    if direction == 1:
+        reasoning = buy_reasoning
+        action = "BUY"
+    elif direction == -1:
+        reasoning = sell_reasoning
+        action = "SELL"
+    else:
+        reasoning = none_reasoning
+        action = "NONE"
+
+    final_reasoning = filter_reasoning(reasoning, )
+    exec_score = round(conf_val*100)
+    print(f"Execution score: {exec_score}")
+    print("Reasoning:")
+    print(final_reasoning)
+    prompt = "\n".join([
+        f"Ticker: {ticker}",
+        f"Action: {action}",
+        f"Execution Score: {exec_score}",
+        "Reasoning: ",
+        final_reasoning
+    ])
+    response = openai_client.responses.create(
+        model="gpt-5.2",
+        instructions=SYSTEM_PROMPT,
+        input=prompt
+    )
+    print(response.output_text)
+    return round(conf_val*100)
+    
 
 def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):
     import bot.trading.orders as orders

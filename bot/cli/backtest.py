@@ -6,6 +6,7 @@ import bot.stuffs.candles as candles
 import bot.ml.pipelines as pipelines
 import bot.ml.registry as registry
 import bot.ml.stacking as stacking
+import market_timer.timer as market_timer
 import matplotlib.pyplot as plt
 import bot.ml.models as models
 from datetime import datetime
@@ -27,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 N_ESTIMATORS = 100
 RANDOM_SEED = 42
+BAR_TIMEFRAME = forest.BAR_TIMEFRAME
+N_BARS = forest.N_BARS
+REWRITE = forest.REWRITE
 
 def _timestamp_to_str(value):
     if value is None:
@@ -83,7 +87,7 @@ def update_backtest_cache(path: str, meta: dict, *, mode: str, total_iterations:
                           next_index: int, predictions: list, actuals: list,
                           timestamps: list, trade_records: list, portfolio_records: list,
                           cash: float, position_qty, avg_entry_price: float,
-                          last_action) -> None:
+                          last_action, pending_trades: list = None) -> None:
     remaining = max(0, total_iterations - next_index)
     state = {
         "version": forest.BACKTEST_CACHE_VERSION,
@@ -100,6 +104,7 @@ def update_backtest_cache(path: str, meta: dict, *, mode: str, total_iterations:
         "position_qty": float(position_qty),
         "avg_entry_price": float(avg_entry_price),
         "last_action": last_action,
+        "pending_trades": _serialize_records(pending_trades or []),
     }
     state.update(meta)
     save_backtest_cache(path, state)
@@ -149,6 +154,7 @@ def restore_backtest_state(state, *, mode: str, total_iterations: int,
     timestamps = [_deserialize_timestamp(ts) for ts in state.get("timestamps", [])]
     trade_records = _deserialize_records(state.get("trade_records", []))
     portfolio_records = _deserialize_records(state.get("portfolio_records", []))
+    pending_trades = _deserialize_records(state.get("pending_trades", []))
 
     cash = float(state.get("cash", start_balance))
     position_qty = state.get("position_qty", 0)
@@ -171,6 +177,7 @@ def restore_backtest_state(state, *, mode: str, total_iterations: int,
         avg_entry_price,
         next_index,
         last_action,
+        pending_trades,
     )
 
 def clear_backtest_cache(path: str) -> None:
@@ -181,6 +188,21 @@ def clear_backtest_cache(path: str) -> None:
             os.remove(path)
     except Exception as e:
         logging.warning(f"Unable to remove backtest cache {path}: {e}")
+
+
+def check_for_wait(ticker: str, direction: int):
+    """Check if market_timer says to execute or wait."""
+    df = candles.fetch_candles_plus_features(
+        ticker,
+        bars=N_BARS,
+        timeframe=BAR_TIMEFRAME,
+        rewrite_mode=REWRITE
+    )
+    decision = market_timer.get_execution_decision(df, ticker, 3, "cat", direction)
+    if decision == "EXECUTE":
+        return True
+    else:
+        return False
 
 
 def run_backtest(parts, use_ml=True):
@@ -405,6 +427,7 @@ def run_backtest(parts, use_ml=True):
         avg_entry_price = 0.0
         last_action = None
         start_iter = 0
+        pending_trades = []
 
         ticker_has_slash = "/" in str(forest.BACKTEST_TICKER)
         allow_shorting = forest.USE_SHORT and (not ticker_has_slash)
@@ -524,6 +547,7 @@ def run_backtest(parts, use_ml=True):
                     avg_entry_price,
                     start_iter,
                     last_action,
+                    pending_trades,
                 ) = resume_data
                 logging.info(
                     f"[{forest.BACKTEST_TICKER}] Resuming backtest for {logic_module_name} "
@@ -550,6 +574,7 @@ def run_backtest(parts, use_ml=True):
                 predictions        = []
                 actuals            = []
                 timestamps         = []
+                pending_trades     = []
 
                 START_BALANCE  = 10_000.0 if not ticker_has_slash else 1_000_000.0
                 cash = START_BALANCE
@@ -599,6 +624,7 @@ def run_backtest(parts, use_ml=True):
                         avg_entry_price,
                         start_iter,
                         last_action,
+                        pending_trades,
                     ) = resume_data
                     logging.info(
                         f"[{forest.BACKTEST_TICKER}] Resuming signal backtest for {logic_module_name} "
@@ -678,6 +704,7 @@ def run_backtest(parts, use_ml=True):
                         position_qty=position_qty,
                         avg_entry_price=avg_entry_price,
                         last_action=last_action,
+                        pending_trades=pending_trades,
                     )
 
                 # -----------------------------------------------------------------------
@@ -746,7 +773,7 @@ def run_backtest(parts, use_ml=True):
                     ] = pred_close
 
                     # ───────────────────────────────────────────────────────────
-                    # 3. Call the user’s trading-logic module
+                    # 3. Call the user's trading-logic module
                     # ───────────────────────────────────────────────────────────
                     print(logic_module)
                     if forest.TRADE_LOGIC == 25 or forest.TRADE_LOGIC == "logic_25_catmulti.py" or forest.TRADE_LOGIC == 9 or forest.TRADE_LOGIC == "logic_9_tcn.py":
@@ -776,6 +803,99 @@ def run_backtest(parts, use_ml=True):
                     actuals.append(real_close)
                     timestamps.append(row_data["timestamp"])
 
+                    # ───────────────────────────────────────────────────────────
+                    # 5. PROCESS PENDING TRADES (when action is NONE)
+                    # ───────────────────────────────────────────────────────────
+                    if action == "NONE" and forest.USE_TICKER_SELECTION == 2:
+                        executed_indices = []
+                        for idx, pending in enumerate(pending_trades):
+                            direction = pending["direction"]
+                            if check_for_wait(forest.BACKTEST_TICKER, direction):
+                                # EXECUTE this pending trade
+                                pending_action = pending["action"]
+                                
+                                # Execute the trade using current price
+                                if pending_action == "BUY":
+                                    shares_to_buy = int(cash // real_close)
+                                    if shares_to_buy > 0:
+                                        position_qty = shares_to_buy
+                                        avg_entry_price = real_close
+                                        fee = shares_to_buy * real_close * buy_fee_rate
+                                        if fee:
+                                            cash -= fee
+                                        record_trade(
+                                            "BUY",
+                                            row_data["timestamp"],
+                                            shares_to_buy,
+                                            real_close,
+                                            pred_close,
+                                            (-fee if fee else None),
+                                        )
+                                        logging.info(f"Executed pending BUY at {real_close}")
+                                
+                                elif pending_action == "SELL":
+                                    if position_qty > 0:
+                                        pl = (real_close - avg_entry_price) * position_qty
+                                        cash += pl
+                                        record_trade(
+                                            "SELL",
+                                            row_data["timestamp"],
+                                            position_qty,
+                                            real_close,
+                                            pred_close,
+                                            pl,
+                                        )
+                                        position_qty = 0
+                                        avg_entry_price = 0.0
+                                        logging.info(f"Executed pending SELL at {real_close}")
+                                
+                                elif pending_action == "SHORT" and allow_shorting:
+                                    shares_to_short = int(cash // real_close)
+                                    if shares_to_short > 0:
+                                        position_qty = -shares_to_short
+                                        avg_entry_price = real_close
+                                        record_trade(
+                                            "SHORT",
+                                            row_data["timestamp"],
+                                            shares_to_short,
+                                            real_close,
+                                            pred_close,
+                                            None,
+                                        )
+                                        logging.info(f"Executed pending SHORT at {real_close}")
+                                
+                                elif pending_action == "COVER":
+                                    if position_qty < 0:
+                                        qty = abs(position_qty)
+                                        pl = (avg_entry_price - real_close) * qty
+                                        cash += pl
+                                        record_trade(
+                                            "COVER",
+                                            row_data["timestamp"],
+                                            qty,
+                                            real_close,
+                                            pred_close,
+                                            pl,
+                                        )
+                                        position_qty = 0
+                                        avg_entry_price = 0.0
+                                        logging.info(f"Executed pending COVER at {real_close}")
+                                
+                                executed_indices.append(idx)
+                            else:
+                                # WAIT - increment counter
+                                pending["wait_count"] += 1
+                                if pending["wait_count"] >= 7:
+                                    logging.info(f"Abandoning pending {pending['action']} after 7 waits")
+                                    executed_indices.append(idx)
+                        
+                        # Remove executed/abandoned trades from pending list
+                        for idx in sorted(executed_indices, reverse=True):
+                            del pending_trades[idx]
+
+                    # ───────────────────────────────────────────────────────────
+                    # 6. NORMALIZE ACTION
+                    # ───────────────────────────────────────────────────────────
                     if action == "BUY":
                         if position_qty > 0:
                             action = "NONE"
@@ -803,7 +923,30 @@ def run_backtest(parts, use_ml=True):
                         if position_qty >= 0:
                             action = "NONE"
 
-                    # Execute normalized action
+                    # ───────────────────────────────────────────────────────────
+                    # 7. CHECK MARKET TIMER (USE_TICKER_SELECTION == 2)
+                    # ───────────────────────────────────────────────────────────
+                    if action != "NONE" and forest.USE_TICKER_SELECTION == 2:
+                        # Determine direction: 1 for BUY/COVER, 0 for SELL/SHORT
+                        direction = 1 if action in ["BUY", "COVER"] else 0
+                        
+                        if not check_for_wait(forest.BACKTEST_TICKER, direction):
+                            # WAIT - add to pending trades
+                            pending_trades.append({
+                                "action": action,
+                                "timestamp": row_data["timestamp"],
+                                "price": real_close,
+                                "pred_price": pred_close,
+                                "direction": direction,
+                                "wait_count": 0
+                            })
+                            logging.info(f"Added {action} to pending trades (WAIT signal)")
+                            action = "NONE"  # Don't execute now
+                        # else: EXECUTE - proceed normally
+
+                    # ───────────────────────────────────────────────────────────
+                    # 8. EXECUTE ACTION
+                    # ───────────────────────────────────────────────────────────
                     if action == "BUY":
                         shares_to_buy = int(cash // real_close)
                         if shares_to_buy > 0:
@@ -899,6 +1042,7 @@ def run_backtest(parts, use_ml=True):
                         position_qty=position_qty,
                         avg_entry_price=avg_entry_price,
                         last_action=last_action,
+                        pending_trades=pending_trades,
                     )
             # ----------------- END inner loop ---------------------------------
 

@@ -119,11 +119,15 @@ def fit(
     neg = float(np.sum(y_fit == 0))
 
     if pos >= neg:
+        eval_metric="AUC"
+        custom_metric=["AUC", "Logloss", "PRAUC"]
         # 1 is majority, 0 is minority -> upweight class 0
         neg_weight = float(np.clip(pos / max(neg, 1.0), 1.0, 20.0))
         class_weights = [neg_weight, 1.0]
     else:
         # 0 is majority, 1 is minority -> upweight class 
+        eval_metric="PRAUC"
+        custom_metric=["AUC", "Logloss"]
         pos_weight = _compute_pos_weight(y_fit, cap=20.0)
         class_weights = [1.0, pos_weight]
 
@@ -141,8 +145,8 @@ def fit(
         l2_leaf_reg=20.0,
         min_data_in_leaf=80,
         loss_function="Logloss",
-        eval_metric="PRAUC",
-        custom_metric=["AUC", "Logloss"],
+        eval_metric=eval_metric,
+        custom_metric=custom_metric,
         bootstrap_type="Bernoulli",
         subsample=0.8,
         rsm=0.85,

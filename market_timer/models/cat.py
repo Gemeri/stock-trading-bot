@@ -219,22 +219,63 @@ def fit(
     else:
         model.fit(train_pool)
 
-    # Store training balance for confidence_score inversion logic
-    model._train_pos = float(pos)
-    model._train_neg = float(neg)
-
     return model
 
 
 def predict(
     model: CatBoostClassifier,
     X: Union[pd.DataFrame, np.ndarray],
-    confidence_score: bool = False,
-) -> np.ndarray:
+    confidence_score: Optional[bool] = False,
+    shap_reasoning: Optional[bool] = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, dict]]:
     _validate_X(X, "X")
-    proba_1 = np.asarray(model.predict_proba(X)[:, 1], dtype=float)  # P(class=1)
 
-    if not confidence_score:
-        return proba_1
+    # Usual probability path (P(class=1))
+    proba_1 = np.asarray(model.predict_proba(X)[:, 1], dtype=float)
+    out = proba_1 if not confidence_score else _confidence_from_p(proba_1, model, X)
+    print(f"Proba: {out}")
+
+    if not shap_reasoning:
+        return out
+
+    # ---- SHAP feature contributions for label 1 only ----
+    if isinstance(X, pd.DataFrame):
+        feature_names = list(X.columns)
+        pool = Pool(X)
+        n_samples = int(X.shape[0])
     else:
-        return _confidence_from_p(proba_1, model, X)
+        X_arr = np.asarray(X)
+        feature_names = [f"f{i}" for i in range(int(X_arr.shape[1]))]
+        pool = Pool(X_arr, feature_names=feature_names)
+        n_samples = int(X_arr.shape[0])
+
+    shap_vals = np.asarray(model.get_feature_importance(pool, type="ShapValues"))
+
+    # CatBoost shapes:
+    # - Binary: (n_samples, n_features + 1)
+    # - Multiclass: (n_samples, n_classes, n_features + 1)
+    if shap_vals.ndim == 2:
+        contrib = shap_vals[:, :-1]  # drop base_value column
+    elif shap_vals.ndim == 3:
+        class_idx = 1 if shap_vals.shape[1] > 1 else 0
+        contrib = shap_vals[:, class_idx, :-1]  # drop base_value column
+    else:
+        raise ValueError(f"Unexpected SHAP values shape: {shap_vals.shape}")
+
+    if contrib.shape[1] != len(feature_names):
+        raise ValueError(
+            f"SHAP feature mismatch: contrib has {contrib.shape[1]} features, "
+            f"but X has {len(feature_names)}"
+        )
+
+    if n_samples == 1:
+        feature_contribs = {
+            name: float(contrib[0, i]) for i, name in enumerate(feature_names)
+        }
+    else:
+        feature_contribs = {
+            name: np.asarray(contrib[:, i], dtype=float)
+            for i, name in enumerate(feature_names)
+        }
+
+    return out, feature_contribs

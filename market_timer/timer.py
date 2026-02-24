@@ -5,6 +5,7 @@ from typing import Callable, Tuple, Optional
 import numpy as np
 import pandas as pd
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -394,21 +395,66 @@ def _fit_model(
     raise ValueError(f"Unsupported model: {model_name!r}")
 
 
-def _predict_proba(model_name: str, model, x_pred: pd.DataFrame) -> float:
+def _predict_proba(model_name: str, model, x_pred: pd.DataFrame, shap_reasoning=False):
     model_name = model_name.lower()
 
     if model_name in {"cat", "catboost", "cb"}:
         from market_timer.models import cat
-        proba = cat.predict(model, x_pred, USE_CONFIDENCE_PROBA)
+        proba, reasoning = cat.predict(model, x_pred, USE_CONFIDENCE_PROBA, shap_reasoning)
+        if shap_reasoning:
+            return float(proba[-1]), reasoning
         return float(proba[-1])
 
     if model_name in {"cat-multi", "cat_multi", "catmulti"}:
         from market_timer.models import cat
         execute_model, wait_model = model
-        execute_proba = float(cat.predict(execute_model, x_pred, USE_CONFIDENCE_PROBA)[-1])
-        wait_proba = float(cat.predict(wait_model, x_pred, USE_CONFIDENCE_PROBA)[-1])
+
+        if shap_reasoning:
+            # cat.predict returns: (out, feature_contribs)
+            execute_out, execute_reasoning = cat.predict(
+                execute_model, x_pred, USE_CONFIDENCE_PROBA, shap_reasoning=True
+            )
+            wait_out, wait_reasoning = cat.predict(
+                wait_model, x_pred, USE_CONFIDENCE_PROBA, shap_reasoning=True
+            )
+
+            # [-1] applied to the OUTPUT ARRAY, not the whole tuple
+            execute_proba = float(np.asarray(execute_out).reshape(-1)[-1])
+            wait_proba = float(np.asarray(wait_out).reshape(-1)[-1])
+
+            # 1) Invert wait_reasoning values (feature impacts)
+            inverted_wait_reasoning = {
+                k: (-np.asarray(v, dtype=float) if isinstance(v, (np.ndarray, list, tuple)) else -float(v))
+                for k, v in (wait_reasoning or {}).items()
+            }
+
+            # 1) Average execute_reasoning and inverted_wait_reasoning (per feature)
+            #    (assumes same features; uses union and treats missing as 0.0)
+            keys = set((execute_reasoning or {}).keys()) | set(inverted_wait_reasoning.keys())
+            averaged_reasoning = {}
+            for k in keys:
+                a = (execute_reasoning or {}).get(k, 0.0)
+                b = inverted_wait_reasoning.get(k, 0.0)
+                a_arr = np.asarray(a, dtype=float)
+                b_arr = np.asarray(b, dtype=float)
+                avg = (a_arr + b_arr) / 2.0
+                averaged_reasoning[k] = float(avg) if avg.ndim == 0 else avg
+
+        else:
+            # cat.predict returns: out
+            execute_out = cat.predict(execute_model, x_pred, USE_CONFIDENCE_PROBA, shap_reasoning=False)
+            wait_out = cat.predict(wait_model, x_pred, USE_CONFIDENCE_PROBA, shap_reasoning=False)
+
+            # [-1] applied to the OUTPUT ARRAY
+            execute_proba = float(np.asarray(execute_out).reshape(-1)[-1])
+            wait_proba = float(np.asarray(wait_out).reshape(-1)[-1])
+
         inverted_wait_proba = 1.0 - wait_proba
-        return (execute_proba + inverted_wait_proba) / 2.0
+        avg_proba = (execute_proba + inverted_wait_proba) / 2.0
+
+        if shap_reasoning:
+            return avg_proba, averaged_reasoning
+        return avg_proba
 
     if model_name in {"lstm"}:
         from market_timer.models import lstm
@@ -622,6 +668,7 @@ def get_execution_decision(
     label: int,
     model: str,
     direction: int,
+    calculate_confidence=False,
 ):
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (SELL) or 1 (BUY)")
@@ -693,14 +740,91 @@ def get_execution_decision(
         else:
             threshold = _best_threshold_weighted(probas_cal, y_cal)
 
-
-
     x_pred = X_full.tail(1)
-    prob_execute = _predict_proba(model, fitted, x_pred)
+
+    # --- prediction ---
+    if calculate_confidence:
+        prob_execute, reasoning = _predict_proba(model, fitted, x_pred, calculate_confidence)
+    else:
+        prob_execute = _predict_proba(model, fitted, x_pred)
+
     if model_key == "tcn":
         remaining = max(remaining - 1, 0)
         _save_tcn_cache(cache_path, remaining)
-    return "EXECUTE" if prob_execute >= threshold else "WAIT"
+
+    action = "EXECUTE" if prob_execute >= threshold else "WAIT"
+
+    if not calculate_confidence and "cat" not in model_key:
+        return action
+
+    EPS = 1e-12
+
+    def _clip01(v: float) -> float:
+        return 0.0 if v < 0.0 else (1.0 if v > 1.0 else float(v))
+
+    def _entropy_binary(p: float) -> float:
+        # normalized to [0,1] for binary when using log2
+        p = _clip01(p)
+        p = min(max(p, EPS), 1.0 - EPS)
+        return -(p * math.log(p, 2) + (1.0 - p) * math.log(1.0 - p, 2))
+
+    def _gini_binary(p: float) -> float:
+        # standard gini impurity for binary: 1 - (p^2 + (1-p)^2) = 2p(1-p), max 0.5 at p=0.5
+        p = _clip01(p)
+        return 2.0 * p * (1.0 - p)
+
+    # If fitted is (model_exec, model_wait_inverse), combine them for stability.
+    # model1 predicts EXECUTE (positive class = EXECUTE)
+    # model2 predicts WAIT (positive class = WAIT) on inverted labels
+    p_exec_1 = _clip01(float(prob_execute))
+
+    p_wait_2 = None
+    if isinstance(fitted, (tuple, list)) and len(fitted) >= 2 and fitted[1] is not None:
+        try:
+            p_wait_2 = _clip01(float(_predict_proba(model, fitted[1], x_pred)))
+        except Exception:
+            p_wait_2 = None
+
+    if p_wait_2 is None:
+        # fall back to complement if we don't have (or can't query) the inverse model
+        p_wait_2 = _clip01(1.0 - p_exec_1)
+
+    # Action-specific probability (probability of the chosen action),
+    # and threshold-margin normalized to [0,1].
+    thr = min(max(float(threshold), EPS), 1.0 - EPS)
+
+    if action == "EXECUTE":
+        # Use both models if present: model1 says EXECUTE, model2 (WAIT model) implies EXECUTE = 1 - p_wait_2
+        p_action = 0.5 * (p_exec_1 + (1.0 - p_wait_2))
+        # how far above threshold, normalized so thr->0 and 1->1
+        margin = (p_exec_1 - thr) / max(1.0 - thr, EPS)
+    else:  # WAIT
+        # Use both models if present: model1 implies WAIT = 1 - p_exec_1, model2 says WAIT
+        p_action = 0.5 * ((1.0 - p_exec_1) + p_wait_2)
+        # how far below threshold, normalized so thr->0 and 0->1
+        margin = (thr - p_exec_1) / max(thr, EPS)
+
+    p_action = _clip01(p_action)
+    margin = _clip01(margin)
+
+    # Impurity-based confidence: lower impurity => higher confidence.
+    # Normalize gini to [0,1] by dividing by 0.5 (its max).
+    gini = _gini_binary(p_action)
+    gini_norm = _clip01(gini / 0.5)
+    ent_norm = _clip01(_entropy_binary(p_action))  # already [0,1]
+    impurity_conf = _clip01(1.0 - 0.5 * (gini_norm + ent_norm))
+
+    # Final blend (all in [0,1]):
+    # - margin: distance from decision boundary (threshold)
+    # - p_action: raw probability for the chosen action
+    # - impurity_conf: sharpness/decisiveness via gini+entropy
+    confidence_0_1 = _clip01(
+        0.45 * margin +
+        0.35 * p_action +
+        0.20 * impurity_conf
+    )
+    confidence_0_100 = float(round(100.0 * confidence_0_1, 2))
+    return action, confidence_0_100, reasoning
 
 
 def execution_backtest(

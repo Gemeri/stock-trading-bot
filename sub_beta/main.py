@@ -629,8 +629,8 @@ def compute_macro_features(
             df[col] = np.nan
     if len(df.index) == 0:
         return df
-
-    api_key = os.getenv("POLYGON_API_KEY", "").strip()
+    import forest
+    api_key = forest.POLYGON_API_KEY
     client = None
     if api_key:
         try:

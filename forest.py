@@ -127,7 +127,7 @@ import bot.stuffs.candles as candles
 import bot.trading.logic as logicScript
 import bot.ml.stacking as stacking
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_EXECUTE = """
 You are a professional trading analyst translating a model's raw feature output into a concise, human-readable market read for the average retail investor.
 
 You will receive:
@@ -161,6 +161,42 @@ Rules:
 
 Also, if Action is NONE, interpret impacts as “reasons to stand aside / not take a trade”.
 
+"""
+
+SYSTEM_PROMPT_TIMING = """
+You are a professional trading analyst translating a model's raw feature output into a concise, human-readable timing read for the average retail investor.
+
+You will receive:
+- A ticker
+- A desired action (BUY / SELL), a timing decision (WAIT / EXECUTE), and its confidence score (0–100)
+- A JSON of features and their signed impact values (positive = supports executing now, negative = suggests waiting)
+
+Your job is to synthesize this into a plain-English timing read. Follow this structure exactly:
+
+---
+Timing read: [A short, punchy one-liner describing whether now is the right moment, e.g. "Not the right moment — let it breathe" or "Conditions are aligned, timing looks clean"]
+
+[2–4 sentences reading the timing like a seasoned trader would. Focus on whether the entry is early/late, whether the move has already happened, whether price needs to consolidate first, or whether conditions are lined up for immediate action. Do NOT mention feature names or numbers. Speak in terms an average investor understands — e.g. "price is mid-swing and hasn't set up yet", "momentum is peaking and may need to reset", "the window looks open right now", "waiting for a cleaner entry point".]
+
+[1–2 sentences on what to do — wait for a better moment or act now — and what to watch for if waiting.]
+
+---
+Additional context:
+[2–4 bullet points covering the most notable signals that informed the timing decision — e.g. where price is in its current move, momentum state, volume behavior, time-of-day or session conditions. Keep each bullet to one sentence. Still no raw numbers or feature names — translate everything into investor-friendly language.]
+
+---
+
+Rules:
+- Never mention feature names (e.g. don't say "ema_9" or "obv" — say "short-term trend" or "volume flow" or don't say "rsi_zscore" or "hour_sin" — say "momentum reading" or "time-of-session conditions)
+- Never include raw numbers from the feature json
+- A low score does not mean the timing decision is wrong, it simply means conviction is low — lean toward caution and not doing any action when conviction is low
+- Never reference "the model", write as if this is your own read of the market, not an algorithmic output
+- Focus more on the features with the largest absolute impact
+- The framing is always about TIMING, not whether the trade idea itself is good, assume the directional decision has already been made
+- Match the tone to the action score: low score = clearly unconfident, high score = clearly confident, mid score = borderline/situational
+- Keep the entire response under 200 words
+- Do NOT invent news, fundamentals, price levels, earnings, or macro events.
+- Do not use jargon like "alpha", "signal decay" or "quant signal" — write like a smart, plain-speaking trader
 """
 
 MANDATORY_FEATURES = {
@@ -225,9 +261,6 @@ def get_execution_score(ticker, direction):
 
     final_reasoning = filter_reasoning(reasoning, )
     exec_score = round(conf_val*100)
-    print(f"Execution score: {exec_score}")
-    print("Reasoning:")
-    print(final_reasoning)
     prompt = "\n".join([
         f"Ticker: {ticker}",
         f"Action: {action}",
@@ -237,11 +270,50 @@ def get_execution_score(ticker, direction):
     ])
     response = openai_client.responses.create(
         model="gpt-5.2",
-        instructions=SYSTEM_PROMPT,
+        instructions=SYSTEM_PROMPT_EXECUTE,
         input=prompt
     )
-    print(response.output_text)
-    return round(conf_val*100)
+    reason = response.output_text
+    print(reason)
+    return ticker, action, exec_score, reason
+
+def timer_guard(ticker, direction):
+    import market_timer.timer as market_time
+    df = candles.fetch_candles_plus_features(
+        ticker,
+        bars=N_BARS,
+        timeframe=BAR_TIMEFRAME,
+        rewrite_mode=REWRITE
+    )
+    action, conf, reasoning = market_time.get_execution_decision(df, ticker, 3, "catmulti", direction, True)
+    if direction == 1:
+        desired_action = "BUY"
+    else:
+        desired_action = "SELL"
+
+    filtered_reasoning = {k: v for k, v in reasoning.items() if v != 0}
+    print(desired_action)
+    print(action)
+    print(conf)
+    print(filtered_reasoning)
+    reasoning_json = json.dumps(filtered_reasoning, indent=2)
+    prompt = "\n".join([
+        f"Ticker: {ticker}",
+        f"Desired Action: {desired_action}",
+        f"Timing Decision: {action}",
+        f"Action Score: {conf}",
+        "Reasoning: ",
+        reasoning_json
+    ])
+    response = openai_client.responses.create(
+        model="gpt-5.2",
+        instructions=SYSTEM_PROMPT_TIMING,
+        input=prompt
+    )
+    reason = response.output_text
+    print(reason)
+    return ticker, desired_action, action, conf
+
     
 
 def _perform_trading_job(skip_data=False, scheduled_time_ny: str = None):

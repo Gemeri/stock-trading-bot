@@ -434,6 +434,11 @@ def console_listener():
                 logging.info("Usage: execution-score <ticker> <direction>")
                 continue
             forest.get_execution_score(parts[1], int(parts[2]))
+        elif cmd == "timer-guard":
+            if len(parts) < 3:
+                logging.info("Usage: execution-score <ticker> <direction>")
+                continue
+            forest.timer_guard(parts[1], int(parts[2]))
         elif cmd == "set-timeframe":
             if len(parts) < 2:
                 logging.info("Usage: set-timeframe 4Hour/1Day/etc.")

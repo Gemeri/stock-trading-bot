@@ -52,64 +52,25 @@ load_tickerlist()
 def fetch_new_ai_tickers(num_needed, exclude_tickers):
     openai_client = OpenAI(api_key=forest.OPENAI_API_KEY)
 
-    def bing_web_search(query):
-        """Simple Bing Web Search to get some snippet info for each query."""
-        search_url = "https://api.bing.microsoft.com/v7.0/search"
-        headers = {"Ocp-Apim-Subscription-Key": forest.BING_API_KEY}
-        params = {"q": query, "textDecorations": True, "textFormat": "HTML", "count": 2}
-        try:
-            r = requests.get(search_url, headers=headers, params=params)
-            r.raise_for_status()
-            data = r.json()
-            found = []
-            if 'webPages' in data:
-                for v in data['webPages']['value']:
-                    found.append({
-                        'name': v['name'],
-                        'url': v['url'],
-                        'snippet': v['snippet'],
-                        'displayUrl': v['displayUrl']
-                    })
-            return found
-        except Exception as e:
-            logging.error(f"Bing search failed: {e}")
-            return []
-
-    search_queries = [
-        "best US stocks expected to rise soon",
-        "top bullish stocks to watch in the US market"
-    ]
-
-    snippet_contexts = []
-    for one_query in search_queries:
-        results = bing_web_search(one_query)
-        for item in results:
-            snippet_contexts.append(f"{item['name']}: {item['snippet']}")
-
-    joined_snippets = "\n".join(snippet_contexts)
-
     exclude_list_str = ", ".join(sorted(exclude_tickers)) if exclude_tickers else "None"
     prompt_text = (
         f"You are an AI that proposes exactly {num_needed} unique US stock tickers (one per line)\n"
         f"that are likely to rise soon, based on fundamental/technical analysis.\n"
-        f"Use the following context from Bing if helpful:\n{joined_snippets}\n\n"
+        f"Use your search tool to find promising tickers with good fundemental, techincal and sentiment factors\n"
         f"Do NOT include these tickers: {exclude_list_str}\n"
         f"Output only {num_needed} lines, each line is a ticker symbol only, no extra text."
     )
 
     try:
-        messages = [
-            {"role": "system", "content": "You are a financial assistant that suggests promising tickers."},
-            {"role": "user", "content": prompt_text}
-        ]
-
-        completion = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            store=True
+        system_prompt = "You are a financial assistant that suggests promising tickers."
+        completion = openai_client.responses.create(
+            model="gpt-5.2",
+            tools=[{"type": "web_search"}],
+            reasoning={"effort": "medium"},
+            instructions=system_prompt,
+            input=prompt_text
         )
-
-        content = completion.choices[0].message.content.strip()
+        content = completion.output_text
 
     except Exception as e:
         logging.error(f"Error calling OpenAI ChatCompletion: {e}")
